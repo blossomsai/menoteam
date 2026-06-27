@@ -1,4 +1,4 @@
-# Judgment Loop
+# Menoteam
 
 An early worldview for an autonomous work framework where humans and agents form judgment, discover goals, act in the world, evaluate outcomes, and grow together.
 
@@ -6,7 +6,8 @@ This repository starts as a thinking artifact, not a product spec. The first doc
 
 - [Worldview Manifesto v0.1](docs/worldview-manifesto-v0.1.md)
 
-## Working Name
+## Name
 
-`Judgment Loop` is a provisional name. It emphasizes the idea that autonomous work is not only execution, but a recurring process of observation, interpretation, judgment, action, evaluation, and reflection.
+`Menoteam` is a working name for autonomous work systems that grow with human judgment.
 
+It emphasizes collaborative growth and autonomous execution without binding the system to a fixed model, role, or task type.
