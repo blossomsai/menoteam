@@ -6,6 +6,8 @@ As agents become more capable and more able to act independently, the central qu
 
 Future agent systems may take many forms: companies, teams, workflows, dynamic graphs, sandbox swarms, single autonomous agents, or agent operating systems. Different forms will fit different stages and contexts. This framework looks for the deeper principles that can travel across those forms.
 
+This framework is not primarily a fixed workflow, a task manager, a dashboard, or a single agent runtime. It is an attempt to make human philosophy operational. A useful autonomous work system should learn from how a human thinks, judges, chooses, rejects, corrects, and takes responsibility, then use that learning to guide work when the human is not continuously present.
+
 ## Core Loop
 
 An autonomous work system can be understood as a set of living loops:
@@ -25,6 +27,29 @@ It learns while reflecting with humans and updating shared understanding.
 
 Learning does not happen only at the end. It happens throughout the system.
 
+The loop should be able to continue over long spans of work. If the system has enough context, it should keep moving. If it lacks context, if responsibility needs human judgment, or if a decision would change the meaning of the work, it should ask. Autonomy is not silence. Autonomy is knowing when continued action is justified and when human participation is required.
+
+## Philosophy As Operating Ground
+
+The deepest input from the human is not a task list. It is an operating philosophy.
+
+That philosophy includes what the human believes is worth doing, what quality means, which trade-offs are acceptable, what kinds of work feel alive, what kinds of output feel irresponsible, and how standards should evolve through experience.
+
+The system should not merely imitate surface preferences. It should learn the reasons behind repeated judgments. Taste, standards, goals, and boundaries should become usable structure for autonomous work.
+
+This learning can come from simple interaction:
+
+- direct conversation
+- correction and critique
+- goal discussion
+- planning and review
+- past agent sessions
+- project history
+- durable memory and knowledge systems
+- examples of accepted and rejected work
+
+The result should not be a static profile. It should be a living philosophy that can be questioned, revised, and applied.
+
 ## Human Role
 
 Humans provide reality, taste, value, responsibility, ambition, and boundary.
@@ -40,6 +65,8 @@ The most important human input is not only instruction. It is judgment:
 The system should reduce operational babysitting while deepening human participation in meaning, taste, goal formation, and responsibility.
 
 Humans are not removed from the loop. Their role moves higher in the loop.
+
+The system should save human decision space, not erase human responsibility. The human should spend less time restating context and supervising routine execution, and more time shaping meaning, ambition, standards, and critical judgment.
 
 ## Taste And Quality
 
@@ -75,6 +102,10 @@ Human values still shape the system. They enter through reality, taste, responsi
 
 The agent can be more capable than the human in many domains, but the human still remains responsible for what is shipped, said, sold, deployed, or represented. For that reason, the system must expose its judgment enough for humans to understand, calibrate, and take responsibility.
 
+Autonomous work should remain traceable. Over days or weeks, the system should preserve the goals it pursued, the goals it proposed, the context it used, the actions it took, the questions it asked, the artifacts it produced, the evaluations it made, and the reflections that changed future behavior.
+
+Traceability is not only auditability. It is how humans can understand whether the system is becoming more aligned, more capable, and more worthy of trust.
+
 ## Execution
 
 This framework is meant for real work.
@@ -89,6 +120,10 @@ Execution matters because work must become artifacts, decisions, experiments, co
 
 Judgment matters because execution without judgment can create more output without creating better work.
 
+The framework should support agents that can discover work, not only receive work. A good system should notice signals, propose goals, challenge weak goals, and connect new goals back to the human philosophy and the current reality.
+
+When the system proposes a goal, it should be able to explain why that goal matters, what context supports it, what standard it will use to evaluate success, and when it would need human input.
+
 ## Structure As An Artifact
 
 Coordinators, DAGs, YAML workflows, workers, sandboxes, handoff schemas, scorecards, memory stores, and evaluation harnesses can all be valuable.
@@ -98,6 +133,8 @@ They are useful structures the system can create, use, revise, and discard.
 As models improve and tasks change, the system should be able to generate new structures instead of being permanently limited by one structure chosen early.
 
 The framework should stay thin enough to benefit from stronger models.
+
+Existing coding agents, local tools, memory systems, team channels, and orchestration systems can all be connected to the framework. None of them should define the framework. The enduring layer is the relationship between human philosophy, goal formation, autonomous work, evaluation, and reflection.
 
 ## What Persists
 
@@ -133,4 +170,3 @@ Agents provide breadth, execution, patience, research ability, multi-path explor
 Through repeated loops, both sides shape each other.
 
 The desired result is an autonomous work system that can keep acting, keep calibrating, keep learning, and keep improving judgment over time.
-
