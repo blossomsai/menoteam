@@ -1,0 +1,10 @@
+# Merge this block into ~/.hermes/config.yaml and restart Hermes so the
+# gateway loads it at session start. Replace the channel ID with the selected
+# Discord channel. Keep the bot token in Hermes' native secret path.
+discord:
+  require_mention: true
+  thread_require_mention: true
+  channel_skill_bindings:
+    - id: "REPLACE_WITH_DISCORD_CHANNEL_ID"
+      # Hermes uses the SKILL.md frontmatter name, which is "master".
+      skills: ["master"]

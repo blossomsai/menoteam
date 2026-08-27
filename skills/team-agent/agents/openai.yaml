@@ -1,0 +1,4 @@
+interface:
+  display_name: "Work Map Team Agent"
+  short_description: "Maintain shared Work Map context after progress"
+  default_prompt: "Use $team-agent to handle this assigned Work and maintain shared context."

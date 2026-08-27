@@ -1,1 +1,11 @@
 .gstack/
+.impeccable/
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.DS_Store
+data/
+backups/

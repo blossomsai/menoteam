@@ -1,0 +1,6 @@
+# Merge into ~/.hermes/config.yaml. Keep WORK_MAP_MCP_API_KEY outside git.
+mcp_servers:
+  work_map:
+    url: "https://team.example.com/mcp"
+    headers:
+      Authorization: "Bearer ${WORK_MAP_MCP_API_KEY}"

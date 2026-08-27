@@ -1,0 +1,5 @@
+# Copy into a trusted Codex config scope and keep the real key in the process
+# environment. This file contains no credential.
+[mcp_servers.work_map]
+url = "https://team.example.com/mcp"
+bearer_token_env_var = "WORK_MAP_MCP_API_KEY"

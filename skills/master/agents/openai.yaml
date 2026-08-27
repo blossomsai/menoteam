@@ -1,0 +1,4 @@
+interface:
+  display_name: "Work Map Master"
+  short_description: "Answer and route shared Work Map questions"
+  default_prompt: "Use $master to answer or route this Work Map request from shared context."

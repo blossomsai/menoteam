@@ -1,0 +1,16 @@
+// Merge the mcp.servers entry into OpenClaw's config. Keep the key in the
+// gateway process environment or ~/.openclaw/.env; do not replace the
+// placeholder with a literal bearer token.
+{
+  mcp: {
+    servers: {
+      workMap: {
+        url: "https://team.example.com/mcp",
+        transport: "streamable-http",
+        headers: {
+          Authorization: "Bearer ${WORK_MAP_MCP_API_KEY}",
+        },
+      },
+    },
+  },
+}
