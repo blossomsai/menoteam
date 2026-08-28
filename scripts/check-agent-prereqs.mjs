@@ -12,9 +12,11 @@ const MASTER_SKILL_NAMES = ['master'];
 const PLACEHOLDER = /^(?:<|\$\{|set[-_ ]?this|replace[-_ ]?with|read[-_ ]?this|change[-_ ]?me|your[-_ ]|todo|example)/iu;
 const REF = /^teammate_[A-Za-z0-9_-]+$/u;
 const HARNESS = {
-  hermes: { command: 'hermes', config: ['.hermes/config.yaml', '.hermes/.env'], discord: true },
-  openclaw: { command: 'openclaw', config: ['.openclaw/openclaw.json5', '.openclaw/openclaw.json', '.openclaw/config.json', '.openclaw/.env'], discord: true },
-  codex: { command: 'codex', config: ['config.toml'], discord: false },
+  hermes: { command: 'hermes', config: ['.hermes/config.yaml', '.hermes/.env'], nativeChannels: ['discord'] },
+  openclaw: { command: 'openclaw', config: ['.openclaw/openclaw.json5', '.openclaw/openclaw.json', '.openclaw/config.json', '.openclaw/.env'], nativeChannels: ['discord'] },
+  codex: { command: 'codex', config: ['config.toml'], nativeChannels: [] },
+  pi: { generic: true },
+  other: { generic: true },
 };
 const COMMON_EXECUTABLES = {
   hermes: [join(homedir(), '.local/bin/hermes')],
@@ -46,6 +48,7 @@ async function run(input) {
   const channel = input.channel ?? env.WORK_MAP_CHANNEL ?? 'discord';
   const masterMention = input.masterMention ?? env.WORK_MAP_MASTER_MENTION;
   const discordChannelId = input.discordChannelId ?? env.DISCORD_CHANNEL_ID;
+  const teammateRouteRequired = roleNeedsTeammateRoute(role);
 
   const mcpUrl = parseMcpUrl(urlValue);
   if (mcpUrl) pass(checks, 'Work Map URL format is valid');
@@ -54,35 +57,40 @@ async function run(input) {
   if (usableSecret(apiKey)) pass(checks, 'WORK_MAP_MCP_API_KEY is present (value hidden)');
   else fail(checks, 'WORK_MAP_MCP_API_KEY is missing, too short, or still a template placeholder');
 
-  if (typeof teammateRef === 'string' && REF.test(teammateRef)) pass(checks, 'Teammate reference format is valid');
+  if (!teammateRouteRequired || (typeof teammateRef === 'string' && REF.test(teammateRef))) pass(checks, teammateRouteRequired ? 'Teammate reference format is valid' : 'Master does not require a teammate owner reference');
   else fail(checks, 'WORK_MAP_TEAMMATE_REF must look like teammate_alice');
 
-  if (usableAddress(agentAddress)) pass(checks, 'Native agent address is present (value hidden)');
+  if (!teammateRouteRequired || usableAddress(agentAddress)) pass(checks, teammateRouteRequired ? 'Native agent address is present (value hidden)' : 'Master address is owned by the native harness (no teammate address required)');
   else fail(checks, 'WORK_MAP_AGENT_ADDRESS is missing or still a template placeholder');
 
   if (role === 'master' || role === 'team-agent') pass(checks, `Agent role is ${role}`);
   else fail(checks, 'WORK_MAP_ROLE must be master or team-agent');
 
-  if (channel === 'discord' || channel === 'none') pass(checks, `Channel is ${channel}`);
-  else fail(checks, 'WORK_MAP_CHANNEL must be discord or none');
+  if (channel === 'discord' || channel === 'slack' || channel === 'none') pass(checks, `Channel is ${channel}`);
+  else fail(checks, 'WORK_MAP_CHANNEL must be discord, slack, or none');
 
   const harness = HARNESS[harnessName];
   if (harness) {
-    const executable = findExecutable(harness.command);
-    if (!executable) {
-      fail(checks, `${harness.command} is not available on PATH`);
-    } else if (!probeExecutable(executable)) {
-      fail(checks, `${harness.command} is present but its version probe failed`);
+    let executable = null;
+    if (harness.generic) {
+      warn(checks, `${harnessName} uses the generic MCP/Skill path; executable, config, and native channel checks remain harness-owned`);
     } else {
-      pass(checks, `${harness.command} CLI is available`);
-    }
+      executable = findExecutable(harness.command);
+      if (!executable) {
+        fail(checks, `${harness.command} is not available on PATH`);
+      } else if (!probeExecutable(executable)) {
+        fail(checks, `${harness.command} is present but its version probe failed`);
+      } else {
+        pass(checks, `${harness.command} CLI is available`);
+      }
 
-    const configRoot = harnessName === 'codex' ? (process.env.CODEX_HOME ?? join(homedir(), '.codex')) : homedir();
-    const configPaths = harness.config.map((relative) => join(configRoot, relative));
-    if (configPaths.some((path) => existsSync(path))) {
-      pass(checks, `${harnessName} native config exists (contents not printed)`);
-    } else {
-      fail(checks, `${harnessName} native config was not found under the expected home directory`);
+      const configRoot = harnessName === 'codex' ? (process.env.CODEX_HOME ?? join(homedir(), '.codex')) : homedir();
+      const configPaths = harness.config.map((relative) => join(configRoot, relative));
+      if (configPaths.some((path) => existsSync(path))) {
+        pass(checks, `${harnessName} native config exists (contents not printed)`);
+      } else {
+        fail(checks, `${harnessName} native config was not found under the expected home directory`);
+      }
     }
 
     if (harnessName === 'codex' && executable && probeCodexMcp(executable)) {
@@ -97,21 +105,25 @@ async function run(input) {
       else fail(checks, `Hermes ${skillName} Skill is missing or resolves outside ~/.hermes/skills; install a reviewed copy, not an external symlink`);
     }
 
-    if (channel === 'discord' && !harness.discord) {
-      fail(checks, 'Codex has no native Discord gateway; use Hermes or OpenClaw for Discord delivery');
+    if (channel !== 'none' && !harness.generic && !harness.nativeChannels.includes(channel)) {
+      fail(checks, `${harnessName} has no verified native ${channel} gateway; use a harness with native ${channel} delivery`);
     }
 
-    if (channel === 'discord') {
-      if (masterMention === '@Master') pass(checks, 'Discord activation is explicitly @Master');
+    if (channel !== 'none') {
+      if (masterMention === '@Master') pass(checks, 'Channel activation is explicitly @Master');
       else fail(checks, 'WORK_MAP_MASTER_MENTION must be set to @Master');
 
-      if (hasDiscordToken(harness.config)) {
-        pass(checks, 'Native Discord credential is present (value hidden)');
-      } else {
-        fail(checks, 'Native Discord credential was not detected; inject it through the selected harness secret path');
+      if (harness.generic) {
+        warn(checks, `Native ${channel} credential and route are delegated to ${harnessName}; complete the harness's own allowlist and mention/reply proof`);
+      } else if (channel === 'discord') {
+        if (hasDiscordToken(harness.config)) {
+          pass(checks, 'Native Discord credential is present (value hidden)');
+        } else {
+          fail(checks, 'Native Discord credential was not detected; inject it through the selected harness secret path');
+        }
       }
 
-      if (harnessName === 'hermes') {
+      if (channel === 'discord' && harnessName === 'hermes') {
         if (/^\d{5,25}$/u.test(String(discordChannelId ?? ''))) pass(checks, 'Discord channel ID is present');
         else fail(checks, 'DISCORD_CHANNEL_ID must be the selected Discord channel snowflake');
 
@@ -121,17 +133,17 @@ async function run(input) {
         else fail(checks, `Hermes Discord binding is incomplete: ${binding.reason}`);
       }
 
-      warn(checks, 'Guild/channel/user allowlists and one real mention/reply remain operator proof in native Discord');
+      warn(checks, `${channel[0].toUpperCase()}${channel.slice(1)} guild/channel/user allowlists and one real mention/reply remain operator proof in the native harness`);
     }
   } else {
-    fail(checks, 'WORK_MAP_HARNESS must be hermes, openclaw, or codex');
+    fail(checks, 'WORK_MAP_HARNESS must be hermes, openclaw, codex, pi, or other');
   }
 
-  const structuralReady = mcpUrl && usableSecret(apiKey) && REF.test(String(teammateRef ?? '')) && usableAddress(agentAddress);
+  const structuralReady = mcpUrl && usableSecret(apiKey) && (!teammateRouteRequired || (REF.test(String(teammateRef ?? '')) && usableAddress(agentAddress)));
   if (input.noNetwork) {
     warn(checks, 'Network checks skipped by --no-network; run without it before onboarding');
   } else if (structuralReady) {
-    await checkRemote(mcpUrl, apiKey, teammateRef, channel, checks);
+    await checkRemote(mcpUrl, apiKey, teammateRef, agentAddress, channel, role, checks);
   } else {
     warn(checks, 'Remote checks skipped because required local values are missing');
   }
@@ -139,7 +151,7 @@ async function run(input) {
   return { checks, failed: checks.some((check) => check.status === 'fail') };
 }
 
-async function checkRemote(mcpUrl, apiKey, teammateRef, channel, checks) {
+async function checkRemote(mcpUrl, apiKey, teammateRef, agentAddress, channel, role, checks) {
   try {
     const healthUrl = new URL(mcpUrl.href);
     healthUrl.pathname = healthUrl.pathname.replace(/\/mcp\/?$/u, '/healthz');
@@ -178,9 +190,25 @@ async function checkRemote(mcpUrl, apiKey, teammateRef, channel, checks) {
     }
     pass(checks, 'Authenticated MCP exposes all six V1 tools');
 
+    if (role === 'master') {
+      const list = await rpc(mcpUrl, apiKey, {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: { name: 'list', arguments: { kind: 'work', filters: {}, limit: 1 } },
+      }, sessionId);
+      const page = list.result?.structuredContent;
+      if (list.error || !page || !Array.isArray(page.items) || typeof page.total_count !== 'number') {
+        fail(checks, 'Master could not read the shared Work Map through authenticated MCP');
+      } else {
+        pass(checks, 'Master can read the shared Work Map through authenticated MCP');
+      }
+      return;
+    }
+
     const read = await rpc(mcpUrl, apiKey, {
       jsonrpc: '2.0',
-      id: 3,
+      id: 4,
       method: 'tools/call',
       params: { name: 'read', arguments: { ref: teammateRef } },
     }, sessionId);
@@ -190,14 +218,14 @@ async function checkRemote(mcpUrl, apiKey, teammateRef, channel, checks) {
       return;
     }
     const addresses = entity.default_agent_addresses;
-    if (channel === 'discord' && addresses?.discord === agentAddress) {
-      pass(checks, 'Teammate record is readable and matches the supplied Discord route');
+    if (channel !== 'none' && addresses?.[channel] === agentAddress) {
+      pass(checks, `Teammate record is readable and matches the supplied ${channel} route`);
     } else if (channel === 'none') {
       pass(checks, 'Teammate record is readable');
-    } else if (channel === 'discord' && addresses?.discord) {
-      fail(checks, 'Teammate record has a different Discord route; reconcile it through native MCP after human confirmation');
+    } else if (channel !== 'none' && addresses?.[channel]) {
+      fail(checks, `Teammate record has a different ${channel} route; reconcile it through native MCP after human confirmation`);
     } else {
-      fail(checks, 'Teammate record is readable but has no Discord route; update it through native MCP after human confirmation');
+      fail(checks, `Teammate record is readable but has no ${channel} route; update it through native MCP after human confirmation`);
     }
   } catch (error) {
     const reason = error?.name === 'TimeoutError' ? 'timed out' : 'could not be reached';
@@ -278,6 +306,10 @@ function usableAddress(value) {
   return typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 300 && !/[\u0000-\u001f\u007f]/u.test(value) && !PLACEHOLDER.test(value.trim());
 }
 
+function roleNeedsTeammateRoute(role) {
+  return role === 'team-agent';
+}
+
 function hasDiscordToken(relativePaths) {
   if (usableSecret(process.env.DISCORD_BOT_TOKEN)) return true;
   return relativePaths.some((relative) => {
@@ -311,7 +343,7 @@ function readHermesDiscordBinding(path, channelId) {
   } catch {
     return { ok: false, reason: 'config could not be read' };
   }
-  return parseHermesDiscordBinding(contents, channelId);
+  return parseHermesDiscordBinding(contents, channelId, process.env);
 }
 
 function hasTrustedHermesSkill(skillName) {
@@ -327,11 +359,18 @@ function hasTrustedHermesSkill(skillName) {
   }
 }
 
-function parseHermesDiscordBinding(contents, channelId) {
+function parseHermesDiscordBinding(contents, channelId, environment = process.env) {
   const discord = section(contents, 'discord');
   const bindings = section(discord, 'channel_skill_bindings');
   if (!/require_mention\s*:\s*true(?:\s|$)/u.test(discord)) return { ok: false, reason: 'require_mention is not true' };
   if (!/thread_require_mention\s*:\s*true(?:\s|$)/u.test(discord)) return { ok: false, reason: 'thread_require_mention is not true' };
+  if (!settingIsFalse(discord, 'history_backfill', environment.DISCORD_HISTORY_BACKFILL)) return { ok: false, reason: 'history_backfill must be false for explicit-mention privacy' };
+  if (!settingIsFalse(discord, 'auto_thread', environment.DISCORD_AUTO_THREAD)) return { ok: false, reason: 'auto_thread must be false for the selected inline channel' };
+  if (!settingIsFalse(discord, 'reactions', environment.DISCORD_REACTIONS)) return { ok: false, reason: 'reactions must be false for the selected channel' };
+  if (!settingIsTrue(discord, 'bots_require_inline_mention', environment.DISCORD_BOTS_REQUIRE_INLINE_MENTION)) return { ok: false, reason: 'bots_require_inline_mention must be true for multi-agent safety' };
+  if (String(environment.DISCORD_ALLOW_BOTS ?? '').trim().toLowerCase() !== 'mentions') return { ok: false, reason: 'DISCORD_ALLOW_BOTS must be mentions for multi-agent safety' };
+  const allowedChannels = configuredAllowedChannels(discord, environment);
+  if (!allowedChannels.values.includes(String(channelId)) || allowedChannels.values.includes('*')) return { ok: false, reason: `${allowedChannels.source} must explicitly allow the selected channel and must not use a wildcard` };
   const entries = bindings.split(/(?=^\s*-\s*id\s*:)/mu).filter((entry) => /^\s*-\s*id\s*:/mu.test(entry));
   const selected = entries.find((entry) => {
     const match = entry.match(/^\s*-\s*id\s*:\s*["']?([^\s"'#]+)["']?/mu);
@@ -345,9 +384,53 @@ function parseHermesDiscordBinding(contents, channelId) {
   return { ok: true };
 }
 
+function settingIsFalse(contents, key, environmentValue) {
+  if (environmentValue !== undefined && String(environmentValue).trim() !== '') return isFalseSetting(environmentValue);
+  return new RegExp(`(?:^|\\n)\\s*${escapeRegExp(key)}\\s*:\\s*false(?:\\s|$)`, 'iu').test(contents);
+}
+
+function settingIsTrue(contents, key, environmentValue) {
+  if (environmentValue !== undefined && String(environmentValue).trim() !== '') return /^(?:true|1|yes|on)$/iu.test(String(environmentValue).trim());
+  return new RegExp(`(?:^|\\n)\\s*${escapeRegExp(key)}\\s*:\\s*true(?:\\s|$)`, 'iu').test(contents);
+}
+
+function configuredAllowedChannels(contents, environment) {
+  const environmentValue = String(environment.DISCORD_ALLOWED_CHANNELS ?? '').trim();
+  if (environmentValue) return { source: 'DISCORD_ALLOWED_CHANNELS', values: splitConfiguredValues(environmentValue) };
+  const lines = String(contents).split(/\r?\n/u);
+  const index = lines.findIndex((line) => /^\s*allowed_channels\s*:/u.test(line));
+  if (index < 0) return { source: 'discord.allowed_channels', values: [] };
+  const line = lines[index];
+  const baseIndent = line.match(/^\s*/u)?.[0].length ?? 0;
+  const inline = line.replace(/^\s*allowed_channels\s*:\s*/u, '').trim();
+  if (inline) return { source: 'discord.allowed_channels', values: splitConfiguredValues(inline) };
+  const values = [];
+  for (const candidate of lines.slice(index + 1)) {
+    if (!candidate.trim() || candidate.trimStart().startsWith('#')) continue;
+    const indent = candidate.match(/^\s*/u)?.[0].length ?? 0;
+    if (indent <= baseIndent) break;
+    const item = candidate.match(/^\s*-\s*(.+)$/u);
+    if (item) values.push(...splitConfiguredValues(item[1]));
+  }
+  return { source: 'discord.allowed_channels', values };
+}
+
+function splitConfiguredValues(value) {
+  return String(value)
+    .replace(/^\[/u, '')
+    .replace(/\]$/u, '')
+    .split(',')
+    .map((item) => item.replace(/\s+#.*$/u, '').trim().replace(/^(['"])(.*)\1$/u, '$2'))
+    .filter(Boolean);
+}
+
 function section(contents, key) {
   const match = String(contents).match(new RegExp(`(?:^|\\n)\\s*${escapeRegExp(key)}\\s*:\\s*\\n([\\s\\S]*?)(?=\\n\\S|$)`));
   return match?.[1] ?? '';
+}
+
+function isFalseSetting(value) {
+  return /^(?:false|0|no|off)$/iu.test(String(value).trim());
 }
 
 function escapeRegExp(value) {
@@ -411,12 +494,14 @@ function printUsage() {
   console.log(`Usage: pnpm onboarding:check -- [options]
 
 Required environment: WORK_MAP_MCP_URL, WORK_MAP_MCP_API_KEY,
-WORK_MAP_TEAMMATE_REF, WORK_MAP_AGENT_ADDRESS, WORK_MAP_HARNESS.
-Hermes/Discord additionally requires DISCORD_CHANNEL_ID and the native
+WORK_MAP_HARNESS, WORK_MAP_ROLE, and WORK_MAP_CHANNEL. A team-agent additionally
+requires WORK_MAP_TEAMMATE_REF and WORK_MAP_AGENT_ADDRESS; a master does not.
+Native Hermes/Discord additionally requires DISCORD_CHANNEL_ID,
+DISCORD_ALLOW_BOTS=mentions, the strict channel binding, and the native
 DISCORD_BOT_TOKEN secret path.
 
-Options: --harness hermes|openclaw|codex, --role master|team-agent,
---channel discord|none, --discord-channel-id ID, --no-network, --json,
+Options: --harness hermes|openclaw|codex|pi|other, --role master|team-agent,
+--channel discord|slack|none, --discord-channel-id ID, --no-network, --json,
 --self-test`);
 }
 
@@ -426,7 +511,7 @@ function printChecks(checks, json) {
     return;
   }
   for (const check of checks) console.log(`${icon(check.status)} ${check.message}`);
-  console.log(checks.some((check) => check.status === 'fail') ? '\nOnboarding preflight failed.' : '\nOnboarding preflight passed; complete any native Discord proof warning before calling it connected.');
+  console.log(checks.some((check) => check.status === 'fail') ? '\nOnboarding preflight failed.' : '\nOnboarding preflight passed; complete any native channel proof warning before calling it connected.');
 }
 
 function pass(checks, message) {
@@ -455,12 +540,26 @@ function selfTest() {
   assert.ok(REF.test('teammate_alice'));
   assert.equal(REF.test('alice'), false);
   assert.equal(usableAddress('replace-with-native-discord-address'), false);
-  const validHermes = `discord:\n  require_mention: true\n  thread_require_mention: true\n  channel_skill_bindings:\n    - id: "123456"\n      skills: ["master"]\n`;
-  assert.equal(parseHermesDiscordBinding(validHermes, '123456').ok, true);
+  assert.equal(roleNeedsTeammateRoute('master'), false);
+  assert.equal(roleNeedsTeammateRoute('team-agent'), true);
+  const validHermes = `discord:\n  require_mention: true\n  thread_require_mention: true\n  history_backfill: false\n  auto_thread: false\n  reactions: false\n  bots_require_inline_mention: true\n  allowed_channels:\n    - "123456"\n  channel_skill_bindings:\n    - id: "123456"\n      skills: ["master"]\n`;
+  const validHermesEnv = { DISCORD_ALLOW_BOTS: 'mentions' };
+  assert.equal(parseHermesDiscordBinding(validHermes, '123456', validHermesEnv).ok, true);
   const unsafeHermes = validHermes.replace('thread_require_mention: true', 'thread_require_mention: false');
-  assert.equal(parseHermesDiscordBinding(unsafeHermes, '123456').ok, false);
-  const wrongChannelSkill = `discord:\n  require_mention: true\n  thread_require_mention: true\n  channel_skill_bindings:\n    - id: "123456"\n      skills: ["unrelated"]\n    - id: "999999"\n      skills: ["master"]\n`;
-  assert.equal(parseHermesDiscordBinding(wrongChannelSkill, '123456').ok, false);
+  assert.equal(parseHermesDiscordBinding(unsafeHermes, '123456', validHermesEnv).reason, 'thread_require_mention is not true');
+  const unsafeHistory = validHermes.replace('history_backfill: false', 'history_backfill: true');
+  assert.equal(parseHermesDiscordBinding(unsafeHistory, '123456', validHermesEnv).reason, 'history_backfill must be false for explicit-mention privacy');
+  assert.equal(parseHermesDiscordBinding(validHermes, '123456', { ...validHermesEnv, DISCORD_AUTO_THREAD: 'true' }).reason, 'auto_thread must be false for the selected inline channel');
+  assert.equal(parseHermesDiscordBinding(validHermes, '123456', { ...validHermesEnv, DISCORD_REACTIONS: 'true' }).reason, 'reactions must be false for the selected channel');
+  assert.equal(parseHermesDiscordBinding(validHermes, '123456', { ...validHermesEnv, DISCORD_BOTS_REQUIRE_INLINE_MENTION: 'false' }).reason, 'bots_require_inline_mention must be true for multi-agent safety');
+  const unsafeChannel = validHermes.replace('- "123456"', '- "654321"');
+  assert.equal(parseHermesDiscordBinding(unsafeChannel, '123456', validHermesEnv).reason, 'discord.allowed_channels must explicitly allow the selected channel and must not use a wildcard');
+  const wrongChannelSkill = validHermes.replace('skills: ["master"]', 'skills: ["unrelated"]');
+  assert.equal(parseHermesDiscordBinding(wrongChannelSkill, '123456', validHermesEnv).reason, 'selected channel is not bound to the registered master skill');
+  const unsafeBots = { DISCORD_ALLOW_BOTS: 'all' };
+  assert.equal(parseHermesDiscordBinding(validHermes, '123456', unsafeBots).reason, 'DISCORD_ALLOW_BOTS must be mentions for multi-agent safety');
+  const envAllowedChannel = { ...validHermesEnv, DISCORD_ALLOWED_CHANNELS: '123456' };
+  assert.equal(parseHermesDiscordBinding(validHermes.replace('- "123456"', '- "654321"'), '123456', envAllowedChannel).ok, true);
   assert.equal(extractDiscordToken('# DISCORD_BOT_TOKEN=' + 'x'.repeat(MIN_SECRET_LENGTH)), undefined);
   assert.equal(extractDiscordToken('DISCORD_BOT_TOKEN=' + 'x'.repeat(MIN_SECRET_LENGTH)), 'x'.repeat(MIN_SECRET_LENGTH));
   console.log('onboarding preflight self-test passed');

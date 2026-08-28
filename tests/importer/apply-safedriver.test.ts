@@ -44,6 +44,7 @@ describe("Safe Driver apply CLI", () => {
       repoPath: "/repo",
       apply: false,
       confirmInferredOwnerAndState: false,
+      preserveInferredOwner: false,
       includePullRequests: true,
     });
     expect(parseApplySafeDriverArgs([
@@ -62,10 +63,40 @@ describe("Safe Driver apply CLI", () => {
       teammateRef: "teammate_alice",
       displayName: "Alice",
       state: "completed",
+      preserveInferredOwner: false,
     });
   });
 
-  it("rejects apply unless every human confirmation flag is present", () => {
+  it("parses the explicit inferred-owner preservation flag", () => {
+    expect(parseApplySafeDriverArgs([
+      "/repo",
+      "--apply",
+      "--preserve-inferred-owner",
+      "--teammate-ref",
+      "teammate_alice",
+      "--display-name",
+      "Alice",
+      "--state",
+      "current",
+    ])).toMatchObject({ apply: true, confirmInferredOwnerAndState: false, preserveInferredOwner: true });
+  });
+
+  it("rejects mutually exclusive confirmed and inferred owner modes", () => {
+    expect(() => parseApplySafeDriverArgs([
+      "/repo",
+      "--apply",
+      "--confirm-inferred-owner-and-state",
+      "--preserve-inferred-owner",
+      "--teammate-ref",
+      "teammate_alice",
+      "--display-name",
+      "Alice",
+      "--state",
+      "current",
+    ])).toThrow("mutually exclusive");
+  });
+
+  it("rejects apply unless an explicit owner mode is present", () => {
     for (const args of [
       ["--apply"],
       ["--apply", "--confirm-inferred-owner-and-state"],
@@ -117,6 +148,43 @@ describe("Safe Driver apply CLI", () => {
       await client.close();
       await repository.close();
     }
+  });
+
+  it("applies repository ownership as inferred when explicitly requested", async () => {
+    const created: Array<Record<string, unknown>> = [];
+    const updatedTeammates: Array<Record<string, unknown>> = [];
+    const tools: WorkMapToolClient = {
+      async list() { return { items: [], next_cursor: null }; },
+      async search() { return { items: [], next_cursor: null }; },
+      async read() { throw new Error("not found"); },
+      async create_work(input) {
+        created.push(input);
+        return { work: { ref: `work_${created.length}`, ...input } };
+      },
+      async update_work() { throw new Error("must not update"); },
+      async update_teammate(input) {
+        updatedTeammates.push(input);
+        return { teammate: { ref: input.ref } };
+      },
+    };
+
+    const result = await runSafeDriverImport(importedPlan(), tools, {
+      ...defaults,
+      apply: true,
+      confirmInferredOwnerAndState: false,
+      preserveInferredOwner: true,
+      teammateRef: "teammate_alice",
+      displayName: "Alice",
+      state: "current",
+    });
+
+    expect(result.ownerSource).toBe("inferred");
+    expect(created).toHaveLength(2);
+    expect(created.every((input) => input.owner_source === "inferred")).toBe(true);
+    expect(created[1]?.owner_evidence).toEqual(importedPlan().workNodes[1]?.owner.evidence);
+    expect(updatedTeammates[0]?.changes).toMatchObject({
+      memory: expect.stringContaining("remains inferred"),
+    });
   });
 
   it("requires the confirmation marker again at the writer seam", async () => {

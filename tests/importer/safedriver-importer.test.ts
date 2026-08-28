@@ -77,4 +77,46 @@ it("imports a durable feature as current Work with an unconfirmed owner candidat
   expect(result.teammateMemories).toHaveLength(1);
   expect(result.teammateMemories[0]?.person.id).toBe("github:E2023");
 });
+
+it("links a merged pull request by merge commit when its title is generic", () => {
+  const result = importSafeDriverPlan({
+    repository: "blossomsai/safe-driver-plan",
+    ref: "origin/main",
+    commit: "main1234",
+    generatedAt: "2026-08-28T12:00:00.000Z",
+    commits: Array.from({ length: 13 }, (_, index) => ({
+      sha: index === 0 ? "merge1234" : `commit${index.toString().padStart(4, "0")}`,
+      subject: "Protect Hiring source uploads",
+      author: { id: "git:E2023", displayName: "E2023" },
+      files: [
+        "frontend/src/components/ConfidentialDocumentPasswordDialog.jsx",
+        "supabase/migrations/20260813_hiring_source_confidentiality.sql",
+      ],
+    })),
+    pullRequests: [{
+      number: 10,
+      title: "Protect Hiring source uploads",
+      state: "MERGED",
+      author: { id: "github:E2023", displayName: "E2023" },
+      headRef: "codex/hiring-source-confidentiality",
+      baseRef: "main",
+      url: "https://github.com/blossomsai/safe-driver-plan/pull/10",
+      mergedAt: "2026-08-10T22:01:06Z",
+      mergeCommit: "merge1234",
+    }],
+    files: [
+      "frontend/src/components/ConfidentialDocumentPasswordDialog.jsx",
+      "supabase/migrations/20260813_hiring_source_confidentiality.sql",
+    ],
+  });
+
+  const confidential = result.workNodes.find((node) => node.id === "sdp:confidential-documents");
+  expect(confidential?.owner.confidence).toBe("high");
+  expect(confidential?.owner.evidence).toEqual(expect.arrayContaining([
+    expect.objectContaining({ kind: "pull_request", ref: "#10" }),
+  ]));
+  expect(confidential?.livingDoc.content).toContain(
+    "[Protect Hiring source uploads](https://github.com/blossomsai/safe-driver-plan/pull/10)",
+  );
+});
 });

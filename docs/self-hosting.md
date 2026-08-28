@@ -44,7 +44,7 @@ MCP_API_KEY=$(openssl rand -hex 32)
 DASHBOARD_PASSWORD=$(openssl rand -hex 32)
 PORT=3000
 HOST=0.0.0.0
-APP_VERSION=0.1.0
+APP_VERSION=0.1.1
 ALLOWED_HOSTS=localhost,127.0.0.1
 ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 EOF

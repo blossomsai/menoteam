@@ -4,7 +4,21 @@
 discord:
   require_mention: true
   thread_require_mention: true
+  # Do not pull unmentioned channel history into a triggered agent context.
+  history_backfill: false
+  # Keep the selected shared channel inline and quiet; no auto-created threads
+  # or lifecycle emoji reactions.
+  auto_thread: false
+  reactions: false
+  # Prevent reply-ping loops when another native agent posts in this channel.
+  bots_require_inline_mention: true
+  # This must contain only the selected channel ID (replace the placeholder).
+  allowed_channels:
+    - "REPLACE_WITH_DISCORD_CHANNEL_ID"
   channel_skill_bindings:
     - id: "REPLACE_WITH_DISCORD_CHANNEL_ID"
       # Hermes uses the SKILL.md frontmatter name, which is "master".
       skills: ["master"]
+
+# In Hermes' supported ~/.hermes/.env (not this YAML file), also set:
+# DISCORD_ALLOW_BOTS=mentions

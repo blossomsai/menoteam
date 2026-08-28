@@ -20,7 +20,7 @@ const compactPageOutput = z.object({ items: z.array(z.record(z.string(), z.unkno
 const entityOutput = z.object({ entity: z.record(z.string(), z.unknown()) });
 
 export function createMcpServer(repository: WorkMapRepository): McpServer {
-  const server = new McpServer({ name: 'menoteam-work-map', version: process.env.APP_VERSION ?? '0.1.0' });
+  const server = new McpServer({ name: 'menoteam-work-map', version: process.env.APP_VERSION ?? '0.1.1' });
 
   server.registerTool('list', {
     description: 'List deterministic paginated compact Work or teammate summaries. total_count counts filter matches; each Work subtree_count counts that Work plus all descendants and is the authoritative branch size. Work title is exact; ancestor filters to a root and its descendants.',

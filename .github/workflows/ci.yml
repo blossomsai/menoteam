@@ -10,6 +10,20 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: public.ecr.aws/docker/library/postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        env:
+          POSTGRES_DB: menoteam
+          POSTGRES_USER: menoteam
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U menoteam -d menoteam"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -31,7 +45,22 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: Test onboarding preflight
+        run: pnpm onboarding:check -- --self-test
+
+      - name: Verify generic Master onboarding shape
+        env:
+          WORK_MAP_MCP_URL: https://work-map.invalid/mcp
+          WORK_MAP_MCP_API_KEY: ci-onboarding-key-0123456789abcdef0123456789abcdef
+          WORK_MAP_HARNESS: other
+          WORK_MAP_ROLE: master
+          WORK_MAP_CHANNEL: none
+          WORK_MAP_MASTER_MENTION: '@Master'
+        run: pnpm onboarding:check -- --no-network
+
       - name: Test
+        env:
+          WORK_MAP_TEST_DATABASE_URL: postgres://menoteam:ci-postgres-password@127.0.0.1:5432/menoteam
         run: pnpm test
 
       - name: Build

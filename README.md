@@ -38,7 +38,7 @@ docker compose up -d --build
 Open `http://127.0.0.1:3000/dashboard`, then follow:
 
 1. [Self-host Work Map](docs/self-hosting.md)
-2. [Connect existing agents and Discord](docs/connect-agents.md)
+2. [Connect existing agents and native channels](docs/connect-agents.md)
 3. [Read the V1 product and architecture spec](docs/work-map-v1-spec.md)
 
 Do not expose the service directly to the public internet. Put HTTPS and access

@@ -551,6 +551,14 @@ function limitedEvidence(values: EvidenceRef[]): EvidenceRef[] {
   return unique(values, (item) => `${item.kind}:${item.ref}`).slice(0, EVIDENCE_LIMIT);
 }
 
+function limitedOwnerEvidence(values: EvidenceRef[]): EvidenceRef[] {
+  const uniqueValues = unique(values, (item) => `${item.kind}:${item.ref}`);
+  if (uniqueValues.length <= EVIDENCE_LIMIT) return uniqueValues;
+  const selected = ["pull_request", "commit", "branch", "tree", "tag", "history"]
+    .flatMap((kind) => uniqueValues.find((item) => item.kind === kind) ?? []);
+  return [...selected, ...uniqueValues.filter((item) => !selected.includes(item))].slice(0, EVIDENCE_LIMIT);
+}
+
 function confidenceFor(score: CandidateScore, runnerUp: CandidateScore | undefined): Confidence {
   if (score.matchingCommitCount >= 1 && score.hasMergedPullRequest && (!runnerUp || score.score >= runnerUp.score * 2)) {
     return "high";
@@ -576,13 +584,16 @@ function findMatches(snapshot: SafeDriverSnapshot, rule: FeatureRule): FeatureMa
     );
     return subjectMatch || fileMatch;
   });
+  const matchingCommitShas = new Set(commits.map((commit) => commit.sha));
   const pullRequests = (snapshot.pullRequests ?? []).filter((pr) => {
     return (
       featureTextMatches(rule, pr.title) ||
-      featureTextMatches(rule, pr.headRef ?? "")
+      featureTextMatches(rule, pr.headRef ?? "") ||
+      (pr.mergeCommit !== undefined &&
+        pr.mergeCommit !== null &&
+        matchingCommitShas.has(pr.mergeCommit))
     );
   });
-  const matchingCommitShas = new Set(commits.map((commit) => commit.sha));
   const branches = (snapshot.branches ?? []).filter((branch) => {
     return (
       featureTextMatches(rule, branch.name) ||
@@ -740,7 +751,7 @@ function inferOwner(matches: FeatureMatches, snapshot: SafeDriverSnapshot): Owne
   }
   const runnerUp = scores[1];
   const confidence = confidenceFor(best, runnerUp);
-  const allEvidence = limitedEvidence(best.evidence);
+  const allEvidence = limitedOwnerEvidence(best.evidence);
   const alternatives = scores.slice(1, 4).map((candidate) => ({
     person: candidate.person,
     confidence: confidenceFor(candidate, best),
@@ -1020,6 +1031,8 @@ export interface WriteImportOptions {
   confirmedOwners: Record<string, ConfirmedOwner>;
   /** Every selected Work must have an explicit human-confirmed state. */
   confirmedStates: Record<string, WorkState>;
+  /** Keep repository-derived ownership inferred instead of promoting it to confirmed. */
+  ownerSource?: "confirmed" | "inferred";
   /** Include only these stable importer IDs; parents are included automatically. */
   nodeIds?: string[];
   dryRun?: boolean;
@@ -1029,6 +1042,7 @@ export interface ExplicitBootstrapConfirmation {
   teammateRef: string;
   displayName: string;
   state: WorkState;
+  ownerSource?: "confirmed" | "inferred";
 }
 
 export interface WriteImportResult {
@@ -1061,6 +1075,7 @@ export function makeExplicitBootstrapOptions(
       displayName: confirmation.displayName,
     }])),
     confirmedStates: Object.fromEntries(imported.workNodes.map((node) => [node.id, confirmation.state])),
+    ownerSource: confirmation.ownerSource ?? "confirmed",
   };
 }
 
@@ -1151,8 +1166,8 @@ async function listAll(
 
 /**
  * Applies an import through the shared six-tool MCP seam. The owner field still
- * requires explicit human mapping; once supplied, that mapping is persisted as
- * confirmed ownership while repository inference remains supporting evidence.
+ * requires explicit human mapping; the optional inferred mode preserves the
+ * repository candidate as unconfirmed supporting evidence.
  */
 export async function writeSafeDriverImport(
   imported: WorkMapImport,
@@ -1160,6 +1175,18 @@ export async function writeSafeDriverImport(
   options: WriteImportOptions
 ): Promise<WriteImportResult> {
   const nodes = sortParentFirst(workSelection(imported, options.nodeIds));
+  const ownerSource = options.ownerSource ?? "confirmed";
+  if (ownerSource !== "confirmed" && ownerSource !== "inferred") {
+    throw new Error("ownerSource must be confirmed or inferred.");
+  }
+  if (ownerSource === "inferred") {
+    const missingCandidates = nodes
+      .filter((node) => node.owner.provenance !== "inferred" || !node.owner.person)
+      .map((node) => node.id);
+    if (missingCandidates.length) {
+      throw new Error(`Inferred owner preservation requires repository candidates for: ${missingCandidates.join(", ")}`);
+    }
+  }
   const missingOwners = nodes
     .filter((node) => !options.confirmedOwners[node.id]?.teammateRef)
     .map((node) => node.id);
@@ -1198,7 +1225,7 @@ export async function writeSafeDriverImport(
         await tools.update_teammate({
           ref,
           expected_revision: 0,
-          changes: { display_name: owner.displayName, default_agent_addresses: {}, memory: memoryForOwner(imported, ref, owner, options.confirmedOwners) },
+          changes: { display_name: owner.displayName, default_agent_addresses: {}, memory: memoryForOwner(imported, ref, owner, options.confirmedOwners, ownerSource) },
         });
       }
       teammateRefs[ref] = ref;
@@ -1209,7 +1236,7 @@ export async function writeSafeDriverImport(
     const revision = Number(entity.revision ?? existing.revision);
     const currentName = String(entity.display_name ?? existing.display_name ?? "");
     const currentMemory = String(entity.memory ?? "");
-    const desiredMemory = memoryForOwner(imported, ref, owner, options.confirmedOwners);
+    const desiredMemory = memoryForOwner(imported, ref, owner, options.confirmedOwners, ownerSource);
     if (currentName !== owner.displayName || currentMemory !== desiredMemory) {
       plannedOperations.push(`update_teammate ${ref} expected_revision=${revision}`);
       if (!options.dryRun) {
@@ -1234,7 +1261,6 @@ export async function writeSafeDriverImport(
       const entity = resultEntity(complete);
       const revision = Number(entity.revision);
       const changes: Record<string, unknown> = {};
-      const ownerSource = "confirmed";
       if (entity.owner !== owner.teammateRef) changes.owner = owner.teammateRef;
       if (entity.owner_source !== ownerSource) changes.owner_source = ownerSource;
       if (!isDeepStrictEqual(entity.owner_evidence ?? [], node.owner.evidence)) changes.owner_evidence = node.owner.evidence;
@@ -1258,7 +1284,7 @@ export async function writeSafeDriverImport(
     const input = {
       title: node.title,
       owner: owner.teammateRef,
-      owner_source: "confirmed",
+      owner_source: ownerSource,
       owner_evidence: node.owner.evidence,
       state: options.confirmedStates[node.id],
       parent: parentRef,
@@ -1284,11 +1310,15 @@ function memoryForOwner(
   imported: WorkMapImport,
   teammateRef: string,
   owner: ConfirmedOwner,
-  confirmedOwners: Record<string, ConfirmedOwner>
+  confirmedOwners: Record<string, ConfirmedOwner>,
+  ownerSource: "confirmed" | "inferred",
 ): string {
   const nodes = imported.workNodes.filter((node) => confirmedOwners[node.id]?.teammateRef === teammateRef);
   const labels = nodes.slice(0, 5).map((node) => node.title).join(", ") || "the imported project";
-  const memory = `Repository history links ${owner.displayName} to ${labels} as supporting evidence. The current Work owner was explicitly confirmed by the operator; repository activity alone is not proof of accountability. This is team-visible routing context; correct it when better team context becomes available.`;
+  const ownership = ownerSource === "inferred"
+    ? "The current Work owner remains inferred from repository evidence and is not confirmed by a human"
+    : "The current Work owner was explicitly confirmed by the operator";
+  const memory = `Repository history links ${owner.displayName} to ${labels} as supporting evidence. ${ownership}; repository activity alone is not proof of accountability. This is team-visible routing context; correct it when better team context becomes available.`;
   return memory;
 }
 
@@ -1387,6 +1417,9 @@ function parsePullRequests(raw: string): PullRequestRecord[] | undefined {
         baseRef: safeText(String(pr.baseRefName ?? "")),
         url: typeof pr.url === "string" ? safeUrl(pr.url) : undefined,
         mergedAt: typeof pr.mergedAt === "string" ? pr.mergedAt : null,
+        mergeCommit: pr.mergeCommit && typeof pr.mergeCommit === "object"
+          ? safeText(String((pr.mergeCommit as Record<string, unknown>).oid ?? "")) || null
+          : null,
       };
     }).filter((pr) => Number.isFinite(pr.number) && pr.number > 0);
   } catch {
@@ -1466,7 +1499,7 @@ export function collectSafeDriverSnapshot(repoPath: string, options: CollectOpti
       "--limit",
       "1000",
       "--json",
-      "number,title,state,author,headRefName,baseRefName,mergedAt,url",
+      "number,title,state,author,headRefName,baseRefName,mergedAt,url,mergeCommit",
     ], repoPath) ?? "");
   const warnings = [] as string[];
   if (options.includePullRequests !== false && !pullRequests) {

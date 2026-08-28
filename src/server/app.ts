@@ -56,7 +56,7 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
   app.get('/healthz', async (_request, reply) => {
     const healthy = await options.repository.health();
     if (!healthy) return reply.code(503).send({ status: 'error', service: 'menoteam-work-map' });
-    return reply.send({ status: 'ok', service: 'menoteam-work-map', version: options.version ?? process.env.APP_VERSION ?? '0.1.0' });
+    return reply.send({ status: 'ok', service: 'menoteam-work-map', version: options.version ?? process.env.APP_VERSION ?? '0.1.1' });
   });
 
   app.post('/mcp', { preHandler: authenticate(options.apiKey) }, async (request, reply) => {

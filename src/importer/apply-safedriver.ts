@@ -23,6 +23,7 @@ export interface SafeDriverCliOptions {
   includePullRequests: boolean;
   apply: boolean;
   confirmInferredOwnerAndState: boolean;
+  preserveInferredOwner?: boolean;
   teammateRef?: string;
   displayName?: string;
   state?: WorkState;
@@ -33,6 +34,7 @@ export interface SafeDriverImportRun {
   mode: "preview" | "apply";
   imported: WorkMapImport;
   write: WriteImportResult;
+  ownerSource?: "confirmed" | "inferred";
 }
 
 export class SafeDriverCliUsageError extends Error {
@@ -44,16 +46,18 @@ export class SafeDriverCliUsageError extends Error {
 
 export const SAFE_DRIVER_USAGE = `Usage: pnpm exec tsx src/importer/apply-safedriver.ts [repo-path] [options]
 
-Preview is the default and is always dry-run. Apply requires all explicit human confirmations:
-  --apply --confirm-inferred-owner-and-state --teammate-ref teammate_... --display-name NAME --state current|completed
+Preview is the default and is always dry-run. Apply requires an explicit owner mapping and state. Use the existing confirmation flag for confirmed ownership, or use --preserve-inferred-owner to keep repository ownership inferred:
+  --apply (--confirm-inferred-owner-and-state | --preserve-inferred-owner) --teammate-ref teammate_... --display-name NAME --state current|completed
 
 Options:
   --repo PATH       Safe Driver Plan checkout (alternative to the positional path)
   --ref REF         Git ref to collect (default: origin/main)
   --no-pr           Skip optional GitHub pull-request metadata
-  --apply           Persist the confirmed import through the six MCP tools
+  --apply           Persist the selected import through the six MCP tools
   --confirm-inferred-owner-and-state
                     Confirm that the supplied human owner and state may be written
+  --preserve-inferred-owner
+                    Keep the repository owner candidate inferred instead of confirmed
   --teammate-ref REF
   --display-name NAME
   --state current|completed
@@ -68,6 +72,7 @@ export function parseApplySafeDriverArgs(
   let includePullRequests = true;
   let apply = false;
   let confirmInferredOwnerAndState = false;
+  let preserveInferredOwner = false;
   let teammateRef: string | undefined;
   let displayName: string | undefined;
   let state: WorkState | undefined;
@@ -90,6 +95,8 @@ export function parseApplySafeDriverArgs(
       apply = true;
     } else if (arg === "--confirm-inferred-owner-and-state") {
       confirmInferredOwnerAndState = true;
+    } else if (arg === "--preserve-inferred-owner") {
+      preserveInferredOwner = true;
     } else if (arg === "--no-pr") {
       includePullRequests = false;
     } else if (arg === "--repo") {
@@ -126,6 +133,7 @@ export function parseApplySafeDriverArgs(
     includePullRequests,
     apply,
     confirmInferredOwnerAndState,
+    preserveInferredOwner,
     ...(teammateRef ? { teammateRef } : {}),
     ...(displayName ? { displayName } : {}),
     ...(state ? { state } : {}),
@@ -137,9 +145,14 @@ export function parseApplySafeDriverArgs(
 
 function validateApplyOptions(options: SafeDriverCliOptions): void {
   if (!options.apply) return;
-  if (!options.confirmInferredOwnerAndState) {
+  if (options.confirmInferredOwnerAndState && options.preserveInferredOwner) {
     throw new SafeDriverCliUsageError(
-      "--apply requires --confirm-inferred-owner-and-state.",
+      "--confirm-inferred-owner-and-state and --preserve-inferred-owner are mutually exclusive.",
+    );
+  }
+  if (!options.confirmInferredOwnerAndState && !options.preserveInferredOwner) {
+    throw new SafeDriverCliUsageError(
+      "--apply requires --confirm-inferred-owner-and-state or --preserve-inferred-owner.",
     );
   }
   if (!options.teammateRef?.trim()) {
@@ -181,16 +194,30 @@ export async function runSafeDriverImport(
         teammateRef: options.teammateRef!,
         displayName: options.displayName!,
         state: options.state!,
+        ownerSource: options.preserveInferredOwner ? "inferred" as const : "confirmed" as const,
       }
     : options.teammateRef && options.displayName && options.state
-      ? { teammateRef: options.teammateRef, displayName: options.displayName, state: options.state }
-      : previewConfirmation(imported);
+      ? {
+          teammateRef: options.teammateRef,
+          displayName: options.displayName,
+          state: options.state,
+          ownerSource: options.preserveInferredOwner ? "inferred" as const : "confirmed" as const,
+        }
+      : {
+          ...previewConfirmation(imported),
+          ownerSource: options.preserveInferredOwner ? "inferred" as const : "confirmed" as const,
+        };
   const writeOptions = makeExplicitBootstrapOptions(imported, confirmation);
   const write = await writeSafeDriverImport(imported, tools, {
     ...writeOptions,
     dryRun: !options.apply,
   });
-  return { mode: options.apply ? "apply" : "preview", imported, write };
+  return {
+    mode: options.apply ? "apply" : "preview",
+    imported,
+    write,
+    ownerSource: writeOptions.ownerSource,
+  };
 }
 
 export function formatSafeDriverSummary(run: SafeDriverImportRun): string {
@@ -204,6 +231,8 @@ export function formatSafeDriverSummary(run: SafeDriverImportRun): string {
   ];
   if (run.mode === "preview") {
     lines.push("No writes performed. Inferred owner/state remain unconfirmed until explicit apply flags are supplied.");
+  } else if (run.ownerSource === "inferred") {
+    lines.push("Owner source: repository inference was preserved as inferred; a human can confirm or override it later.");
   } else {
     lines.push("Owner/state fields: explicitly supplied by the operator; owner provenance preserves repository inference for review.");
   }
@@ -234,7 +263,7 @@ async function withMcpTools<T>(env: McpEnvironment, action: (tools: WorkMapToolC
   const transport = new StreamableHTTPClientTransport(url, {
     requestInit: { headers: { authorization: `Bearer ${apiKey}` } },
   });
-  const client = new Client({ name: "menoteam-safedriver-importer", version: "0.1.0" });
+  const client = new Client({ name: "menoteam-safedriver-importer", version: "0.1.1" });
   try {
     await client.connect(transport);
     return await action(createWorkMapToolClient({
