@@ -106,7 +106,10 @@ async function run(input) {
     }
 
     if (channel !== 'none' && !harness.generic && !harness.nativeChannels.includes(channel)) {
-      fail(checks, `${harnessName} has no verified native ${channel} gateway; use a harness with native ${channel} delivery`);
+      const reason = harnessName === 'codex' && channel === 'discord'
+        ? 'Codex has no native Discord gateway in this setup; Work Map MCP registration alone cannot wake a local Codex app. Use WORK_MAP_CHANNEL=none or a harness with native Discord delivery'
+        : `${harnessName} has no verified native ${channel} gateway; use a harness with native ${channel} delivery`;
+      fail(checks, reason);
     }
 
     if (channel !== 'none') {
@@ -542,6 +545,7 @@ function selfTest() {
   assert.equal(usableAddress('replace-with-native-discord-address'), false);
   assert.equal(roleNeedsTeammateRoute('master'), false);
   assert.equal(roleNeedsTeammateRoute('team-agent'), true);
+  assert.equal(HARNESS.codex.nativeChannels.includes('discord'), false);
   const validHermes = `discord:\n  require_mention: true\n  thread_require_mention: true\n  history_backfill: false\n  auto_thread: false\n  reactions: false\n  bots_require_inline_mention: true\n  allowed_channels:\n    - "123456"\n  channel_skill_bindings:\n    - id: "123456"\n      skills: ["master"]\n`;
   const validHermesEnv = { DISCORD_ALLOW_BOTS: 'mentions' };
   assert.equal(parseHermesDiscordBinding(validHermes, '123456', validHermesEnv).ok, true);

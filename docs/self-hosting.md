@@ -45,14 +45,20 @@ DASHBOARD_PASSWORD=$(openssl rand -hex 32)
 PORT=3000
 HOST=0.0.0.0
 APP_VERSION=0.1.1
+APP_IMAGE=ghcr.io/e2023/menoteam-work-map:v0.1.1
 ALLOWED_HOSTS=localhost,127.0.0.1
 ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 EOF
 chmod 600 .env
-docker compose --env-file .env up -d --build
+docker compose --env-file .env pull app
+docker compose --env-file .env up -d --no-build
 curl --fail --retry 20 --retry-delay 2 http://127.0.0.1:3000/healthz
 docker compose --env-file .env ps
 ```
+
+This runs the reviewed `v0.1.1` app image instead of building the current
+checkout. Use the source-build upgrade flow below only when you deliberately
+want to run locally reviewed source.
 
 The app runs the versioned SQL migrations during startup. The migration runner
 uses a PostgreSQL advisory lock, so starting more than one app replica does not

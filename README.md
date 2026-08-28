@@ -31,9 +31,15 @@ database, MCP, and dashboard credentials.
 
 ```bash
 cp .env.example .env
-# Replace every placeholder in .env, then:
-docker compose up -d --build
+# Replace every placeholder in .env and add:
+# APP_IMAGE=ghcr.io/e2023/menoteam-work-map:v0.1.1
+docker compose pull app
+docker compose up -d --no-build
 ```
+
+This is the published-image path for a new team. Use the source-build flow in
+the [self-hosting guide](docs/self-hosting.md) only when you deliberately want
+to run locally reviewed source.
 
 Open `http://127.0.0.1:3000/dashboard`, then follow:
 

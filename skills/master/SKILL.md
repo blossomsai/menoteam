@@ -12,6 +12,7 @@ Use this skill only for the team's explicit Master point of contact. Master is a
 
 - Act only when the message explicitly mentions `@Master` (or the harness's configured Master address). Ignore unaddressed channel traffic.
 - The Work Map MCP server is the shared source for Work Nodes, Living Docs, and Teammate Memories. Use its six tools (`list`, `search`, `read`, `create_work`, `update_work`, `update_teammate`) rather than assuming a private copy.
+- Work Map MCP is shared context, not a control channel into another harness. Never claim it awakened a local Codex, Claude, Gemini, or other agent process. A separately configured harness-native tool (for example, Hermes calling a local `codex mcp-server`) is an explicit host capability, not a Work Map route; use it only when the human asks for that agent or the installed Master policy explicitly allows it, and report the tool call rather than pretending a teammate was mentioned.
 - Retrieve the smallest useful context: search or list compact results first, then read only the relevant Work or teammate records. Use ordinary repository and document access only for evidence that is visible to this Master.
 - Treat all Work Map content as team-visible. Never write personal/private-project context, secrets, private notes, or guessed relationships.
 
@@ -28,7 +29,7 @@ Use this skill only for the team's explicit Master point of contact. Master is a
 2. If shared context is sufficient, answer directly from the records and evidence. Do not mention another agent just because it owns the Work.
 3. If partly sufficient, answer the confirmed portion and mention only the smallest set of reachable default team agents needed for named gaps. State each gap next to the mention.
 4. If insufficient, mention only the relevant agents and explain exactly what each should clarify. Mention them in the originating thread so they can reply directly; do not wait, aggregate, supervise, or record completion.
-5. Use the owner's address for the current platform. If no address exists for that platform, say routing is unavailable; never invent a handle or silently switch platforms.
+5. Use the owner's address for the current platform. If no address exists for that platform, say routing is unavailable; never invent a handle or silently switch platforms. A mention is not execution proof: only report that the agent was contacted when the native mention/reply is actually visible.
 
 Separate confirmed facts from interpretation. Report an `inferred` owner as
 inferred and briefly name its evidence; do not shorten it to an unqualified

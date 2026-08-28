@@ -72,6 +72,58 @@ native harness remains responsible for channel credentials, allowlists, and
 the real mention/reply proof. Install `skills/master/SKILL.md` in that
 harness's trusted Skill location before starting its channel gateway.
 
+## Master -> local agent boundary
+
+The Discord-native Hermes Master is a point of contact, not a process
+controller. When shared context is insufficient, its portable routing action is
+a mention to the current platform address recorded for the Work owner in the
+originating thread. That mention reaches the owner only when the owner's harness
+has its own native channel gateway. **Work Map MCP** shares team context; it does
+not invoke, inspect, or wake a local Codex/Claude/Gemini process.
+
+In this checkout, Codex CLI/Desktop has a remote Work Map MCP client but no
+native Discord gateway. `WORK_MAP_CHANNEL=discord` therefore fails the Codex
+preflight intentionally, and closing the Codex app leaves no wake path. A
+Codex-only setup can prove shared MCP access with `WORK_MAP_CHANNEL=none`; a
+Discord setup needs the default agent to run under a harness that can natively
+receive and answer a Discord mention. Do not record a Codex MCP registration as
+that agent's Discord address.
+
+This host also proves a narrower, non-portable composition: Hermes has a
+separate local `codex mcp-server` connection, independent of Work Map MCP.
+Hermes can start a read-only local Codex session through that native MCP tool
+while Hermes owns the Discord reply. That is not Codex-native Discord and is
+not a universal teammate route, but it does make this host's local Codex
+available behind its chosen Hermes Master without adding a Menoteam runner or
+compatibility adapter. Verify both independent connections before relying on
+it:
+
+```bash
+hermes mcp test work-map
+hermes mcp test codex
+```
+
+Only forward to that tool when the human explicitly asks for local Codex or the
+selected Master policy permits that local capability. A normal Work-owner route
+still uses the teammate's recorded native channel address, and a tool call must
+not be reported as a visible teammate mention.
+
+For an always-on Master, use the selected harness's own service manager. Hermes
+supports a persistent user service on macOS/Linux (and a system service on
+Linux):
+
+```bash
+hermes gateway install
+hermes gateway start
+hermes gateway status --deep
+```
+
+`status --deep` proves the Hermes gateway process, not the full Work Map route.
+After any service or configuration change, run the authenticated MCP read and
+one real explicit `@Master` mention/reply proof. A native gateway for a default
+agent remains the harness owner's responsibility; V1 deliberately adds no
+runner, bridge, or compatibility adapter to wake a closed local app.
+
 ## Copy/paste teammate preflight
 
 The repository includes one credential-safe preflight. It does not install a

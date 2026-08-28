@@ -22,7 +22,9 @@ Use the exact version tag for deployments and rollback. `latest` and the
 
 Before creating a tag:
 
-1. Update `package.json` to the next version and review the complete diff.
+1. Update `package.json` and the public quickstart image tags in `README.md`
+   and `docs/self-hosting.md` to the next version, then review the complete
+   diff.
 2. Run the same source checks used by the release gate:
 
    ```bash
