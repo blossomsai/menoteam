@@ -1,0 +1,4 @@
+# Install this only on the Master Codex host. Teammate Codex endpoints do not get this MCP credential.
+[mcp_servers.agent-gateway]
+url = "https://agents.example.com/mcp"
+bearer_token_env_var = "MENOTEAM_MASTER_MCP_KEY"

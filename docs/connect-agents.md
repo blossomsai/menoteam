@@ -1,8 +1,11 @@
-# Connect existing agents to Work Map
+# Advanced: connect native harnesses directly to Work Map
 
-This is the smallest V1 connection path for teams that already use an agent
-harness and a native Slack or Discord channel. It is intentionally not a
-runner, bridge, channel bot, or control plane.
+> This is not the default Menoteam Agent Network setup. For one Slack app, one always-on Master, and many opt-in Codex endpoints, start with [Agent Network quickstart](agent-network-v1.md). The Hermes/Discord path below is an optional harness-native integration and is not required on any Codex computer.
+
+This document covers the Work Map-only connection path for teams that already
+use an agent harness and a native Slack or Discord channel. Work Map remains
+shared context, not a runner. Teams that need one Slack app to wake opt-in local
+Codex sessions should use the separate [Agent Network V1](agent-network-v1.md).
 
 ```text
 Slack/Discord <-> native harness gateway <-> existing agent
@@ -25,7 +28,7 @@ credential values, token files, message history, or private configuration.
 
 | Harness | Local result | Relevant upstream capability | What remains operator-owned |
 | --- | --- | --- | --- |
-| Hermes Agent | v0.20.6 installed; Work Map remote MCP discovers all six tools; local Codex MCP and the Master Skill are enabled | Native Discord gateway and remote HTTP MCP client; MCP tools are discovered and exposed to platform toolsets | Add `DISCORD_BOT_TOKEN`, bind the selected channel to the Skill's frontmatter name `master` with the strict channel policy, add guild/channel/user allowlists, then prove one explicit mention/reply |
+| Hermes Agent | Previously evaluated as an optional harness; it is not part of the default Codex Agent Network | Native Discord gateway and remote HTTP MCP client | Install and operate it only on the chosen always-on harness host; it is not needed on teammate Codex computers |
 | pi agent | `pi` not found; `~/.pi` absent | Use the generic path when the installed Pi release exposes MCP, Skills, and a native channel gateway | Install/configure Pi and repeat the same MCP read plus native channel mention/reply proof |
 | OpenClaw | `openclaw` not found; `~/.openclaw` absent | Native Discord gateway; MCP client registry for Streamable HTTP; local `SKILL.md` install | Install OpenClaw, configure Discord bot/pairing/allowlists, install the Skill, and inject the Work Map key |
 | Codex CLI | Present at `/Applications/ChatGPT.app/Contents/Resources/codex`; `work-map` is registered as Streamable HTTP and a direct authenticated `list` completed | `codex mcp` supports remote Streamable HTTP and bearer-token env vars; `/mcp` shows connections | Inject `WORK_MAP_MCP_API_KEY` into each Codex process and install the appropriate Skill; Codex has no Discord gateway in this local capability set |
@@ -74,20 +77,17 @@ harness's trusted Skill location before starting its channel gateway.
 
 ## Master -> local agent boundary
 
-The Discord-native Hermes Master is a point of contact, not a process
-controller. When shared context is insufficient, its portable routing action is
-a mention to the current platform address recorded for the Work owner in the
-originating thread. That mention reaches the owner only when the owner's harness
-has its own native channel gateway. **Work Map MCP** shares team context; it does
-not invoke, inspect, or wake a local Codex/Claude/Gemini process.
+The Master is a point of contact, not a process controller. When shared context
+is insufficient, it either uses a harness-native mention or the separately
+deployed Agent Gateway. **Work Map MCP** shares team context; it does not invoke,
+inspect, or wake a local Codex/Claude/Gemini process. Agent Gateway routing must
+be configured and proven independently.
 
-In this checkout, Codex CLI/Desktop has a remote Work Map MCP client but no
-native Discord gateway. `WORK_MAP_CHANNEL=discord` therefore fails the Codex
-preflight intentionally, and closing the Codex app leaves no wake path. A
-Codex-only setup can prove shared MCP access with `WORK_MAP_CHANNEL=none`; a
-Discord setup needs the default agent to run under a harness that can natively
-receive and answer a Discord mention. Do not record a Codex MCP registration as
-that agent's Discord address.
+Codex CLI/Desktop has a remote Work Map MCP client but is not itself a native
+Slack or Discord gateway. A Codex-only setup can prove shared MCP access with
+`WORK_MAP_CHANNEL=none`. The optional Local Connector supplies a separate,
+outbound wake path for one dedicated Codex Linked Session; installing a plugin
+or registering Work Map MCP alone does not.
 
 This host also proves a narrower, non-portable composition: Hermes has a
 separate local `codex mcp-server` connection, independent of Work Map MCP.
