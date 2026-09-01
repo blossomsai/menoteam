@@ -56,7 +56,7 @@ function validatedMcpUrl(value) {
   const url = new URL(value);
   const isLocal = ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
   if (url.protocol !== 'https:' && !(isLocal && url.protocol === 'http:')) throw new Error('WORK_MAP_MCP_URL must use HTTPS (HTTP is allowed only for localhost)');
-  if (url.username || url.password || url.search || url.hash || url.pathname.replace(/\/+$/u, '') !== '/mcp') {
+  if (url.username || url.password || url.search || url.hash || !url.pathname.replace(/\/+$/u, '').endsWith('/mcp')) {
     throw new Error('WORK_MAP_MCP_URL must end in /mcp and contain no credentials, query, or fragment');
   }
   return url.toString().replace(/\/+$/u, '');

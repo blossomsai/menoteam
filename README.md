@@ -53,8 +53,8 @@ Open `http://127.0.0.1:3000/dashboard`, then follow:
 3. [Advanced: connect other native harnesses](docs/connect-agents.md)
 4. [Read the V1 product and architecture spec](docs/work-map-v1-spec.md)
 
-Every teammate Codex installs the same team plugin but receives its own endpoint
-token. Hermes Master uses the small connector in `connectors/hermes/` on a
+Every teammate Codex installs the same team plugin, confirms one repository,
+and completes one short admin-approved device pairing. Hermes Master uses the small connector in `connectors/hermes/` on a
 separate always-on macOS or Linux host. A sleeping teammate computer simply
 appears offline.
 

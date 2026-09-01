@@ -24,13 +24,13 @@ different revocable endpoint token.
 
 | Role | Runs where | Receives |
 | --- | --- | --- |
-| Operator | Always-on Menoteam server | Slack credentials and endpoint registry |
+| Operator | Always-on Menoteam server | Slack credentials, pairing admin password, and endpoint registry |
 | Master | Separate always-on computer | Hermes profile, Master endpoint token, Master MCP key, Work Map key |
-| Teammate | Each colleague's Codex computer | That colleague's endpoint token and Work Map key |
+| Teammate | Each colleague's Codex computer | Locally generated Connector and scoped Work Map proxy tokens |
 
 Do not run Master on a laptop that frequently sleeps. Installing the Codex
-plugin does not make a computer Master; the role comes from its one-time
-handoff file.
+plugin does not make a computer Master. Device pairing creates teammate Codex
+endpoints only; Master still uses its deliberate operator handoff.
 
 ## 1. Operator: deploy Gateway beside Work Map
 
@@ -49,6 +49,24 @@ Configure one Slack app with:
 
 Keep the Slack bot token and signing secret only on this server. Expose Gateway
 through the existing HTTPS reverse proxy; its Compose port is loopback-only.
+
+To enable teammate device pairing, configure all five values together:
+
+```dotenv
+AGENT_GATEWAY_REGISTRY_FILE=/data/connectors.json
+AGENT_GATEWAY_PUBLIC_URL=https://agents.example.com
+AGENT_GATEWAY_ADMIN_PASSWORD=replace-with-a-separate-admin-password
+WORK_MAP_MCP_URL=https://team.example.com/mcp
+WORK_MAP_MCP_API_KEY=replace-with-the-work-map-upstream-key
+```
+
+The named Compose volume persists approved paired endpoints and pairing
+metadata. Gateway uses the Work Map key only as the upstream credential for
+the scoped `/v1/work-map/mcp` proxy; teammate devices receive separate,
+revocable proxy tokens instead of the shared upstream key. If that additional
+Gateway authority is unacceptable for your threat model, leave pairing
+disabled and use the legacy handoff path until Work Map supports native
+per-agent credentials.
 
 ## 2. Operator: create the Hermes Master handoff
 
@@ -127,24 +145,7 @@ If another service already owns this Hermes Gateway/API, install with
 `--manage-hermes-gateway false`; that operator-managed process must expose the
 same loopback API URL and key. The default managed mode is simpler.
 
-## 4. Operator: create one handoff per Codex teammate
-
-```bash
-./scripts/gateway-admin-docker.sh add \
-  --env /absolute/path/to/menoteam/.env.gateway \
-  --id alice-codex \
-  --label "Alice · Codex" \
-  --role teammate \
-  --harness codex \
-  --gateway-url https://agents.example.com \
-  --work-map-url https://team.example.com/mcp \
-  --work-map-env /absolute/path/to/menoteam/.env \
-  --output /absolute/path/to/menoteam/handoffs/alice-codex.env
-```
-
-Restart Gateway, then send only `alice-codex.env` to Alice.
-
-## 5. Teammate: install the Codex Connector
+## 4. Teammate: pair the Codex Connector
 
 Alice installs the same plugin from a reviewed checkout:
 
@@ -156,31 +157,36 @@ codex plugin add menoteam-agent@blossomsai
 In a new Codex task, Alice can say:
 
 ```text
-Use the Menoteam Agent skill to install this computer from
-/secure/path/alice-codex.env. Link it to the current repository.
+Connect this repository to Menoteam at https://agents.example.com
 ```
 
 Equivalent manual command:
 
 ```bash
-/absolute/path/to/menoteam/plugins/menoteam-agent/scripts/setup.sh install \
-  --config /secure/path/alice-codex.env \
+/absolute/path/to/menoteam/plugins/menoteam-agent/scripts/setup.sh connect \
+  --gateway-url https://agents.example.com \
   --repository-cwd /absolute/path/to/repository
 ```
 
-The setup registers Work Map MCP and creates a background LaunchAgent or
-systemd service. A teammate handoff is rejected if it contains the Master MCP
-key. Delete the handoff after status succeeds.
+The setup reports the canonical repository path and a short approval code. It
+generates two high-entropy credentials locally and sends only their SHA-256
+digests to Gateway. No `.env` handoff is created or transferred.
+
+The operator opens `https://agents.example.com/agents`, unlocks it with the
+separate Gateway admin password, confirms the same code with Alice, and clicks
+**Approve**. Setup then registers the scoped Work Map proxy MCP and creates a
+background LaunchAgent or systemd service.
 
 This Connector resumes one dedicated linked Codex task. It uses that host's
 Codex account, configuration, MCP registrations, skills, repository
 instructions, and permitted environment, but it does **not** attach to the
 currently visible Desktop chat or inherit unsaved UI state.
 
-Repeat with a unique endpoint ID and token for each colleague. There is still
-only one Slack app.
+Repeat the same pairing flow for each colleague. Gateway assigns a unique
+endpoint ID and every device keeps unique credentials. There is still only one
+Slack app.
 
-## 6. Use it in Slack
+## 5. Use it in Slack
 
 1. An allowlisted person mentions the one Slack bot in an allowlisted channel.
 2. Gateway wakes `master-hermes`.
@@ -216,6 +222,10 @@ Rotate an endpoint after a lost handoff or computer move:
 Restart Gateway immediately after rotation. Rotating Master also rotates the
 Master MCP key.
 
+Paired teammate endpoints can be revoked immediately from `/agents`; no
+Gateway restart is required. The CLI below remains for legacy env-configured
+endpoints.
+
 Revoke a teammate and restart Gateway:
 
 ```bash
@@ -247,8 +257,9 @@ The active Master cannot be revoked until a replacement Master is added.
 - Claude teammate routing is **not implemented yet**. The Gateway protocol is
   small enough to add it later, but registering fake Claude endpoints would be
   misleading.
-- Gateway presence and in-flight jobs are memory-only. A sleeping or offline
-  computer is unavailable; there is no hidden durable execution queue.
+- Approved paired endpoints and their credential digests are durable. Presence
+  and in-flight jobs remain memory-only: a sleeping or offline computer is
+  unavailable, and there is no hidden durable execution queue.
 - The central server stores no agent transcript. Hermes and Codex retain their
   own local session state.
 

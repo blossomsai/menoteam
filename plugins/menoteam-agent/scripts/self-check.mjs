@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { JsonRpcClient, childEnvironment, configFromEnv, wrapGatewayJob, wrapPrompt } from './connector.mjs';
-import { agentPaths, installAgent, parseHandoff, renderLaunchAgent, renderSystemdUnit, sanitizedConfig, statusAgent, uninstallAgent } from './setup.mjs';
+import { agentPaths, connectAgent, installAgent, parseHandoff, renderLaunchAgent, renderSystemdUnit, sanitizedConfig, statusAgent, uninstallAgent } from './setup.mjs';
 
 const config = configFromEnv({
   MENOTEAM_GATEWAY_URL: 'https://agents.example.com/',
@@ -115,13 +116,56 @@ try {
     '',
   ].join('\n'), { mode: 0o600 });
   const runtime = { platform: 'darwin', home, skipCommands: true, codexPath: process.execPath, nodePath: process.execPath };
-  const installed = await installAgent({ config: handoff }, runtime);
+  await assert.rejects(installAgent({ config: handoff }, runtime), /--repository-cwd is required/u);
+  const installed = await installAgent({ config: handoff, 'repository-cwd': repository }, runtime);
   assert.equal((await stat(installed.config)).mode & 0o777, 0o600);
   assert.doesNotMatch(await readFile(installed.service, 'utf8'), /a{32}/u);
   assert.deepEqual(await statusAgent({ endpoint: 'alice-codex' }, runtime), expectStatus(installed));
   await uninstallAgent({ endpoint: 'alice-codex' }, runtime);
   await assert.rejects(access(installed.config));
   await assert.rejects(access(installed.service));
+
+  let pairingRequest;
+  let pairingDeviceCode;
+  let output = '';
+  const pairedRuntime = {
+    ...runtime,
+    fetch: async (url, init) => {
+      if (String(url).endsWith('/v1/pairings')) {
+        pairingRequest = JSON.parse(init.body);
+        pairingDeviceCode = String(init.headers.authorization).replace(/^Bearer /u, '');
+        return new Response(JSON.stringify({
+          pairing_id: '11111111-1111-4111-8111-111111111111',
+          user_code: 'ABCD-2345',
+          verification_url: 'https://agents.example.com/agents',
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          interval_seconds: 1,
+        }), { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      assert.equal(init.headers.authorization, `Bearer ${pairingDeviceCode}`);
+      return new Response(JSON.stringify({
+        status: 'approved',
+        endpoint_id: 'paired-codex',
+        endpoint_label: 'Paired · Codex',
+        work_map_url: 'https://agents.example.com/v1/work-map/mcp',
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    },
+    sleep: async () => undefined,
+    write: (message) => { output += message; },
+  };
+  const paired = await connectAgent({
+    'gateway-url': 'https://agents.example.com',
+    'repository-cwd': repository,
+    label: 'Paired · Codex',
+  }, pairedRuntime);
+  const pairedConfig = parseHandoff(await readFile(paired.config, 'utf8'));
+  assert.equal(hash(pairedConfig.MENOTEAM_AGENT_TOKEN), pairingRequest.connector_token_sha256);
+  assert.equal(hash(pairedConfig.WORK_MAP_MCP_API_KEY), pairingRequest.work_map_token_sha256);
+  assert.notEqual(pairedConfig.MENOTEAM_AGENT_TOKEN, pairedConfig.WORK_MAP_MCP_API_KEY);
+  assert.doesNotMatch(output, new RegExp(pairedConfig.MENOTEAM_AGENT_TOKEN, 'u'));
+  assert.doesNotMatch(output, new RegExp(pairedConfig.WORK_MAP_MCP_API_KEY, 'u'));
+  assert.match(output, /Repository confirmed/u);
+  await uninstallAgent({ endpoint: 'paired-codex' }, runtime);
 } finally {
   await rm(temporary, { recursive: true, force: true });
 }
@@ -136,4 +180,8 @@ function expectStatus(installed) {
     config: installed.config,
     service: installed.service,
   };
+}
+
+function hash(value) {
+  return createHash('sha256').update(value).digest('hex');
 }

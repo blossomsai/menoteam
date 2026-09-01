@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, chmod, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { homedir, platform } from 'node:os';
+import { homedir, hostname, platform } from 'node:os';
 import { basename, delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { configFromEnv } from './connector.mjs';
@@ -89,11 +90,16 @@ export function sanitizedConfig(values, { codexPath }) {
 }
 
 export async function installAgent(options, runtime = {}) {
-  const platformName = runtime.platform ?? platform();
-  if (platformName !== 'darwin' && platformName !== 'linux') throw new Error('Automatic background setup currently supports macOS and Linux');
   const handoffPath = resolve(requiredOption(options, 'config'));
   const handoff = parseHandoff(await readFile(handoffPath, 'utf8'));
-  handoff.MENOTEAM_REPOSITORY_CWD = resolve(options['repository-cwd'] || handoff.MENOTEAM_REPOSITORY_CWD || process.cwd());
+  const repositoryCwd = resolve(requiredOption(options, 'repository-cwd'));
+  return installAgentValues(handoff, { repositoryCwd, handoffPath }, runtime);
+}
+
+export async function installAgentValues(values, options, runtime = {}) {
+  const platformName = runtime.platform ?? platform();
+  if (platformName !== 'darwin' && platformName !== 'linux') throw new Error('Automatic background setup currently supports macOS and Linux');
+  const handoff = { ...values, MENOTEAM_REPOSITORY_CWD: resolve(requiredOption(options, 'repositoryCwd')) };
   const codexPath = runtime.codexPath ?? await findExecutable(handoff.CODEX_BIN || 'codex', codexFallbacks());
   const nodePath = runtime.nodePath ?? process.execPath;
   const { config, contents } = sanitizedConfig(handoff, { codexPath });
@@ -152,7 +158,85 @@ export async function installAgent(options, runtime = {}) {
       run('systemctl', [...prefix, 'enable', '--now', paths.unit]);
     }
   }
-  return { ...paths, endpointId: config.endpointId, role: config.role, handoffPath };
+  return { ...paths, endpointId: config.endpointId, role: config.role, handoffPath: options.handoffPath };
+}
+
+export async function connectAgent(options, runtime = {}) {
+  const gatewayUrl = validatedGatewayUrl(requiredOption(options, 'gateway-url'));
+  const repositoryCwd = resolve(requiredOption(options, 'repository-cwd'));
+  const repository = await stat(repositoryCwd).catch(() => null);
+  if (!repository?.isDirectory()) throw new Error('--repository-cwd must be an existing directory');
+  const fetchImpl = runtime.fetch ?? fetch;
+  const pairing = await requestPairing({ gatewayUrl, label: options.label || `${hostname()} · Codex`, fetchImpl });
+  const write = runtime.write ?? ((message) => process.stdout.write(message));
+  write(`Repository confirmed: ${repositoryCwd}\nApproval code: ${pairing.user_code}\nOpen ${pairing.verification_url} and ask a Menoteam admin to approve this code.\n`);
+  const credentials = await waitForPairing({
+    gatewayUrl,
+    pairing,
+    fetchImpl,
+    sleep: runtime.sleep,
+    now: runtime.now,
+  });
+  const installed = await installAgentValues({
+    MENOTEAM_GATEWAY_URL: gatewayUrl,
+    MENOTEAM_AGENT_ENDPOINT: credentials.endpoint_id,
+    MENOTEAM_AGENT_TOKEN: pairing.connector_token,
+    MENOTEAM_AGENT_ROLE: 'teammate',
+    MENOTEAM_AGENT_HARNESS: 'codex',
+    WORK_MAP_MCP_URL: credentials.work_map_url,
+    WORK_MAP_MCP_API_KEY: pairing.work_map_token,
+  }, { repositoryCwd }, runtime);
+  return { ...installed, userCode: pairing.user_code };
+}
+
+export async function requestPairing({ gatewayUrl, label, fetchImpl = fetch }) {
+  const deviceCode = randomBytes(32).toString('base64url');
+  const connectorToken = randomBytes(32).toString('base64url');
+  const workMapToken = randomBytes(32).toString('base64url');
+  const response = await fetchImpl(`${gatewayUrl}/v1/pairings`, {
+    method: 'POST',
+    headers: { accept: 'application/json', authorization: `Bearer ${deviceCode}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      label,
+      harness: 'codex',
+      connector_token_sha256: sha256(connectorToken),
+      work_map_token_sha256: sha256(workMapToken),
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Error(`Menoteam pairing request failed (${response.status})`);
+  const body = await response.json();
+  if (!body || typeof body.pairing_id !== 'string' || typeof body.user_code !== 'string' || typeof body.verification_url !== 'string' || typeof body.expires_at !== 'string') {
+    throw new Error('Menoteam Gateway returned an invalid pairing response');
+  }
+  const verificationUrl = new URL(body.verification_url);
+  if (verificationUrl.origin !== new URL(gatewayUrl).origin || verificationUrl.protocol !== new URL(gatewayUrl).protocol) {
+    throw new Error('Menoteam Gateway returned an invalid verification URL');
+  }
+  return { ...body, device_code: deviceCode, connector_token: connectorToken, work_map_token: workMapToken, interval_seconds: boundedInteger(body.interval_seconds, 2, 1, 10) };
+}
+
+export async function waitForPairing({ gatewayUrl, pairing, fetchImpl = fetch, sleep = delay, now = Date.now }) {
+  const expiresAt = Date.parse(pairing.expires_at);
+  if (!Number.isFinite(expiresAt)) throw new Error('Menoteam Gateway returned an invalid pairing expiry');
+  while (now() < expiresAt) {
+    const response = await fetchImpl(`${gatewayUrl}/v1/pairings/${encodeURIComponent(pairing.pairing_id)}/token`, {
+      method: 'POST',
+      headers: { accept: 'application/json', authorization: `Bearer ${pairing.device_code}` },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (response.status === 202) {
+      await sleep(pairing.interval_seconds * 1_000);
+      continue;
+    }
+    if (!response.ok) throw new Error(`Menoteam pairing failed (${response.status})`);
+    const body = await response.json();
+    if (!body || body.status !== 'approved' || typeof body.endpoint_id !== 'string' || typeof body.work_map_url !== 'string') {
+      throw new Error('Menoteam Gateway returned an invalid approval');
+    }
+    return body;
+  }
+  throw new Error('Menoteam pairing approval expired');
 }
 
 export async function statusAgent(options, runtime = {}) {
@@ -245,6 +329,28 @@ function codexFallbacks() {
   return platform() === 'darwin' ? ['/Applications/ChatGPT.app/Contents/Resources/codex'] : [];
 }
 
+function validatedGatewayUrl(value) {
+  const url = new URL(value);
+  const local = ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) throw new Error('Gateway URL must use HTTPS (HTTP is allowed only for localhost)');
+  if (url.username || url.password || url.search || url.hash) throw new Error('Gateway URL must not contain credentials, query, or fragment');
+  return url.toString().replace(/\/+$/u, '');
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function delay(milliseconds) {
+  return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const number = Number(value ?? fallback);
+  if (!Number.isInteger(number) || number < minimum || number > maximum) throw new Error('Menoteam Gateway returned an invalid polling interval');
+  return number;
+}
+
 async function atomicWrite(path, contents, mode) {
   const temporary = `${path}.${process.pid}.tmp`;
   await writeFile(temporary, contents, { mode });
@@ -319,7 +425,8 @@ function parseArgs(argv) {
 function usage() {
   return [
     'Usage:',
-    '  node setup.mjs install --config /secure/path/agent.env [--repository-cwd /path/to/repo]',
+    '  node setup.mjs connect --gateway-url https://agents.example.com --repository-cwd /path/to/repo [--label "Alice · Codex"]',
+    '  node setup.mjs install --config /secure/path/agent.env --repository-cwd /path/to/repo',
     '  node setup.mjs status --endpoint alice-codex',
     '  node setup.mjs uninstall --endpoint alice-codex',
   ].join('\n');
@@ -327,6 +434,11 @@ function usage() {
 
 async function main() {
   const { command, options } = parseArgs(process.argv.slice(2));
+  if (command === 'connect') {
+    const result = await connectAgent(options);
+    process.stdout.write(`Menoteam teammate connected: ${result.endpointId}\nBackground Connector started. No handoff file was created.\n`);
+    return;
+  }
   if (command === 'install') {
     const result = await installAgent(options);
     process.stdout.write(`Menoteam ${result.role} installed: ${result.endpointId}\nBackground Connector started. Delete the one-time handoff file after confirming status.\n`);

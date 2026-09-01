@@ -1,25 +1,33 @@
 import { z } from 'zod';
 import { createGatewayApp } from './app.js';
+import { PairingManager } from './pairing.js';
+import { endpointLabelSchema, GatewayRegistry } from './registry.js';
 import { AgentRouter, type AgentEndpointConfig } from './router.js';
 import { createSlackReplyPoster, createSlackThreadPoster } from './slack.js';
 
 const endpointSchema = z.object({
   id: z.string().regex(/^[a-z0-9][a-z0-9-]{1,62}$/u),
-  label: z.string().trim().min(1).max(80).refine((value) => !/[<>]/u.test(value), 'label cannot contain Slack control characters'),
+  label: endpointLabelSchema,
   harness: z.enum(['codex', 'hermes']),
   token_sha256: z.string().regex(/^[a-f0-9]{64}$/u),
 }).strict().transform(({ token_sha256, ...endpoint }) => ({ ...endpoint, tokenSha256: token_sha256 }));
 
 const endpoints = parseEndpoints(required('AGENT_GATEWAY_CONNECTORS_JSON'));
+const pairingConfig = readPairingConfig();
+const registry = await GatewayRegistry.open(endpoints, pairingConfig?.registryFile ?? process.env.AGENT_GATEWAY_REGISTRY_FILE);
 const masterEndpointId = required('AGENT_GATEWAY_MASTER_ENDPOINT');
-if (!endpoints.some((endpoint) => endpoint.id === masterEndpointId)) throw new Error('AGENT_GATEWAY_MASTER_ENDPOINT is not configured');
+if (!registry.list().some((endpoint) => endpoint.id === masterEndpointId)) throw new Error('AGENT_GATEWAY_MASTER_ENDPOINT is not configured');
 const allowedSlackChannels = splitSlackIds('SLACK_ALLOWED_CHANNEL_IDS', /^[CG][A-Z0-9]+$/u);
 const slackBotToken = requiredSecret('SLACK_BOT_TOKEN', 20, 'xoxb-');
 const postThreadMessage = createSlackThreadPoster(slackBotToken);
-const router = new AgentRouter(endpoints, {
+const router = new AgentRouter(registry.connectorConfigs(), {
   allowedSlackChannels,
   onReply: createSlackReplyPoster(slackBotToken),
 });
+const pairingManager = pairingConfig ? new PairingManager(registry, router, {
+  gatewayUrl: pairingConfig.publicUrl,
+  workMapUrl: `${pairingConfig.publicUrl}/v1/work-map/mcp`,
+}) : undefined;
 const app = await createGatewayApp({
   router,
   masterKey: requiredSecret('AGENT_GATEWAY_MASTER_KEY', 32),
@@ -27,6 +35,14 @@ const app = await createGatewayApp({
   allowedHosts: splitRequired('AGENT_GATEWAY_ALLOWED_HOSTS'),
   trustProxy: process.env.AGENT_GATEWAY_TRUST_PROXY === 'true',
   version: process.env.APP_VERSION,
+  pairing: pairingConfig && pairingManager ? {
+    manager: pairingManager,
+    registry,
+    adminPassword: pairingConfig.adminPassword,
+    masterEndpointId,
+    workMapUpstreamUrl: pairingConfig.workMapUrl,
+    workMapUpstreamKey: pairingConfig.workMapKey,
+  } : undefined,
   slack: {
     signingSecret: requiredSecret('SLACK_SIGNING_SECRET', 20),
     botUserId: validatedSlackId('SLACK_BOT_USER_ID', /^U[A-Z0-9]+$/u),
@@ -65,6 +81,58 @@ export function parseEndpoints(value: string): AgentEndpointConfig[] {
     throw new Error('AGENT_GATEWAY_CONNECTORS_JSON contains duplicate endpoint token digests');
   }
   return endpoints;
+}
+
+interface PairingRuntimeConfig {
+  registryFile: string;
+  publicUrl: string;
+  adminPassword: string;
+  workMapUrl: string;
+  workMapKey: string;
+}
+
+function readPairingConfig(): PairingRuntimeConfig | undefined {
+  const values = {
+    registryFile: process.env.AGENT_GATEWAY_REGISTRY_FILE,
+    publicUrl: process.env.AGENT_GATEWAY_PUBLIC_URL,
+    adminPassword: process.env.AGENT_GATEWAY_ADMIN_PASSWORD,
+    workMapUrl: process.env.WORK_MAP_MCP_URL,
+    workMapKey: process.env.WORK_MAP_MCP_API_KEY,
+  };
+  if (!Object.values(values).some(Boolean)) return undefined;
+  if (!Object.values(values).every(Boolean)) {
+    throw new Error('Pairing requires AGENT_GATEWAY_REGISTRY_FILE, AGENT_GATEWAY_PUBLIC_URL, AGENT_GATEWAY_ADMIN_PASSWORD, WORK_MAP_MCP_URL, and WORK_MAP_MCP_API_KEY');
+  }
+  return {
+    registryFile: values.registryFile!,
+    publicUrl: validatedBaseUrl(values.publicUrl!),
+    adminPassword: validatedSecret('AGENT_GATEWAY_ADMIN_PASSWORD', values.adminPassword!, 16),
+    workMapUrl: validatedMcpUrl(values.workMapUrl!),
+    workMapKey: validatedSecret('WORK_MAP_MCP_API_KEY', values.workMapKey!, 32),
+  };
+}
+
+function validatedBaseUrl(value: string): string {
+  const url = new URL(value);
+  const local = ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) throw new Error('AGENT_GATEWAY_PUBLIC_URL must use HTTPS (HTTP is allowed only for localhost)');
+  if (url.username || url.password || url.search || url.hash) throw new Error('AGENT_GATEWAY_PUBLIC_URL must not contain credentials, query, or fragment');
+  return url.toString().replace(/\/+$/u, '');
+}
+
+function validatedMcpUrl(value: string): string {
+  const url = new URL(value);
+  const local = ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) throw new Error('WORK_MAP_MCP_URL must use HTTPS (HTTP is allowed only for localhost)');
+  if (url.username || url.password || url.search || url.hash || !url.pathname.replace(/\/+$/u, '').endsWith('/mcp')) {
+    throw new Error('WORK_MAP_MCP_URL must end in /mcp and contain no credentials, query, or fragment');
+  }
+  return url.toString().replace(/\/+$/u, '');
+}
+
+function validatedSecret(name: string, value: string, minimumLength: number): string {
+  if (value.length < minimumLength || /replace|example/iu.test(value)) throw new Error(`${name} is missing or invalid`);
+  return value;
 }
 
 function required(name: string): string {

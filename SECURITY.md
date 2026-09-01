@@ -76,6 +76,33 @@ proofs required for a Discord setup: authenticated MCP access and an explicit
 native mention/reply in the original Discord thread. Do not claim Discord
 support from an MCP health check or a bot login alone.
 
+## Agent Gateway pairing boundary
+
+Self-service pairing is optional and belongs to Agent Gateway, not the Work Map
+domain. It requires a separate `AGENT_GATEWAY_ADMIN_PASSWORD`, a writable
+Gateway state file, the public HTTPS Gateway URL, and the Work Map upstream URL
+and key. Configure all pairing values together or leave the feature disabled.
+
+The teammate device generates three independent high-entropy values locally:
+the Connector token, the scoped Work Map proxy token, and a short-lived device
+authorization secret. Only SHA-256 digests cross the enrollment boundary or
+enter the durable Gateway state file. The displayed eight-character user code
+is a comparison label, not an authentication credential. Approval expires
+after ten minutes and cannot create or revoke the active Master.
+
+The `/agents` page uses a signed `HttpOnly; SameSite=Strict` admin cookie. It
+shows only labels, endpoint IDs, harness, presence, last-seen time, and pairing
+metadata; it never returns token values or digests. Revoking a paired endpoint
+removes its Connector and Work Map proxy capabilities immediately.
+
+Pairing deliberately lets Gateway proxy Work Map MCP with the upstream
+instance key so each device can receive a separate revocable proxy capability.
+This increases the impact of a Gateway compromise compared with the legacy
+handoff architecture. For a deployment that requires strict transport/storage
+separation, keep pairing disabled until Work Map provides native per-agent
+credentials. Never expose Gateway or Work Map without HTTPS and exact host
+allowlists.
+
 ## Reporting a vulnerability
 
 Do not include live credentials, private Work Map content, or exploit details in

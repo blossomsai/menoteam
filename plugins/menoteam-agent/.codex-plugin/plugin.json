@@ -1,15 +1,15 @@
 {
   "name": "menoteam-agent",
-  "version": "0.1.0+codex.20260828205951",
-  "description": "Connect one opt-in Codex session to Menoteam from a secure handoff file.",
+  "version": "0.2.0+codex.20260901191559",
+  "description": "Pair one opt-in Codex session with Menoteam without transferring a credential file.",
   "author": {
     "name": "BlossomsAI"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "Menoteam Agent",
-    "shortDescription": "Connect this Codex to Menoteam with one secure handoff.",
-    "longDescription": "Installs the Menoteam Agent onboarding skill, role-aware setup command, and outbound Connector. It resumes one dedicated Codex task and never receives a Slack token.",
+    "shortDescription": "Pair this repository with Menoteam in one approval flow.",
+    "longDescription": "Installs the Menoteam Agent onboarding skill and outbound Connector. Credentials are generated locally, an admin approves a short device code, and one dedicated Codex task is resumed without giving the computer a Slack token.",
     "developerName": "BlossomsAI",
     "category": "Productivity",
     "capabilities": [

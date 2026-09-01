@@ -15,6 +15,11 @@ services:
       AGENT_GATEWAY_PORT: 3100
       AGENT_GATEWAY_ALLOWED_HOSTS: ${AGENT_GATEWAY_ALLOWED_HOSTS:?set AGENT_GATEWAY_ALLOWED_HOSTS}
       AGENT_GATEWAY_TRUST_PROXY: "true"
+      AGENT_GATEWAY_REGISTRY_FILE: ${AGENT_GATEWAY_REGISTRY_FILE:-}
+      AGENT_GATEWAY_PUBLIC_URL: ${AGENT_GATEWAY_PUBLIC_URL:-}
+      AGENT_GATEWAY_ADMIN_PASSWORD: ${AGENT_GATEWAY_ADMIN_PASSWORD:-}
+      WORK_MAP_MCP_URL: ${WORK_MAP_MCP_URL:-}
+      WORK_MAP_MCP_API_KEY: ${WORK_MAP_MCP_API_KEY:-}
       SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:?set SLACK_BOT_TOKEN}
       SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:?set SLACK_SIGNING_SECRET}
       SLACK_BOT_USER_ID: ${SLACK_BOT_USER_ID:?set SLACK_BOT_USER_ID}
@@ -22,6 +27,8 @@ services:
       SLACK_ALLOWED_CHANNEL_IDS: ${SLACK_ALLOWED_CHANNEL_IDS:?set SLACK_ALLOWED_CHANNEL_IDS}
     ports:
       - "127.0.0.1:3100:3100"
+    volumes:
+      - menoteam-gateway:/data
     healthcheck:
       test:
         [
@@ -37,3 +44,6 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+
+volumes:
+  menoteam-gateway:

@@ -31,3 +31,7 @@ _Avoid_: Availability promise, employee status, uptime record
 **Speaker Label**:
 The human-readable logical identity prepended to a reply posted by the one shared Slack bot.
 _Avoid_: Slack bot identity, impersonation, separate app
+
+**Device Pairing**:
+A ten-minute, admin-approved enrollment that adds one teammate Codex endpoint. The device generates its connector and Work Map proxy credentials locally; Gateway persists only their digests.
+_Avoid_: Account signup, shared handoff secret, Master enrollment

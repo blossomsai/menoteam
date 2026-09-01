@@ -1,6 +1,6 @@
 ---
 name: menoteam-agent
-description: "Install, verify, remove, or troubleshoot this host's opt-in Menoteam Connector from an operator-provided handoff file. Use when the user asks to connect this Codex to Menoteam or check its connector status."
+description: "Pair, verify, remove, or troubleshoot this host's opt-in Menoteam Connector. Use when the user asks to connect this Codex to Menoteam or check its connector status."
 license: "Apache-2.0"
 ---
 
@@ -10,7 +10,7 @@ This plugin is the installable package. Its Connector script is the explicit loc
 
 ## Safety boundary
 
-- Require one operator-generated handoff file. Never display its token or copy its contents into chat.
+- Prefer Gateway device pairing. Generate connector credentials locally, send only their SHA-256 digests to Gateway, and display only the short approval code.
 - Accept only an HTTPS Gateway URL, except `http://localhost` for local testing.
 - Keep the endpoint token in the host's secret mechanism or process environment. Never write it into the repository, a prompt, Slack, or a tracked config file.
 - The Connector makes outbound requests only. Do not open a local inbound port or give it a Slack app/bot token.
@@ -24,18 +24,20 @@ This plugin is the installable package. Its Connector script is the explicit loc
 Locate the plugin root from this `SKILL.md`. The setup launcher is at `../../scripts/setup.sh`, the Connector is at `../../scripts/connector.mjs`, and the self-check is at `../../scripts/self-check.mjs`.
 
 1. Run the self-check without secrets.
-2. Confirm the intended repository directory and handoff file path with the user. Do not read or print the handoff contents.
-3. Run the installer from the intended repository:
+2. Confirm the exact HTTPS Gateway URL and intended repository directory with the user. This explicit local repository confirmation is required.
+3. Run the pairing command from the intended repository:
 
 ```bash
-/absolute/path/to/plugin/scripts/setup.sh install \
-  --config /secure/path/operator-handoff.env \
+/absolute/path/to/plugin/scripts/setup.sh connect \
+  --gateway-url https://agents.example.com \
   --repository-cwd /absolute/path/to/repository
 ```
 
-The handoff determines `master` or `teammate`; never promote a teammate locally. The default architecture uses the separate Hermes Master Connector, so this Codex plugin is normally installed for teammates. If an operator deliberately issues a Codex Master handoff, the installer registers the central Gateway `/mcp` endpoint with its separate key. A teammate handoff containing that key must fail.
+4. Report the verification URL, short approval code, and confirmed repository path. Wait while an admin approves that exact code. Never display or inspect the locally generated connector or Work Map proxy token.
 
-Check status with `../../scripts/setup.sh status --endpoint <assigned-id>`. A successful local service start is not proof of Gateway presence; confirm real readiness from Master's `list_agent_endpoints`, then route one harmless read-only question and verify that the labeled answer appears in the original Slack thread. Tell the user to delete the one-time handoff transfer copy after these checks pass.
+Pairing always creates a teammate Codex endpoint. It cannot create or promote a Master. The default architecture uses the separate Hermes Master Connector. Legacy operator handoff installation remains available only for existing deployments and deliberate Master setup.
+
+Check status with `../../scripts/setup.sh status --endpoint <assigned-id>`. A successful local service start is not proof of Gateway presence; confirm real readiness from the Gateway admin page or Master's `list_agent_endpoints`, then route one harmless read-only question and verify that the labeled answer appears in the original Slack thread.
 
 To remove only the local runtime, run `../../scripts/setup.sh uninstall --endpoint <assigned-id>`. This keeps Codex and the plugin installed.
 

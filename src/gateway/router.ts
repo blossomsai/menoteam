@@ -102,6 +102,36 @@ export class AgentRouter {
     }
   }
 
+  addEndpoint(config: AgentEndpointConfig): void {
+    if (this.endpoints.has(config.id)) throw new Error(`Duplicate agent endpoint: ${config.id}`);
+    if ([...this.endpoints.values()].some(({ tokenSha256 }) => tokenSha256 === config.tokenSha256)) {
+      throw new Error('Agent endpoint tokens must be distinct');
+    }
+    this.endpoints.set(config.id, { ...config });
+    this.queues.set(config.id, []);
+  }
+
+  renameEndpoint(endpointId: string, label: string): void {
+    const endpoint = this.requireEndpoint(endpointId);
+    this.endpoints.set(endpointId, { ...endpoint, label });
+  }
+
+  removeEndpoint(endpointId: string): void {
+    this.requireEndpoint(endpointId);
+    const waiter = this.waiters.get(endpointId);
+    if (waiter) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(null);
+      this.waiters.delete(endpointId);
+    }
+    for (const [jobId, pending] of this.pending) {
+      if (pending.endpointId === endpointId) this.pending.delete(jobId);
+    }
+    this.endpoints.delete(endpointId);
+    this.queues.delete(endpointId);
+    this.lastSeen.delete(endpointId);
+  }
+
   listEndpoints(): AgentEndpointSummary[] {
     this.pruneExpiredJobs();
     return [...this.endpoints.values()].map((endpoint) => {
