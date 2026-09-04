@@ -3,7 +3,6 @@
   "version": "0.1.1",
   "private": true,
   "license": "Apache-2.0",
-  "files": ["dist", "migrations", "Dockerfile", "docker-compose.yml", "pnpm-workspace.yaml", ".env.example"],
   "type": "module",
   "packageManager": "pnpm@11.19.0",
   "engines": {
@@ -15,7 +14,6 @@
     "start": "node dist/server/main.js",
     "gateway:dev": "tsx src/gateway/main.ts",
     "gateway:start": "node dist/gateway/main.js",
-    "gateway:hash-token": "node scripts/hash-connector-token.mjs",
     "gateway:admin": "node scripts/gateway-admin.mjs",
     "gateway:admin:check": "node scripts/gateway-admin-self-check.mjs",
     "plugin:check": "node plugins/menoteam-agent/scripts/self-check.mjs",

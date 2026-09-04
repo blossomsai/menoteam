@@ -20,24 +20,6 @@ Discord credentials, channel delivery, sessions, and agent execution. Each
 trusted agent receives the same instance-level MCP bearer capability in V1;
 this is a soft trusted-team boundary, not actor-level authorization.
 
-## Current local inventory
-
-Checked on 2026-08-28 in this checkout. The probe recorded executable presence,
-version/help output, and config-directory presence only. It did not print
-credential values, token files, message history, or private configuration.
-
-| Harness | Local result | Relevant upstream capability | What remains operator-owned |
-| --- | --- | --- | --- |
-| Hermes Agent | Previously evaluated as an optional harness; it is not part of the default Codex Agent Network | Native Discord gateway and remote HTTP MCP client | Install and operate it only on the chosen always-on harness host; it is not needed on teammate Codex computers |
-| pi agent | `pi` not found; `~/.pi` absent | Use the generic path when the installed Pi release exposes MCP, Skills, and a native channel gateway | Install/configure Pi and repeat the same MCP read plus native channel mention/reply proof |
-| OpenClaw | `openclaw` not found; `~/.openclaw` absent | Native Discord gateway; MCP client registry for Streamable HTTP; local `SKILL.md` install | Install OpenClaw, configure Discord bot/pairing/allowlists, install the Skill, and inject the Work Map key |
-| Codex CLI | Present at `/Applications/ChatGPT.app/Contents/Resources/codex`; `work-map` is registered as Streamable HTTP and a direct authenticated `list` completed | `codex mcp` supports remote Streamable HTTP and bearer-token env vars; `/mcp` shows connections | Inject `WORK_MAP_MCP_API_KEY` into each Codex process and install the appropriate Skill; Codex has no Discord gateway in this local capability set |
-| Discord | New `Menoteam Master` application exists (`1542758028955095120`); bot token, server install, and native reply are still pending | Discord Developer Portal + Gateway are the native integration surface | Create/configure the bot under this new application, enable the required intent, install it with least privilege, set the token and allowlists, then run the native mention/reply proof |
-
-These results are a local 2026-08-28 smoke test, not a portable credential
-bundle. No token value is documented here. A different host must repeat MCP
-discovery and native Discord delivery proof.
-
 Copyable, credential-free config examples live in
 [`examples/mcp/`](../examples/mcp/). They are templates, not proof that a
 service or Discord route exists: `codex-work-map.toml`,
@@ -88,25 +70,6 @@ Slack or Discord gateway. A Codex-only setup can prove shared MCP access with
 `WORK_MAP_CHANNEL=none`. The optional Local Connector supplies a separate,
 outbound wake path for one dedicated Codex Linked Session; installing a plugin
 or registering Work Map MCP alone does not.
-
-This host also proves a narrower, non-portable composition: Hermes has a
-separate local `codex mcp-server` connection, independent of Work Map MCP.
-Hermes can start a read-only local Codex session through that native MCP tool
-while Hermes owns the Discord reply. That is not Codex-native Discord and is
-not a universal teammate route, but it does make this host's local Codex
-available behind its chosen Hermes Master without adding a Menoteam runner or
-compatibility adapter. Verify both independent connections before relying on
-it:
-
-```bash
-hermes mcp test work-map
-hermes mcp test codex
-```
-
-Only forward to that tool when the human explicitly asks for local Codex or the
-selected Master policy permits that local capability. A normal Work-owner route
-still uses the teammate's recorded native channel address, and a tool call must
-not be reported as a visible teammate mention.
 
 For an always-on Master, use the selected harness's own service manager. Hermes
 supports a persistent user service on macOS/Linux (and a system service on

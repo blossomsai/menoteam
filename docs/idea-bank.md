@@ -8,8 +8,6 @@ Last checked: 2026-06-29.
 
 Menoteam is aiming for a light, elegant, meta framework for philosophy-driven autonomous work. References are useful when they clarify what to borrow, what to avoid, or what should remain an external connector.
 
-Detailed notes live in the [Reference Wiki](wiki/README.md).
-
 ## References
 
 ### Paperclip

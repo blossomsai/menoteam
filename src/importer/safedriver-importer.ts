@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
 export type WorkState = "current" | "completed";
@@ -1526,26 +1525,4 @@ export function collectAndImportSafeDriverPlan(
   options: CollectOptions = {}
 ): WorkMapImport {
   return importSafeDriverPlan(collectSafeDriverSnapshot(repoPath, options));
-}
-
-function isMainModule(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  try {
-    return fileURLToPath(import.meta.url) === entry;
-  } catch {
-    return false;
-  }
-}
-
-if (isMainModule()) {
-  const repoPath = process.argv[2] ?? process.cwd();
-  const includePullRequests = !process.argv.includes("--no-pr");
-  try {
-    const result = collectAndImportSafeDriverPlan(repoPath, { includePullRequests });
-    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-  } catch {
-    process.stderr.write("Safe Driver Plan import failed: repository evidence could not be read.\n");
-    process.exitCode = 1;
-  }
 }

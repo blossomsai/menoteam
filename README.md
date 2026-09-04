@@ -71,9 +71,8 @@ is a sibling bounded context: it transports explicit requests but does not own
 Work, copy private memory, or write activity logs into Work Map.
 
 The broader Menoteam worldview is preserved in the
-[manifesto](docs/worldview-manifesto-v0.1.md), [idea bank](docs/idea-bank.md), and
-[reference wiki](docs/wiki/README.md). The canonical product language is in
-[`CONTEXT-MAP.md`](CONTEXT-MAP.md).
+[manifesto](docs/worldview-manifesto-v0.1.md) and [idea bank](docs/idea-bank.md).
+The canonical product language is in [`CONTEXT-MAP.md`](CONTEXT-MAP.md).
 
 ## License
 
