@@ -72,6 +72,7 @@ Work, copy private memory, or write activity logs into Work Map.
 
 The broader Menoteam worldview is preserved in the
 [manifesto](docs/worldview-manifesto-v0.1.md) and [idea bank](docs/idea-bank.md).
+The future direction is described in this [product vision proposal](docs/menoteam-product-vision.md); it is unimplemented and does not change V1 scope.
 The canonical product language is in [`CONTEXT-MAP.md`](CONTEXT-MAP.md).
 
 ## License
