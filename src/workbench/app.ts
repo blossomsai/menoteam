@@ -21,6 +21,7 @@ export interface WorkbenchOptions {
     bootstrapPassword?: string;
     secureCookies?: boolean;
     allowedOrigin?: string;
+    sourceFetcher?: typeof fetch;
     registerAssets?: (app: FastifyInstance) => Promise<void>;
 }
 export async function createWorkbenchApp(options: WorkbenchOptions) {
@@ -314,14 +315,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(targetWork?.profileId && !profile)fail(400,"Agent profile missing");
         if (profile && (profile.kind !== "profile" || (profile.projectId && profile.projectId !== projectId)))
             fail(400, "Invalid agent profile");
-        const skillIds = profile && Array.isArray(profile.data.skillIds) ? profile.data.skillIds as string[] : [];
-        const skills = [];
-        for (const skillId of skillIds) {
-            const skill = await store.get<Setting>('setting', skillId, tx);
-            if (!skill || skill.kind !== 'skill' || (skill.projectId && skill.projectId !== projectId))
-                fail(400, 'Invalid profile skill');
-            if (skill!.data.enabled !== false) skills.push({id:skill!.id,name:skill!.name,content:String(skill!.data.content)});
-        }
+        const skills = profile ? (await resolveProfileSkills(profile, tx))
+            .filter(skill => skill.data.enabled !== false)
+            .map(skill => ({id: skill.id, name: skill.name, content: String(skill.data.content)})) : [];
         const run: Run = {
             ...(candidate ? {
                 targetRevision: candidate.revision,
@@ -505,6 +501,17 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         };
         return schemas[kind].parse(input);
     }
+    async function resolveProfileSkills(profile: Pick<Setting, 'projectId' | 'data'>, tx: Sql): Promise<Setting[]> {
+        const skills: Setting[] = [];
+        for (const skillId of profile.data.skillIds as string[] ?? []) {
+            const skill = await store.get<Setting>('setting', skillId, tx);
+            if (!skill || skill.kind !== 'skill') fail(400, `Profile skill ${skillId} is unavailable`);
+            if (skill!.projectId && skill!.projectId !== profile.projectId)
+                fail(400, `Profile skill ${skillId} is outside the profile scope; use a reusable workspace skill`);
+            skills.push(skill!);
+        }
+        return skills;
+    }
     async function writeSetting(input: unknown, tx = sql) {
         const b = z.object({
             kind: z.enum(["profile", "provider", "skill", "connection"]),
@@ -513,6 +520,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             data: z.record(z.string(), z.unknown())
         }).parse(input);
         b.data = settingData(b.kind, b.data);
+        if (b.kind === 'profile') await resolveProfileSkills(b, tx);
         if(b.kind==='provider'&&!b.projectId){const existing=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.kind==='provider'&&!s.projectId);b.data.default=existing.length===0;}
         const s: Setting = {
             id: id("setting"),
@@ -548,6 +556,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (change.expectedUpdatedAt && change.expectedUpdatedAt !== setting!.updatedAt)
             fail(409, 'Setting changed; reload before updating');
         if (change.data) setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data });
+        if (setting!.kind === 'profile') await resolveProfileSkills(setting!, tx);
         if (change.name !== undefined) setting!.name = change.name;
         setting!.updatedAt = new Date(Math.max(Date.now(), Date.parse(setting!.updatedAt) + 1)).toISOString();
         await store.put('setting', setting!, tx);
@@ -1104,6 +1113,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         githubToken: process.env.WORKBENCH_GITHUB_TOKEN,
         githubWebhookSecret: process.env.WORKBENCH_GITHUB_WEBHOOK_SECRET,
         slackSigningSecret: process.env.WORKBENCH_SLACK_SIGNING_SECRET,
+        fetcher: options.sourceFetcher,
         authorize: async (req, pid, edit) => grant(await member(req), pid, edit),
         onIntake:async(projectId,sourceId,tx)=>{
             const project=await store.get<Project>('project',projectId,tx);const policy=project?.feedbackIntake;if(!policy?.enabled)return;

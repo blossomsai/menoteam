@@ -1,6 +1,6 @@
 import postgres from "postgres";
 import { createHmac } from "node:crypto";
-import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
+import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
 import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
@@ -10,6 +10,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     let cookie = "";
     let projectId = "";
     let connectorToken = "";
+    let scenarioAddress = 1;
+    beforeEach(() => { scenarioAddress += 1; });
+    let sourceFetch: typeof fetch = globalThis.fetch;
     beforeAll(async () => {
         const location = new URL(url!);
         if (!["localhost", "127.0.0.1"].includes(location.hostname) || !location.pathname.endsWith("_test"))
@@ -22,7 +25,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         app = await createWorkbenchApp({
             sql,
             bootstrapEmail: "owner@test.example",
-            bootstrapPassword: "workbench-test-password"
+            bootstrapPassword: "workbench-test-password",
+            sourceFetcher: (...args) => sourceFetch(...args)
         });
         const r = await app.inject({
             method: "POST",
@@ -42,6 +46,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     const user = (method: "GET" | "POST" | "PATCH", path: string, payload?: unknown) => app.inject({
         method,
         url: "/api/workbench" + path,
+        remoteAddress: `127.0.0.${scenarioAddress}`,
         headers: {
             cookie
         },
@@ -50,6 +55,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     const conn = (method: "GET" | "POST", path: string, payload?: unknown) => app.inject({
         method,
         url: "/api/workbench/connector" + path,
+        remoteAddress: `127.0.0.${scenarioAddress}`,
         headers: {
             authorization: `Bearer ${connectorToken}`
         },
@@ -407,7 +413,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await scoped(`/runs/${run.id}/renew`,{generation:run.generation})).statusCode).toBe(403);
     });
     it("binds effective profile skills and derives runtime evidence independently of provider metadata", async () => {
-        const skill = (await user('POST','/settings',{kind:'skill',projectId,name:'Evidence',data:{content:'Record proof before claiming success'}})).json();
+        const skill = (await user('POST','/settings',{kind:'skill',name:'Evidence',data:{content:'Record proof before claiming success'}})).json();
         const profile = (await user('POST','/settings',{kind:'profile',name:'Sol reviewer',data:{model:'gpt-6.1-sol',reasoning:'high',skillIds:[skill.id],tools:[]}})).json();
         const work = (await user('POST',`/projects/${projectId}/works`,{title:'Effective settings',profileId:profile.id})).json();
         const submitted = (await user('POST',`/projects/${projectId}/messages`,{text:'Check effective profile',workId:work.id,requestId:'effective-profile'})).json();
@@ -424,6 +430,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(runtime.some((r:{verifiedRunId?:string}) => !!r.verifiedRunId)).toBe(true);
     });
     it("imports GitHub SKILL.md over HTTP, persists the returned text, and rejects bad upstream content", async () => {
+        const importProjectId = (await user("POST", "/projects", { name: "GitHub skill import fixture" })).json().id as string;
         const ref = "a".repeat(40);
         const sourceUrl = `https://github.com/example/skills/blob/${ref}/review/SKILL.md`;
         const skillText = "# Review skill\nCheck the changed behavior against its acceptance criteria.";
@@ -432,7 +439,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             headers: { "content-type": "application/json" }
         });
         const fetchMock = vi.fn<typeof fetch>();
-        vi.stubGlobal("fetch", fetchMock);
+        const originalFetch = sourceFetch;
+        sourceFetch = fetchMock;
         try {
             fetchMock.mockResolvedValueOnce(githubResponse(200, {
                 type: "file",
@@ -440,19 +448,19 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
                 content: Buffer.from(skillText).toString("base64"),
                 size: Buffer.byteLength(skillText)
             }));
-            const imported = await user("POST", `/projects/${projectId}/skills/import`, { url: sourceUrl });
+            const imported = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
             expect(imported.statusCode).toBe(200);
             expect(fetchMock.mock.calls[0]?.[0]).toBe(`https://api.github.com/repos/example/skills/contents/review/SKILL.md?ref=${ref}`);
             expect(imported.json()).toMatchObject({
                 kind: "skill",
-                projectId,
+                projectId: importProjectId,
                 name: "review",
                 data: { content: skillText, sourceUrl, enabled: true }
             });
             expect((await user("GET", "/snapshot")).json().settings).toContainEqual(imported.json());
 
             fetchMock.mockResolvedValueOnce(githubResponse(404, { message: "Not Found" }));
-            const missing = await user("POST", `/projects/${projectId}/skills/import`, { url: sourceUrl });
+            const missing = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
             expect(missing.statusCode).toBe(502);
 
             fetchMock.mockResolvedValueOnce(githubResponse(200, {
@@ -461,11 +469,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
                 content: Buffer.from("x").toString("base64"),
                 size: 64001
             }));
-            const oversized = await user("POST", `/projects/${projectId}/skills/import`, { url: sourceUrl });
+            const oversized = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
             expect(oversized.statusCode).toBe(400);
             expect(fetchMock).toHaveBeenCalledTimes(3);
         } finally {
-            vi.unstubAllGlobals();
+            sourceFetch = originalFetch;
         }
     });
     it('requires connector stop proof before browser reconciliation',async()=>{
@@ -595,6 +603,27 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await user('POST','/settings',{kind:'skill',name:'Unsafe skill source',projectId,data:{content:'Instructions',sourceUrl:'https://secret@github.com/o/r/blob/main/SKILL.md'}})).statusCode).toBe(400);
         expect((await user('POST',`/projects/${projectId}/sources/github`,{url:'https://secret@github.com/blossomsai/menoteam/issues/1'})).statusCode).toBe(400);
         expect((await user('POST',`/projects/${projectId}/skills/import`,{url:'https://secret@github.com/o/r/blob/main/SKILL.md'})).statusCode).toBe(400);
+    });
+    it('workspace profiles reject project skill references on create/update and work across projects',async()=>{
+        const a=(await user('POST','/projects',{name:'Profile scope A'})).json();
+        const b=(await user('POST','/projects',{name:'Profile scope B'})).json();
+        const scoped=(await user('POST','/settings',{kind:'skill',projectId:a.id,name:'Private project instructions',data:{content:'Only project A'}})).json();
+        const global=(await user('POST','/settings',{kind:'skill',name:'Reusable instructions',data:{content:'All authorized Projects'}})).json();
+        const rejected=await user('POST','/settings',{kind:'profile',name:'Unsafe shared profile',data:{skillIds:[scoped.id]}});
+        expect(rejected.statusCode).toBe(400);
+        expect(rejected.json().message).toContain(scoped.id);
+        expect((await user('POST','/settings',{kind:'profile',name:'Missing skill',data:{skillIds:['missing-skill']}})).statusCode).toBe(400);
+        const profile=(await user('POST','/settings',{kind:'profile',name:'Reusable profile',data:{model:'gpt-6-luna',reasoning:'medium',skillIds:[global.id]}})).json();
+        const badPatch=await user('PATCH',`/settings/${profile.id}`,{expectedUpdatedAt:profile.updatedAt,data:{skillIds:[scoped.id]}});
+        expect(badPatch.statusCode).toBe(400);
+        const persisted=(await user('GET','/snapshot')).json().settings.find((setting:any)=>setting.id===profile.id);
+        expect(persisted.data.skillIds).toEqual([global.id]);
+        for(const project of [a,b]) {
+            const work=(await user('POST',`/projects/${project.id}/works`,{title:'Use the shared profile',profileId:profile.id})).json();
+            const dispatched=await user('POST',`/projects/${project.id}/messages`,{workId:work.id,text:'Use reusable instructions',requestId:`shared-profile-${project.id}`});
+            expect(dispatched.statusCode).toBe(200);
+            expect(dispatched.json().run.execution.skills).toEqual([{id:global.id,name:'Reusable instructions',content:'All authorized Projects'}]);
+        }
     });
     it("survives service restart", async () => {
         const before=(await user("GET","/snapshot")).json();
