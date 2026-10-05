@@ -53,6 +53,7 @@ export interface Run {
         artifactRevision: string;
         commitSha: string;
         candidateFingerprint: string;
+        repositoryUrl: string;
         baseRevision: string;
         baseBranch: string;
         remoteBranch: string;

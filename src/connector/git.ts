@@ -14,7 +14,38 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFile('git', args, { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
   return stdout;
 }
-export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,...args:string[]):Promise<string>{const {stdout}=await execFile('git',args,{cwd,encoding:'utf8',maxBuffer:MAX_BUFFER,env:{...process.env,...env}});return stdout;}
+async function waitGitProcessGroup(pid:number,timeoutMs:number):Promise<boolean>{
+  const deadline=Date.now()+timeoutMs;
+  while(Date.now()<deadline){try{process.kill(-pid,0);}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')return true;}await new Promise(resolve=>setTimeout(resolve,40));}
+  try{process.kill(-pid,0);return false;}catch(error){return (error as NodeJS.ErrnoException).code==='ESRCH';}
+}
+export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,args:string[],onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,timeoutMs=30_000):Promise<string>{
+  if(process.platform==='win32')throw new Error('Bounded Draft PR Git transport requires process-group signals');
+  return new Promise((resolve,reject)=>{
+    const child=spawn('git',args,{cwd,detached:true,stdio:['ignore','pipe','pipe'],shell:false,env:{...process.env,...env}});
+    const stdout:Buffer[]=[];let bytes=0;let stderr='';let timedOut=false;let oversized=false;let settled=false;let startError:Error|undefined;let startTask:Promise<void>|undefined;
+    const killGroup=()=>{if(child.pid){try{process.kill(-child.pid,'SIGKILL');return;}catch{/* fall back to the direct child */}}child.kill('SIGKILL');};
+    const timer=setTimeout(()=>{timedOut=true;killGroup();},timeoutMs);
+    const fail=(error:Error)=>{if(settled)return;settled=true;clearTimeout(timer);reject(error);};
+    child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>MAX_BUFFER){oversized=true;killGroup();return;}stdout.push(chunk);});
+    child.stderr.on('data',(chunk:Buffer)=>{if(stderr.length<4096)stderr+=chunk.toString('utf8').slice(0,4096-stderr.length);});
+    if(onProcessStart)child.once('spawn',()=>{startTask=onProcessStart(child.pid!).catch(error=>{startError=error instanceof Error?error:new Error('Could not record Git transport process');killGroup();});});
+    child.once('error',error=>fail(error));
+    child.once('close',(code,signal)=>{void (async()=>{
+      if(startTask)await startTask;
+      if(child.pid&&!await waitGitProcessGroup(child.pid,100)){
+        killGroup();
+        if(!await waitGitProcessGroup(child.pid,2000)){const error=new Error('Git transport process group could not be confirmed stopped') as NodeJS.ErrnoException;error.code='EUNCONFIRMEDPROCESS';throw error;}
+      }
+      await onProcessStop?.();
+      if(settled)return;settled=true;clearTimeout(timer);
+      if(startError){reject(startError);return;}
+      if(timedOut||oversized){const error=new Error('Git transport exceeded its time or output limit') as NodeJS.ErrnoException;error.code=timedOut?'ETIMEDOUT':'ENOBUFS';reject(error);return;}
+      if(code!==0){const error=new Error(`Git command failed (${code??signal??'unknown'}): ${stderr.trim().slice(0,500)}`) as NodeJS.ErrnoException;error.code=String(code??signal??'UNKNOWN');reject(error);return;}
+      resolve(Buffer.concat(stdout).toString('utf8'));
+    })().catch(error=>fail(error instanceof Error?error:new Error('Git transport lifecycle callback failed')));});
+  });
+}
 
 export interface Worktree { path: string; revision: string; baseRevision: string; artifactRevision?: string; }
 

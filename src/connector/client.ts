@@ -39,6 +39,7 @@ export class WorkbenchConnectorClient {
   renew(runId: string, generation: number): Promise<Run> {
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/renew`, { method: 'POST', body: { generation } });
   }
+  authorizeDeliveryEffect(runId:string,generation:number):Promise<{authorized:true;repositoryUrl:string}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-authorize`,{method:'POST',body:{generation}});}
 
   readRun(runId: string): Promise<Run> {
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}`, { method: 'GET' });

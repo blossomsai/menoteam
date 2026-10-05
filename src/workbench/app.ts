@@ -22,6 +22,7 @@ export interface WorkbenchOptions {
     secureCookies?: boolean;
     allowedOrigin?: string;
     registerAssets?: (app: FastifyInstance) => Promise<void>;
+    sourceFetcher?: typeof fetch;
 }
 export async function createWorkbenchApp(options: WorkbenchOptions) {
     const store = new WorkbenchStore(options.sql);
@@ -347,10 +348,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await store.put("run", run, tx);
         return run;
     }
-    async function requestDraftPr(user: Member, workId: string, raw: unknown, tx = sql) {
+    async function requestDraftPr(user: Member, workId: string, raw: unknown, tx = sql, projectBoundary?:string) {
         const b = z.object({candidateRunId:text,candidateRevision:z.string().min(1).max(200),action:z.literal('create_draft_pr'),requestId:z.string().min(1).max(200)}).strict().parse(raw);
         const work=await store.get<Work>('work',workId,tx);
         if(!work)fail(404,'Work missing');
+        if(projectBoundary&&work!.projectId!==projectBoundary)fail(403,'Draft PR Work is outside the current Master project');
         if(!await actorCanAccess(user,work!.projectId,tx))fail(403,'Project access denied');
         const scopedRuns=await store.list<Run>('run',work!.projectId,tx);
         const candidate=scopedRuns.find(run=>run.id===b.candidateRunId);
@@ -389,7 +391,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             const result=canonical[0].result as {run:Run;operationId:string};
             const existing=await store.get<Run>('run',result.run.id,tx);if(!existing)fail(409,'Canonical delivery operation is unavailable');
             if(['failed','interrupted','cancelled'].includes(existing!.status)){
-                if(existing!.status==='interrupted'&&!existing!.stoppedAt&&existing!.kind!=='delivery')fail(409,'Connector process must be confirmed stopped before retry');
+                if(['interrupted','cancelled'].includes(existing!.status)&&!existing!.stoppedAt)fail(409,'Connector process must be confirmed stopped before retry');
+                if(existing!.operation?.repositoryUrl!==project!.repositoryUrl||existing!.operation?.baseBranch!==policy!.data.baseBranch)fail(409,'Draft PR policy changed; this candidate requires a new delivery review');
                 // Fence any unsent Connector spool from the prior delivery attempt; the new claim gets a fresh generation.
                 existing!.generation++;existing!.status='queued';existing!.stoppedAt=undefined;existing!.error=undefined;existing!.updatedAt=now();await store.put('run',existing!,tx);
             }
@@ -403,12 +406,19 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const checks=Array.isArray(qaData.checks)?qaData.checks.filter(item=>item&&typeof item==='object') as Array<Record<string,unknown>>:[];
         const passed=checks.filter(item=>item.exitCode===0).length,failed=checks.filter(item=>typeof item.exitCode==='number'&&item.exitCode!==0).length,unknown=checks.length-passed-failed;
         const verification=qaData.stale===true?'stale':checks.length?`QA checks: ${passed} passed, ${failed} failed, ${unknown} unknown`: 'QA status unknown; no checks recorded';
-        const operation={action:'create_draft_pr' as const,actorId:user.id,candidateRunId:candidate!.id,candidateRevision:diff!.revision,artifactRevision:diff!.revision,commitSha:exactCommitSha,candidateFingerprint,baseRevision:exactBaseRevision,baseBranch,remoteBranch:`codex/menoteam/${workId}/${exactCommitSha.slice(0,12)}`,workTitle:work!.title,changeSummary:files.length?files.slice(0,30).join(', '):'No file summary recorded',qaStatus:verification,phase:'queued' as const};
+        const operation={action:'create_draft_pr' as const,actorId:user.id,candidateRunId:candidate!.id,candidateRevision:diff!.revision,artifactRevision:diff!.revision,commitSha:exactCommitSha,candidateFingerprint,repositoryUrl:project!.repositoryUrl,baseRevision:exactBaseRevision,baseBranch,remoteBranch:`codex/menoteam/${workId}/${exactCommitSha.slice(0,12)}`,workTitle:work!.title,changeSummary:files.length?files.slice(0,30).join(', '):'No file summary recorded',qaStatus:verification,phase:'queued' as const};
         const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Create a draft pull request for the recorded candidate. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:candidate!.id,targetRevision:diff!.revision,targetConnectorId:candidate!.connectorId,operation};
         await store.put('run',run,tx);
         const result={run,operationId:run.id};
         await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(result as never)}),(${canonicalScope},'canonical',${tx.json(result as never)})`;
         return result;
+    }
+    async function draftPrPolicy(projectId:string,repositoryUrl:string,baseBranch:string,tx:Sql):Promise<void>{
+        const project=await store.get<Project>('project',projectId,tx);
+        if(!project?.repositoryUrl||project.repositoryUrl!==repositoryUrl)fail(409,'Draft PR repository policy changed');
+        const normalizeRepository=(value:string)=>value.replace(/\/$/u,'').replace(/\.git$/u,'');
+        const settings=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.projectId===projectId&&s.kind==='connection'&&s.data.provider==='github'&&s.data.purpose==='delivery'&&s.data.enabled!==false);
+        if(!settings.some(s=>typeof s.data.url==='string'&&normalizeRepository(s.data.url)===normalizeRepository(repositoryUrl)&&s.data.allowDraftPr===true&&s.data.baseBranch===baseBranch&&typeof s.data.configuredBy==='string'))fail(403,'Draft PR action policy is unavailable');
     }
     async function actorCanAccess(user:Member,projectId:string,tx:Sql):Promise<boolean>{
         if(user.role==='owner')return !!await store.get<Project>('project',projectId,tx);
@@ -697,6 +707,19 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(!await actorAuthorized(r!,tx))fail(403,'Run authorization revoked; stop execution');
         return r!;
     }
+    app.post('/api/workbench/connector/runs/:id/delivery-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const run=await leased(req,tx);
+        const body=z.object({generation:z.number()}).strict().parse(req.body);
+        const operation=run.operation;
+        if(run.kind!=='delivery'||!operation||operation.action!=='create_draft_pr')fail(403,'Draft PR operation unavailable');
+        const rows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${run.connectorId!}`;
+        const caps=rows[0]?.capabilities as Record<string,unknown>|undefined;
+        if(!caps||caps.git!==true||caps.githubWrite!==true||!Array.isArray(caps.deliveryActions)||!caps.deliveryActions.includes('create_draft_pr'))fail(403,'Draft PR Connector capability revoked');
+        const project=await store.get<Project>('project',run.projectId,tx);
+        await draftPrPolicy(run.projectId,operation!.repositoryUrl,operation!.baseBranch,tx);
+        if(operation!.actorId!==run.requestedBy||body.generation!==run.generation)fail(409,'Draft PR authorization changed');
+        return {authorized:true,repositoryUrl:project!.repositoryUrl};
+    }));
     app.post("/api/workbench/connector/claim", async (req, reply) => {
         const c = await connector(req);
         const body = z.object({
@@ -714,7 +737,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                     await store.put("run", r, tx);
                 }
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&body.capabilities.deliveryActions.includes('create_draft_pr') : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'))));
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&body.capabilities.deliveryActions.includes('create_draft_pr') : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(active.createdAt===r.createdAt&&active.id<r.id))))));
             if (!r)
                 return undefined;
             r.status = "running";
@@ -963,7 +986,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             }, r.projectId, tx);
         else if (b.action === "request_delivery") {
             const input=z.object({workId:text,candidateRunId:text,candidateRevision:z.string().min(1).max(200),action:z.literal('create_draft_pr'),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
-            const {workId,...request}=input;result=await requestDraftPr(actors[0] as unknown as Member,workId,request,tx);
+            const {workId,...request}=input;result=await requestDraftPr(actors[0] as unknown as Member,workId,request,tx,r.projectId);
         }
         else if (b.action === "dispatch") {
             const input = z.object({
@@ -1010,6 +1033,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             if(typeof b.input.settingId==='string') {
                 const input=z.object({settingId:text,expectedUpdatedAt:z.string().min(1),name:text.optional(),data:z.record(z.string(),z.unknown()).optional()}).strict().parse(b.input);
                 const {settingId,...change}=input;
+                const setting=await store.get<Setting>('setting',settingId,tx);
+                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','baseBranch','configuredBy'];
+                if(setting?.kind==='connection'&&change.data&&protectedConnectionKeys.some(key=>Object.hasOwn(change.data!,key)))fail(403,'Master cannot change connection or delivery authorization policy');
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);
             } else {
                 await toolSettingsGrant(r);
@@ -1198,6 +1224,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         githubToken: process.env.WORKBENCH_GITHUB_TOKEN,
         githubWebhookSecret: process.env.WORKBENCH_GITHUB_WEBHOOK_SECRET,
         slackSigningSecret: process.env.WORKBENCH_SLACK_SIGNING_SECRET,
+        fetcher:options.sourceFetcher,
         authorize: async (req, pid, edit) => grant(await member(req), pid, edit),
         onIntake:async(projectId,sourceId,tx)=>{
             const project=await store.get<Project>('project',projectId,tx);const policy=project?.feedbackIntake;if(!policy?.enabled)return;

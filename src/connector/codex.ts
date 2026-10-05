@@ -243,6 +243,28 @@ export async function terminateVerifiedProcessGroup(identity: CodexProcessIdenti
   return terminateProcessGroup(identity.processGroupId, graceMs);
 }
 
+export type GitProcessIdentity = CodexProcessIdentity;
+export async function readGitProcessIdentity(pid:number):Promise<GitProcessIdentity|undefined>{
+  if(!Number.isSafeInteger(pid)||pid<=1)return undefined;
+  try{
+    if(process.platform==='linux'){
+      const stat=await readFileCb(`/proc/${pid}/stat`,'utf8');const close=stat.lastIndexOf(')');if(close<0)return undefined;
+      const fields=stat.slice(close+2).trim().split(/\s+/u);const processGroupId=Number(fields[2]);const startTicks=fields[19];if(!Number.isSafeInteger(processGroupId)||!startTicks)return undefined;
+      const bootId=(await readFileCb('/proc/sys/kernel/random/boot_id','utf8')).trim();const command=(await readFileCb(`/proc/${pid}/cmdline`)).toString('utf8').replaceAll('\0',' ').trim();
+      if(!bootId||!command.includes('git'))return undefined;return {pid,processGroupId,startedAt:`linux:${bootId}:${startTicks}`,command};
+    }
+    const [group,started,command]=await Promise.all(['pgid=','lstart=','command='].map(async field=>(await execFile('ps',['-o',field,'-p',String(pid)],{encoding:'utf8',maxBuffer:16_384})).stdout.trim()));
+    const processGroupId=Number(group);if(!started||!command||!Number.isSafeInteger(processGroupId)||!command.includes('git'))return undefined;
+    return {pid,processGroupId,startedAt:`ps:${started}`,command};
+  }catch{return undefined;}
+}
+export async function terminateVerifiedGitProcessGroup(identity:GitProcessIdentity,graceMs=1500):Promise<boolean>{
+  if(!Number.isSafeInteger(identity.processGroupId)||identity.processGroupId!==identity.pid)return false;
+  const current=await readGitProcessIdentity(identity.pid);
+  if(!current||current.startedAt!==identity.startedAt||current.command!==identity.command||current.processGroupId!==identity.processGroupId)return false;
+  return terminateProcessGroup(identity.processGroupId,graceMs);
+}
+
 function isVerificationCommand(item: any): boolean {
   const command = String(item.command ?? '');
   const actions = Array.isArray(item.commandActions) ? item.commandActions.map((a: any) => `${a.type ?? ''} ${a.command ?? a.name ?? ''}`).join(' ') : '';
