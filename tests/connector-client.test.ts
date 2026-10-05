@@ -15,3 +15,11 @@ it('allows only HTTPS outside literal loopback HTTP', () => {
   expect(() => new WorkbenchConnectorClient({ ...auth, serverUrl: 'ftp://localhost' })).toThrow(/HTTPS/u);
   expect(() => new WorkbenchConnectorClient({ ...auth, serverUrl: 'http://localhost:3200' })).not.toThrow();
 });
+
+it('can constrain a claim to run kinds without changing the default capability request', async () => {
+  const fetcher = vi.fn(async (_url: URL | RequestInfo, _init?: RequestInit) => new Response(null, { status: 204 }));
+  const client = new WorkbenchConnectorClient(auth, fetcher as typeof fetch);
+  await client.claim(['master', 'implementation', 'master']);
+  const body = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
+  expect(body.capabilities.runKinds).toEqual(['master', 'implementation']);
+});

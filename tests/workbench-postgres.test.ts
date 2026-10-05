@@ -437,13 +437,70 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const stopped=(await send(`/runs/${r.id}/stopped`,{generation:resumed.generation})).json();
         expect(stopped.status).toBe('interrupted');expect(stopped.stoppedAt).toBeTruthy();
     });
+    it('Master and UI share scoped optimistic settings updates with original actor authority',async()=>{
+        const p=(await user('POST','/projects',{name:'Settings operations'})).json();
+        const skill=(await user('POST','/settings',{projectId:p.id,kind:'skill',name:'Original',data:{content:'Original instructions'}})).json();
+        const outside=(await user('POST','/settings',{projectId,kind:'skill',name:'Outside project',data:{content:'Protected'}})).json();
+        const profile=(await user('POST','/settings',{kind:'profile',name:'Workspace profile',data:{model:'gpt-6-luna',reasoning:'medium',skillIds:[]}})).json();
+        await user('POST',`/projects/${p.id}/messages`,{text:'Update the project skill',requestId:'settings-owner-master'});
+        const credential=(await user('POST','/connectors',{id:'settings-connector',projectIds:[p.id]})).json().token;
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        const run=(await send('/claim',{})).json().run;
+        const tool=(r:any,input:unknown,requestId:string)=>send(`/runs/${r.id}/tools`,{generation:r.generation,action:'update_settings',input,requestId});
+        const context=(await send(`/runs/${run.id}/tools`,{generation:run.generation,action:'read_context',input:{},requestId:'settings-read'})).json();
+        expect(context.settings.some((s:any)=>s.id===skill.id)).toBe(true);
+        const updated=(await tool(run,{settingId:skill.id,expectedUpdatedAt:skill.updatedAt,data:{content:'Updated by Master'}},'settings-update')).json();
+        expect(updated.data.content).toBe('Updated by Master');
+        expect((await tool(run,{settingId:skill.id,expectedUpdatedAt:skill.updatedAt,name:'Stale rename'},'settings-stale')).statusCode).toBe(409);
+        expect((await tool(run,{settingId:outside.id,expectedUpdatedAt:outside.updatedAt,name:'Cross scope'},'settings-cross')).statusCode).toBe(403);
+        expect((await user('PATCH',`/settings/${skill.id}`,{expectedUpdatedAt:updated.updatedAt,name:'UI follows Master'})).statusCode).toBe(200);
+        await send(`/runs/${run.id}/complete`,{generation:run.generation,threadId:'settings-thread'});
+        const invite=(await user('POST','/invites',{email:'settings-member@test.example',projectId:p.id,role:'member'})).json();
+        const accepted=await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invite.token,name:'Member',password:'member-test-password'}});
+        expect(accepted.json().email).toBe('settings-member@test.example');
+        const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:accepted.json().email,password:'member-test-password'}});
+        await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:String(login.headers['set-cookie']).split(';')[0]!},payload:{text:'Change settings',requestId:'settings-member-master'}});
+        const memberRun=(await send('/claim',{})).json().run;
+        expect((await tool(memberRun,{settingId:profile.id,expectedUpdatedAt:profile.updatedAt,name:'Escalate'},'member-workspace')).statusCode).toBe(403);
+        expect((await tool(memberRun,{settingId:skill.id,expectedUpdatedAt:updated.updatedAt,name:'Escalate'},'member-project')).statusCode).toBe(403);
+    });
+    it('reflects active Work progress and kind-filtered capacity without treating a turn as done',async()=>{
+        const p=(await user('POST','/projects',{name:'Work activity proof'})).json();
+        const work=(await user('POST',`/projects/${p.id}/works`,{title:'Current progress'})).json();
+        await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Implement one step',requestId:'activity-implementation'});
+        const credential=(await user('POST','/connectors',{id:'activity-connector',projectIds:[p.id]})).json().token;
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        expect((await send('/claim',{capabilities:{runKinds:['master']}})).statusCode).toBe(204);
+        const run=(await send('/claim',{capabilities:{runKinds:['implementation','review']}})).json().run;
+        expect((await user('GET',`/works/${work.id}`)).json().work.status).toBe('in_progress');
+        await user('POST',`/runs/${run.id}/pause`,{});
+        expect((await user('GET',`/works/${work.id}`)).json().work.status).toBe('paused');
+        await send(`/runs/${run.id}/stopped`,{generation:run.generation});
+        await user('POST',`/runs/${run.id}/resume`,{});
+        const resumed=(await send('/claim',{capabilities:{runKinds:['implementation']}})).json().run;
+        expect((await user('GET',`/works/${work.id}`)).json().work.status).toBe('in_progress');
+        await send(`/runs/${run.id}/complete`,{generation:resumed.generation,threadId:'activity-thread'});
+        expect((await user('GET',`/works/${work.id}`)).json().work.status).toBe('in_progress');
+        expect((await send('/claim',{capabilities:{runKinds:['implementation']}})).statusCode).toBe(204);
+        expect((await send('/claim',{capabilities:{runKinds:['master']}})).json().run.kind).toBe('master');
+    });
+    it('rejects credential-bearing source and settings URLs before any external fetch',async()=>{
+        for(const url of ['https://secret@github.com/blossomsai/menoteam','https://github.com/blossomsai/menoteam?token=secret','http://github.com/blossomsai/menoteam']) {
+            const result=await user('POST','/settings',{kind:'connection',name:'Unsafe metadata',projectId,data:{provider:'github',url}});
+            expect(result.statusCode).toBe(400);
+        }
+        expect((await user('POST','/settings',{kind:'skill',name:'Unsafe skill source',projectId,data:{content:'Instructions',sourceUrl:'https://secret@github.com/o/r/blob/main/SKILL.md'}})).statusCode).toBe(400);
+        expect((await user('POST',`/projects/${projectId}/sources/github`,{url:'https://secret@github.com/blossomsai/menoteam/issues/1'})).statusCode).toBe(400);
+        expect((await user('POST',`/projects/${projectId}/skills/import`,{url:'https://secret@github.com/o/r/blob/main/SKILL.md'})).statusCode).toBe(400);
+    });
     it("survives service restart", async () => {
+        const before=(await user("GET","/snapshot")).json();
         await app.close();
         app = await createWorkbenchApp({
             sql
         });
         const snap = await user("GET", "/snapshot");
-        expect(snap.json().projects).toHaveLength(6);
+        expect(snap.json().projects.map((p:any)=>p.id).sort()).toEqual(before.projects.map((p:any)=>p.id).sort());
         expect(snap.json().messages.length).toBeGreaterThan(1);
     });
 });

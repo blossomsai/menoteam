@@ -21,9 +21,15 @@ export class WorkbenchConnectorClient {
     this.codexModels = [...new Set(codexModels)];
   }
 
-  async claim(): Promise<ClaimedRun | undefined> {
+  async claim(runKinds?: Run['kind'][]): Promise<ClaimedRun | undefined> {
+    const capabilities = {
+      codexAppServer: true,
+      models: this.codexModels,
+      localWorktrees: true,
+      ...(runKinds ? { runKinds: [...new Set(runKinds)] } : {}),
+    };
     const result = await this.request<ClaimedRun | undefined>('/api/workbench/connector/claim', {
-      method: 'POST', body: { capabilities: { codexAppServer: true, models: this.codexModels, localWorktrees: true } },
+      method: 'POST', body: { capabilities },
       allowNoContent: true,
     });
     return result;

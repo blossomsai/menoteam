@@ -63,3 +63,15 @@ The Connector polls with bounded concurrency of two runs so a planning Master do
 QA check `testedRevision` is a filesystem fingerprint. The artifact's `revision` is a diff identity, so they must never be equated. QA records `candidateFingerprint` and marks checks stale when missing or differing from that fingerprint; zero recorded checks is unknown verification.
 
 Native profile tool allowlists are not supported in this release: nonempty arbitrary tool preferences are rejected rather than saved as ineffective controls. Profile model/reasoning/skills remain effective; actual Master MCP scopes and native sandbox policy govern available operations.
+
+Master `update_settings` supports either `{instructions}` for the current project or `{settingId,expectedUpdatedAt,name?,data?}` for an existing setting. It uses the same validated service as the UI, merges partial data only through strict kind schemas, and rechecks the initiating actor's current project/workspace role. Another project's setting ID is forbidden. Master updates require the timestamp from `read_context`; concurrent changes return409 rather than silently overwrite. External feedback intake grants exclude settings/skills changes.
+
+### Remaining bounded delivery contract (A14, not implemented)
+
+Operator staging of Menoteam is separate from a Work's runtime delivery capability. The current `deliveryAuthorization` text is context only and does not enforce repository mutations. A14 remains pending.
+
+The smallest runtime addition is a bounded `request_delivery` action, not a general shell tool. It accepts the Work, exact candidate run/revision, an action (`create_pr`, `merge_pr`, or a configured deployment target), and an idempotency key. Server checks bind the originating member's current project authority, the project's exact repository, and structured delivery permission independent of editable instructions. Source intake does not receive this action automatically.
+
+The Connector executes fixed Git/GitHub operations against its saved isolated Work checkout and verifies the full candidate fingerprint and committed revision again. It must refuse dirty or mismatched candidates. A merge/deploy permission names the allowed branch or configured target; it cannot accept an arbitrary command, host or repository from model arguments. A completed independent review must refer to the same candidate, and required QA evidence must still be current. Review results need an explicit validated disposition rather than treating free-form praise as approval.
+
+Each external operation records the resulting PR/commit/workflow or deployment identifier and actual response as a delivery artifact, and retries observe that identity before attempting a second mutation. Deploy success is a delivery state; subsequent user-flow verification is separate QA evidence. Start with repository-bound PR creation and one explicitly authorized target, then prove merge/deploy with a disposable branch/target before granting production effects. Do not infer this capability from operator deployment of the application.

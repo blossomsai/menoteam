@@ -264,6 +264,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             profileId: z.string().default(""),
             sources: z.array(z.string()).max(100).default([])
         }).parse(input);
+        if(b.profileId) {
+            const profile=await store.get<Setting>('setting',b.profileId,tx);
+            if(!profile || profile.kind!=='profile' || (profile.projectId && profile.projectId!==projectId))fail(400,'Agent profile is unavailable in this project');
+        }
         const work: Work = {
             id: id("work"),
             projectId,
@@ -275,6 +279,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         };
         await store.put("work", work, tx);
         return work;
+    }
+    async function setWorkActivity(run:Run,status:Work['status'],tx:Sql) {
+        if(!run.workId)return;
+        const work=await store.get<Work>('work',run.workId,tx);
+        if(!work||work.projectId!==run.projectId)fail(409,'Run Work is unavailable');
+        if(work!.status===status)return;
+        work!.status=status;work!.revision++;work!.updatedAt=now();
+        await store.put('work',work!,tx);
     }
     async function makeRun(projectId: string, input: {
         workId?: string;
@@ -298,6 +310,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(409, "Review requires recorded candidate diff");
         const targetWork = input.workId ? await store.get<Work>("work", input.workId, tx) : undefined;
         const profile = targetWork?.profileId ? await store.get<Setting>("setting", targetWork.profileId, tx) : undefined;
+        if(targetWork?.profileId && !profile)fail(400,"Agent profile missing");
         if (profile && (profile.kind !== "profile" || (profile.projectId && profile.projectId !== projectId)))
             fail(400, "Invalid agent profile");
         const skillIds = profile && Array.isArray(profile.data.skillIds) ? profile.data.skillIds as string[] : [];
@@ -461,6 +474,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             settings: (await store.list<Setting>("setting")).filter(s => s.projectId ? ids.includes(s.projectId) : true)
         };
     });
+    const publicMetadataUrl = z.string().url().max(2000).refine(value => {
+        const url = new URL(value);
+        return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash;
+    }, 'Use an HTTPS URL without credentials or query parameters');
     function settingData(kind: Setting["kind"], input: unknown): Record<string, unknown> {
         const schemas = {
             profile: z.object({
@@ -476,12 +493,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             }).strict(),
             skill: z.object({
                 content: z.string().min(1).max(64000),
-                sourceUrl: z.string().url().optional(),
+                sourceUrl: publicMetadataUrl.optional(),
                 enabled: z.boolean().default(true)
             }).strict(),
             connection: z.object({
                 provider: z.enum(["github", "slack"]),
-                url: z.string().url(),
+                url: publicMetadataUrl,
                 enabled: z.boolean().default(true)
             }).strict()
         };
@@ -515,18 +532,30 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             await admin(req);
         return store.transaction('setting',async tx=>{if(b.projectId)await grant(u,b.projectId,true);else await admin(req);return writeSetting(req.body,tx);});
     });
+    async function patchSetting(actor: Member, sid: string, input: unknown, tx: Sql, projectBoundary?: string) {
+        const change = z.object({
+            name: text.optional(),
+            data: z.record(z.string(), z.unknown()).optional(),
+            expectedUpdatedAt: z.string().optional()
+        }).strict().refine(v => v.name !== undefined || v.data !== undefined, 'A settings change is required').parse(input);
+        const setting = await store.get<Setting>('setting', sid, tx);
+        if (!setting) fail(404, 'Setting missing');
+        if (projectBoundary && setting!.projectId && setting!.projectId !== projectBoundary)
+            fail(403, 'Setting scope mismatch');
+        if (setting!.projectId) await grant(actor, setting!.projectId, true);
+        else if (!['owner', 'admin'].includes(actor.role)) fail(403, 'Workspace administrator required');
+        if (change.expectedUpdatedAt && change.expectedUpdatedAt !== setting!.updatedAt)
+            fail(409, 'Setting changed; reload before updating');
+        if (change.data) setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data });
+        if (change.name !== undefined) setting!.name = change.name;
+        setting!.updatedAt = new Date(Math.max(Date.now(), Date.parse(setting!.updatedAt) + 1)).toISOString();
+        await store.put('setting', setting!, tx);
+        return setting!;
+    }
     app.patch("/api/workbench/settings/:id", async (req) => {
-        const u=await member(req);
+        const actor=await member(req);
         const sid=(req.params as {id:string}).id;
-        const input=z.object({name:text.optional(),data:z.record(z.string(),z.unknown()).optional()}).strict().parse(req.body);
-        return store.transaction('setting',async tx=>{
-            const setting=await store.get<Setting>('setting',sid,tx);
-            if(!setting)fail(404,'Setting missing');
-            if(setting!.projectId)await grant(u,setting!.projectId,true);else await admin(req);
-            if(input.data)input.data=settingData(setting!.kind,input.data);
-            Object.assign(setting!,input,{updatedAt:now()});
-            await store.put('setting',setting!,tx);return setting;
-        });
+        return store.transaction('setting',tx=>patchSetting(actor,sid,req.body,tx));
     });
     app.post("/api/workbench/connectors", async (req) => {
         await admin(req);
@@ -607,7 +636,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                     await store.put("run", r, tx);
                 }
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model)) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt))));
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model)) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt))));
             if (!r)
                 return undefined;
             r.status = "running";
@@ -616,6 +645,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             r.leaseUntil = new Date(Date.now() + 90000).toISOString();
             r.updatedAt = now();
             await store.put("run", r, tx);
+            if(r.kind!=='master')await setWorkActivity(r,'in_progress',tx);
             return {
                 run: r,
                 execution: r.execution ?? {provider:"openai",method:"codex-host",skills:[],tools:[]},
@@ -640,6 +670,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     }).id}`, async (tx) => {
         const r = await leased(req, tx);
         r.leaseUntil = new Date(Date.now() + 90000).toISOString();
+        await tx`UPDATE wb_connectors SET last_seen=now() WHERE id=${r.connectorId!}`;
         await store.put("run", r, tx);
         return r;
     }));
@@ -799,7 +830,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 works: await store.scopedList<Work>("work", [r.projectId], 500, tx),
                 messages: await store.scopedList<Message>("message", [r.projectId], 500, tx),
                 runs: await store.scopedList<Run>("run", [r.projectId], 500, tx),
-                artifacts: await store.artifactMetadata([r.projectId],tx)
+                artifacts: await store.artifactMetadata([r.projectId],tx),
+                settings: (await store.list<Setting>('setting',undefined,tx)).filter(setting=>!setting.projectId || setting.projectId===r.projectId)
             };
         else if (b.action === "read_work") {
             const w = await store.get<Work>("work", String(b.input.workId), tx);
@@ -871,14 +903,17 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             }, tx);
         }
         else {
-            await toolSettingsGrant(r);
-            const input = z.object({
-                instructions: z.string().max(16000)
-            }).parse(b.input);
-            const p = (await store.get<Project>("project", r.projectId, tx))!;
-            p.instructions = input.instructions;
-            await store.put("project", p, tx);
-            result = p;
+            if(typeof b.input.settingId==='string') {
+                const input=z.object({settingId:text,expectedUpdatedAt:z.string().min(1),name:text.optional(),data:z.record(z.string(),z.unknown()).optional()}).strict().parse(b.input);
+                const {settingId,...change}=input;
+                result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);
+            } else {
+                await toolSettingsGrant(r);
+                const input=z.object({instructions:z.string().max(16000)}).strict().parse(b.input);
+                const project=(await store.get<Project>('project',r.projectId,tx))!;
+                project.instructions=input.instructions;
+                await store.put('project',project,tx);result=project;
+            }
         }
         await tx `INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(result as never)})`;
         return result;
@@ -1004,6 +1039,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             r!.stoppedAt = active ? undefined : now();
             r!.updatedAt = now();
             await store.put("run", r!, tx);
+            if(r!.workId && r!.kind!=='master') {
+                const other=await tx`SELECT id FROM wb_records WHERE kind='run' AND project_id=${r!.projectId} AND data->>'workId'=${r!.workId} AND data->>'status'='running' AND id<>${r!.id} LIMIT 1`;
+                if(!other.length)await setWorkActivity(r!,'paused',tx);
+            }
             return r;
         });
     });

@@ -20,8 +20,9 @@ const fail = (statusCode: number, message: string): never => {
 };
 export async function registerSourceRoutes(app: FastifyInstance, store: WorkbenchStore, options: SourceOptions) {
     const fetcher = options.fetcher ?? fetch;
-    async function ingest(projectId: string, sourceId: string, speaker: string, body: string, url: string) {
+    async function ingest(projectId: string, sourceId: string, speaker: string, body: string, url: string, reauthorize?: () => Promise<void>) {
         return store.transaction("source", async (tx) => {
+            await reauthorize?.();
             const scope = `source:${projectId}`;
             const existing = await tx `SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${sourceId}`;
             if (existing[0])
@@ -50,7 +51,7 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         }).parse(req.body);
         const url = new URL(b.url);
         const match = /^\/([^/]+)\/([^/]+)\/(issues|pull)\/(\d+)\/?$/.exec(url.pathname);
-        if ((url.protocol!=="https:"||url.hostname !== "github.com") || !match || url.search || url.hash)
+        if ((url.protocol!=="https:"||url.hostname !== "github.com") || !match || url.username || url.password || url.search || url.hash)
             fail(400, "Use a GitHub issue or pull request URL");
         const p = await store.get<Project>("project", pid);
         const repository = `https://github.com/${match![1]}/${match![2]}`;
@@ -76,13 +77,13 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
             html_url?: string;
             state?: string;
         };
-        return ingest(pid, `github:${match![1]}/${match![2]}:${match![3]}:${match![4]}`, "GitHub source", `${payload.title ?? ""}\n${payload.body ?? ""}\nState: ${payload.state ?? "unknown"}`, b.url);
+        return ingest(pid, `github:${match![1]}/${match![2]}:${match![3]}:${match![4]}`, "GitHub source", `${payload.title ?? ""}\n${payload.body ?? ""}\nState: ${payload.state ?? "unknown"}`, b.url, () => options.authorize(req,pid));
     });
     app.post('/api/workbench/projects/:id/skills/import',async req=>{
         const projectId=(req.params as {id:string}).id;await options.authorize(req,projectId,true);
         const input=z.object({url:z.string().url().max(2000),name:z.string().trim().min(1).max(120).optional()}).parse(req.body);
         const url=new URL(input.url);const parts=url.pathname.split('/').filter(Boolean);
-        if((url.protocol!=='https:'||url.hostname!=='github.com')||parts.length<5||parts[2]!=='blob'||parts.at(-1)!=='SKILL.md'||url.search||url.hash)fail(400,'Use a GitHub URL to a SKILL.md file');
+        if((url.protocol!=='https:'||url.hostname!=='github.com')||parts.length<5||parts[2]!=='blob'||parts.at(-1)!=='SKILL.md'||url.username||url.password||url.search||url.hash)fail(400,'Use a GitHub URL to a SKILL.md file');
         const [owner,repo,,ref,...path]=parts;
         if(!owner||!repo||!ref||![owner,repo].every(p=>/^[A-Za-z0-9_.-]+$/.test(p)))fail(400,'Invalid skill repository');
         const api=`https://api.github.com/repos/${owner}/${repo}/contents/${path.map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref!)}`;
@@ -90,7 +91,11 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         if(!response.ok)fail(502,`GitHub skill unavailable (${response.status})`);
         const result=z.object({type:z.literal('file'),encoding:z.literal('base64'),content:z.string().max(90000),size:z.number().max(64000)}).parse(await response.json());
         const content=Buffer.from(result.content.replace(/\s/g,''),'base64').toString('utf8');if(!content.trim()||Buffer.byteLength(content)>64000)fail(400,'Skill file must be nonempty and at most 64 KB');
-        const skill:Setting={id:`setting_${crypto.randomUUID()}`,kind:'skill',projectId,name:input.name??path.at(-2)??repo!,data:{content,sourceUrl:input.url,enabled:true},updatedAt:new Date().toISOString()};await store.put('setting',skill);return skill;
+        const skill:Setting={id:`setting_${crypto.randomUUID()}`,kind:'skill',projectId,name:input.name??path.at(-2)??repo!,data:{content,sourceUrl:input.url,enabled:true},updatedAt:new Date().toISOString()};return store.transaction('skill-import',async tx=>{
+            await options.authorize(req,projectId,true);
+            await store.put('setting',skill,tx);
+            return skill;
+        });
     });
     await app.register(async (sourceApp) => {
         sourceApp.removeContentTypeParser("application/json");

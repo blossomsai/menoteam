@@ -60,7 +60,7 @@ export const workbenchApi = {
   resumeRun: (runId: string) => request<Run>(`/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' }),
   reconcileRun: (runId: string) => request<Run>(`/runs/${encodeURIComponent(runId)}/reconcile`, { method: 'POST', body: JSON.stringify({ stopped: true }) }),
   saveSetting: (input: { kind: Setting['kind']; projectId?: string; name: string; data: Record<string, unknown> }) => request<Setting>('/settings', { method: 'POST', body: JSON.stringify(input) }),
-  updateSetting: (id: string, input: { name?: string; data?: Record<string, unknown> }) => request<Setting>(`/settings/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
+  updateSetting: (id: string, input: { name?: string; data?: Record<string, unknown>; expectedUpdatedAt?: string }) => request<Setting>(`/settings/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   invite: (input: { email: string; projectId?: string; role: Member['role'] }) => request<{ token: string; expiresAt: string }>('/invites', { method: 'POST', body: JSON.stringify(input) }),
   acceptInvite: (input: { token: string; name: string; password: string }) => request<{ accepted: true; email: string }>('/invites/accept', { method: 'POST', body: JSON.stringify(input) }),
 };

@@ -14,7 +14,7 @@ const app = await createWorkbenchApp({
     sql,
     bootstrapEmail: process.env.WORKBENCH_BOOTSTRAP_EMAIL,
     bootstrapPassword: process.env.WORKBENCH_BOOTSTRAP_PASSWORD,
-    secureCookies: process.env.WORKBENCH_SECURE_COOKIES === "true",
+    secureCookies: process.env.WORKBENCH_SECURE_COOKIES === "true" || process.env.WORKBENCH_ORIGIN?.startsWith("https://"),
     allowedOrigin: process.env.WORKBENCH_ORIGIN,
     registerAssets: async (app) => {
         const root = resolve("dist/workbench/web");
