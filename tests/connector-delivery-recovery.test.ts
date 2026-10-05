@@ -2,7 +2,9 @@ import { spawn } from 'node:child_process';
 import { appendFile, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import * as processInspection from '../src/connector/codex.js';
+import { stateKey, writeSecureJson } from '../src/connector/state.js';
 import { ConnectorRunner } from '../src/connector/runner.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
 import type { WorkbenchConnectorClient } from '../src/connector/client.js';
@@ -11,6 +13,167 @@ const wait=async(check:()=>Promise<boolean>)=>{const end=Date.now()+10000;while(
 const native={start:async()=>[],stop:async()=>{}} as unknown as CodexAppServer;
 
 describe('durable Draft PR Connector recovery',()=>{
+  // Fault only process inspection; durable state and Runner recovery remain real.
+  for (const fault of ['missing child identity', 'unverifiable child identity', 'executor EPERM', 'reused executor PID'] as const) {
+    it(`retains the Git-stage reservation across restart with ${fault}`, async () => {
+      const temp = await mkdtemp(path.join(os.tmpdir(), 'menoteam-delivery-negative-'));
+      const executorPid = 2147000000;
+      const childIdentity = { pid: 2147000001, processGroupId: 2147000001, startedAt: 'saved-before-crash', command: 'git push fixed-ref' };
+      const originalKill = process.kill.bind(process);
+      const probe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        if (pid !== executorPid || signal !== 0) return originalKill(pid, signal);
+        if (fault === 'reused executor PID') return true; // The old PID now belongs to an unrelated live process.
+        throw Object.assign(new Error('Controlled executor inspection fault'), { code: fault === 'executor EPERM' ? 'EPERM' : 'ESRCH' });
+      });
+      const waitGroup = vi.spyOn(processInspection, 'waitProcessGroup').mockResolvedValue(false);
+      const verifyGroup = vi.spyOn(processInspection, 'terminateVerifiedGitProcessGroup').mockResolvedValue(false);
+      try {
+        const f = await draftFixture(temp);
+        f.config.pollIntervalMs = 10;
+        const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey(f.claim.run.id, '1')}.json`);
+        await writeSecureJson(spoolPath, {
+          runId: f.claim.run.id, generation: 1, events: [], artifacts: [],
+          deliveryExecutor: { pid: executorPid, executionId: 'pre-crash-executor', stage: 'git' },
+          ...(fault === 'missing child identity' ? {} : { deliveryProcessIdentity: childIdentity }),
+          deliveryProgress: { phase: 'published', remoteHeadSha: f.commitSha },
+        });
+        const saved = await readFile(spoolPath, 'utf8');
+        const effect = vi.fn(() => { throw new Error('Recovery must not execute delivery effects'); });
+        const generation = 1;
+        // No stopped proof is sent to the server. This fixture models its existing reservation;
+        // actual PG stopped-proof/retry authorization is separate operator validation.
+        const reservation = { runId: f.claim.run.id, generation, stopped: false };
+        const stopped = vi.fn(async () => { reservation.stopped = true; reservation.generation++; });
+        let totalClaims = 0;
+        let retryClaims = 0;
+        for (let restart = 0; restart < 2; restart++) {
+          let runner: ConnectorRunner;
+          const client = {
+            readRun: async () => ({ ...f.claim.run, status: 'interrupted' }),
+            stopped,
+            claim: async () => {
+              totalClaims++;
+              if (reservation.stopped && retryClaims === 0) {
+                retryClaims++;
+                return { ...f.claim, run: { ...f.claim.run, generation: reservation.generation } };
+              }
+              await runner.stop(); return undefined;
+            },
+            authorizeDeliveryEffect: effect, renew: effect, deliveryProgress: effect, complete: effect,
+          } as unknown as WorkbenchConnectorClient;
+          runner = new ConnectorRunner(f.config, {
+            native: () => native, client: () => client,
+            delivery: { transport: effect, fetcher: effect as unknown as typeof fetch },
+          });
+          await runner.run();
+          expect(await readFile(spoolPath, 'utf8')).toBe(saved);
+          expect(await readdir(path.join(f.config.dataDir, 'spool'))).toEqual([path.basename(spoolPath)]);
+          expect(await readdir(path.join(f.config.dataDir, 'unsent-evidence')).catch(() => [])).toEqual([]);
+          expect(stopped).not.toHaveBeenCalled();
+          expect(effect).not.toHaveBeenCalled();
+          expect(reservation).toEqual({ runId: f.claim.run.id, generation: 1, stopped: false });
+        }
+        expect(totalClaims).toBe(2);
+        expect(retryClaims).toBe(0);
+        expect(probe).toHaveBeenCalledWith(executorPid, 0);
+        if (fault === 'unverifiable child identity') {
+          expect(waitGroup).toHaveBeenCalledWith(childIdentity.processGroupId, 1);
+          expect(verifyGroup).toHaveBeenCalledWith(childIdentity);
+        } else {
+          // Missing child proof and executor ambiguity must stop before touching the old group.
+          expect(waitGroup).not.toHaveBeenCalled();
+          expect(verifyGroup).not.toHaveBeenCalled();
+        }
+      } finally {
+        probe.mockRestore(); waitGroup.mockRestore(); verifyGroup.mockRestore();
+        await rm(temp, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('releases the persisted Git-stage reservation only after executor absence and verified child stop', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'menoteam-delivery-verified-'));
+    const prior = process.env.MENOTEAM_GITHUB_TOKEN;
+    process.env.MENOTEAM_GITHUB_TOKEN = 'fixture-token';
+    const executorPid = 2147000000;
+    const childIdentity = { pid: 2147000001, processGroupId: 2147000001, startedAt: 'saved-before-crash', command: 'git push fixed-ref' };
+    const originalKill = process.kill.bind(process);
+    const probe = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (pid !== executorPid || signal !== 0) return originalKill(pid, signal);
+      throw Object.assign(new Error('Controlled executor absence'), { code: 'ESRCH' });
+    });
+    const waitGroup = vi.spyOn(processInspection, 'waitProcessGroup').mockResolvedValue(false);
+    let verified = false;
+    const verifyGroup = vi.spyOn(processInspection, 'terminateVerifiedGitProcessGroup').mockImplementation(async identity => {
+      expect(identity).toEqual(childIdentity);
+      return verified;
+    });
+    try {
+      const f = await draftFixture(temp);
+      f.config.pollIntervalMs = 10;
+      // Exact remote SHA/PR already exist; successful recovery must only reconcile.
+      await f.transport(f.checkout, {}, 'push', `--force-with-lease=refs/heads/${f.claim.run.operation!.remoteBranch}:`, `${f.claim.project.repositoryUrl}.git`, `${f.commitSha}:refs/heads/${f.claim.run.operation!.remoteBranch}`);
+      const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey(f.claim.run.id, '1')}.json`);
+      await writeSecureJson(spoolPath, {
+        runId: f.claim.run.id, generation: 1, events: [], artifacts: [],
+        deliveryExecutor: { pid: executorPid, executionId: 'pre-crash-executor', stage: 'git' },
+        deliveryProcessIdentity: childIdentity,
+      });
+      const saved = await readFile(spoolPath, 'utf8');
+      let runner: ConnectorRunner;
+      let acknowledgments = 0;
+      let generation = 1;
+      let reserved = true;
+      let claimed = false;
+      let completed = 0;
+      const calls: string[] = [];
+      const client = {
+        readRun: async () => ({ ...f.claim.run, status: 'interrupted', generation: 1 }),
+        stopped: async (id: string, g: number) => {
+          expect(verified).toBe(true); expect(id).toBe(f.claim.run.id); expect(g).toBe(1);
+          calls.push('stopped'); acknowledgments++; reserved = false; generation = 2;
+        },
+        claim: async () => {
+          if (!reserved && !claimed) { claimed = true; return { ...f.claim, run: { ...f.claim.run, generation } }; }
+          await runner.stop(); return undefined;
+        },
+        renew: async () => {},
+        authorizeDeliveryEffect: async (_id: string, g: number) => {
+          expect(acknowledgments).toBe(1); expect(g).toBe(2); calls.push('authorize');
+          return { repositoryUrl: f.claim.project.repositoryUrl };
+        },
+        deliveryProgress: async () => {},
+        complete: async () => { completed++; },
+      } as unknown as WorkbenchConnectorClient;
+      const effects: string[] = [];
+      const transport = async (cwd: string, env: NodeJS.ProcessEnv, ...args: string[]) => {
+        expect(acknowledgments).toBe(1); effects.push(args[0]!); return f.transport(cwd, env, ...args);
+      };
+      // Simulate an ambiguous group on first restart, then independently verified termination.
+      const fetcher = (async (_url: string, init?: RequestInit) => {
+        expect(acknowledgments).toBe(1); effects.push(init?.method ?? 'GET');
+        return new Response(JSON.stringify([{ number: 91, html_url: 'https://github.com/example/project/pull/91',
+          head: { sha: f.commitSha }, base: { ref: 'main' }, body: `<!-- menoteam-operation:${f.claim.run.id} -->`, draft: true }]));
+      }) as typeof fetch;
+      runner = new ConnectorRunner(f.config, { native: () => native, client: () => client, delivery: { transport, fetcher } });
+      await runner.run();
+      expect(await readFile(spoolPath, 'utf8')).toBe(saved);
+      expect(acknowledgments).toBe(0); expect(generation).toBe(1); expect(reserved).toBe(true); expect(effects).toEqual([]);
+      verified = true;
+      runner = new ConnectorRunner(f.config, { native: () => native, client: () => client, delivery: { transport, fetcher } });
+      await runner.run();
+      expect(acknowledgments).toBe(1); expect(completed).toBe(1); expect(generation).toBe(2);
+      expect(calls[0]).toBe('stopped'); expect(calls).toContain('authorize');
+      expect(effects.filter(effect => effect === 'POST')).toEqual([]);
+      expect(effects.filter(effect => effect === 'push')).toEqual([]);
+      expect(await readdir(path.join(f.config.dataDir, 'spool'))).toEqual([]);
+    } finally {
+      probe.mockRestore(); waitGroup.mockRestore(); verifyGroup.mockRestore();
+      if (prior === undefined) delete process.env.MENOTEAM_GITHUB_TOKEN; else process.env.MENOTEAM_GITHUB_TOKEN = prior;
+      await rm(temp, { recursive: true, force: true });
+    }
+  });
+
   it('replays the durable completion outbox after response loss without a second PR or publication',async()=>{
     const temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-delivery-outbox-'));const prior=process.env.MENOTEAM_GITHUB_TOKEN;process.env.MENOTEAM_GITHUB_TOKEN='fixture-token';
     try{
