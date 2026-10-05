@@ -8,7 +8,7 @@
 
 现有 `Project.repositoryUrl` 已绑定 GitHub repository；`Run.requestedBy`、actor membership、run lease/generation、source intake 的有限 `allowedActions` 可复用。Connector 已有 isolated Work checkout、checkpoint commit、完整文件 fingerprint、diff identity、review target affinity 和 durable outbox。`Artifact.kind='delivery'` 与 Overview 已能承载交付结果，不需要 Release 页面或 Scope 审批。
 
-现有 `deliveryAuthorization` 是 prompt context，不是权限。当前还没有发布 branch、创建 PR、merge、deploy 的 executor；`WORKBENCH_GITHUB_TOKEN` 只用于 source retrieval，不能假定其有写权限。QA 记录指纹，但 review 目前只有文字结果，没有可验证的 `approved / changes_requested / insufficient_evidence` disposition。Operator staging Menoteam 的动作不能算 Work runtime 具备 delivery 能力。
+现有 `deliveryAuthorization` 是 prompt context，不是权限。固定 branch publication 和 Draft PR executor 已实现；真实 PR #3 只证明旧候选的 PR 创建子流程，不证明当前 `c082127` 集成版本已发布。原生 `merge_pr` 正在开发，deploy executor 尚未实现。以 `c082127` 为基线，QA 已记录候选指纹，但 review 结果仍是自由文本，缺少绑定同一候选的可验证 `approved / changes_requested / insufficient_evidence` disposition。Operator staging Menoteam 的动作不能算 Work runtime 具备 delivery 能力。
 
 ## 一个操作接口，一条已有队列模式
 
