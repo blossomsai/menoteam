@@ -1,6 +1,8 @@
 # A14：基于现有 Work 的最小 Delivery 增量
 
-状态：delivery architecture proposal，merge/deploy 尚未实现。2026-10-06 只读检查 shared backend baseline `080e485f651ae2fd1d4a457f4c85620cd281b358`（包含 validation checkpoint `59c78c416e5989a4e31224d368f0a19edec5bcb4`）：Run.kind 仍为 master/implementation/review；没有 request_delivery route/tool 或固定 delivery executor。Draft PR 的 native Work 正在开发独立候选，不能当作已集成能力。本文件不执行或授权新的远端副作用。
+状态（截至集成候选 `c082127d71ccbcf16b7affb79154b90b2e87ec37`）：固定 Connector executor 可通过 Master 请求创建 Draft PR；真实 PR #3 证明了旧候选的 Draft PR 子流程，但该候选早于当前集成版本，不能作为当前应用的发布候选。原生 `merge_pr` 能力正在开发；`deploy`、部署后验证和版本回滚尚未实现。这里的真实状态以 acceptance ledger 的最新记录为准。
+
+历史基线：以下 2026-10-06 初始检查针对 shared backend `080e485f651ae2fd1d4a457f4c85620cd281b358`（包含 validation checkpoint `59c78c416e5989a4e31224d368f0a19edec5bcb4`），当时确实没有 `request_delivery` route/tool 或固定 delivery executor。该段只记录当时的状态，不代表当前能力。本文件不执行或授权新的远端副作用。
 
 ## 当前可复用的基础与真正缺口
 

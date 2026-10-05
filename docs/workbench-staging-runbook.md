@@ -110,7 +110,33 @@ build. Record the digest and matching source revision in the deployment record.
    before/after Caddy config checksums, service health, test evidence, and
    rollback result without recording secret values or production record data.
 
-## Rollback sequence
+## First isolated deployment: bootstrap failure handling
+
+The first isolated staging deployment has no previously verified Workbench
+image to roll back to. Record this explicitly as `previousVersion: null` before
+starting; do not invent a rollback target or describe bootstrap cleanup as a
+version rollback.
+
+If the first deployment fails verification, remove only the newly added staging
+Caddy route, validate the restored configuration, and reload Caddy. Confirm
+that the V1 and Gateway routes still use their original upstreams, then stop
+the staging app and leave the target offline. Preserve the staging database
+volume, its data, and the failure evidence; do not run `down -v`, prune, or
+delete volumes. Record the outcome as `deploy failed / target offline`, not
+`rolled back` or `rollback verified`.
+
+This bootstrap exception applies only to a new, isolated staging target. It
+does not bypass the authorization or backup prerequisite in the preflight
+section: A15 remains blocked until the user explicitly authorizes the
+production-data export and destination and the required backup/restore proof
+is completed. Do not create the staging target while that prerequisite is
+unmet.
+
+After the first version passes actual version, authentication, and user-flow
+verification, record its immutable digest and source SHA as the first verified
+version. A later candidate can then use that version as its rollback target.
+
+## Subsequent version rollback sequence
 
 Rollback is an app/config operation. Do not delete either database volume and
 do not reverse applied migrations automatically.
@@ -119,7 +145,8 @@ do not reverse applied migrations automatically.
    removing only the staging site block), then validate it and run
    `systemctl reload caddy`. Confirm the V1 and Gateway sites still point to
    `127.0.0.1:3000` and `127.0.0.1:3100`.
-2. Recreate the staging app using the previously recorded, verified image
+2. For a deployment after bootstrap, recreate the staging app using the
+   previously recorded, verified image
    digest with `docker compose -p menoteam-workbench-stage -f
    /opt/menoteam/workbench-stage/compose.yml up -d app`. Do not use `latest`.
    If the prior staging image is not available, leave staging offline rather
@@ -130,6 +157,13 @@ do not reverse applied migrations automatically.
 4. Keep the staging volume and database until evidence has been preserved and
    a separately authorized cleanup is approved. Never run `down -v`, prune
    volumes, or remove the V1 project/volumes as part of staging rollback.
+
+Before enabling version rollback as a release capability, perform a second
+isolated deployment and drill switching back to the first verified digest.
+Verify the service reports that exact digest/source SHA and that persisted
+staging data and a representative authenticated Work flow still work. This is
+the first real version-rollback proof; first-deployment bootstrap cleanup does
+not count.
 
 Schema changes must remain additive and backward-compatible while V1 remains
 live. If a candidate migration is not compatible with its previous app
