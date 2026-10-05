@@ -1,0 +1,62 @@
+import { spawn } from 'node:child_process';
+import { appendFile, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { ConnectorRunner } from '../src/connector/runner.js';
+import type { CodexAppServer } from '../src/connector/codex.js';
+import type { WorkbenchConnectorClient } from '../src/connector/client.js';
+import { draftFixture } from './helpers/draft-pr-fixture.js';
+const wait=async(check:()=>Promise<boolean>)=>{const end=Date.now()+10000;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,20));}throw new Error('Timed out waiting for crash fixture');};
+const native={start:async()=>[],stop:async()=>{}} as unknown as CodexAppServer;
+
+describe('durable Draft PR Connector recovery',()=>{
+  it('replays the durable completion outbox after response loss without a second PR or publication',async()=>{
+    const temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-delivery-outbox-'));const prior=process.env.MENOTEAM_GITHUB_TOKEN;process.env.MENOTEAM_GITHUB_TOKEN='fixture-token';
+    try{
+      const f=await draftFixture(temp);let runner:ConnectorRunner;let claimed=false;let completed=0;let posts=0;let pushes=0;let phaseRequests=0;
+      const client={claim:async()=>{if(!claimed){claimed=true;return f.claim;}if(completed>=2)await runner.stop();return undefined;},readRun:async()=>f.claim.run,renew:async()=>{},authorizeDeliveryEffect:async()=>({repositoryUrl:f.claim.project.repositoryUrl}),deliveryProgress:async()=>{phaseRequests++;},complete:async()=>{completed++;if(completed===1){await runner.stop();throw new Error('completion response lost');}}} as unknown as WorkbenchConnectorClient;
+      const transport=async(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>{if(args[0]==='push')pushes++;return f.transport(cwd,env,...args);};
+      const fetcher=(async(_url:string,init?:RequestInit)=>{if(init?.method==='POST'){posts++;return new Response(JSON.stringify({number:83,html_url:'https://github.com/example/project/pull/83',head:{sha:f.commitSha},draft:true}));}return new Response('[]');}) as typeof fetch;
+      runner=new ConnectorRunner(f.config,{native:()=>native,client:()=>client,delivery:{transport,fetcher}});await runner.run();
+      const pending=await readdir(path.join(f.config.dataDir,'spool'));expect(pending).toHaveLength(1);expect(JSON.parse(await readFile(path.join(f.config.dataDir,'spool',pending[0]!),'utf8')).completion).toEqual({});
+      runner=new ConnectorRunner(f.config,{native:()=>native,client:()=>client,delivery:{transport,fetcher}});await runner.run();
+      expect(completed).toBe(2);expect(posts).toBe(1);expect(pushes).toBe(1);expect(phaseRequests).toBe(2);expect(await readdir(path.join(f.config.dataDir,'spool'))).toEqual([]);
+    }finally{if(prior===undefined)delete process.env.MENOTEAM_GITHUB_TOKEN;else process.env.MENOTEAM_GITHUB_TOKEN=prior;await rm(temp,{recursive:true,force:true});}
+  },15000);
+
+  for(const stage of ['phase','http'] as const)it(`proves executor stopped after ${stage} crash, then reconciles without overlap`,async()=>{
+    const temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-delivery-recovery-'));const prior=process.env.MENOTEAM_GITHUB_TOKEN;process.env.MENOTEAM_GITHUB_TOKEN='fixture-token';
+    let child:ReturnType<typeof spawn>|undefined;
+    try{
+      const f=await draftFixture(temp);const marker=path.join(temp,'crash-ready');const prFile=path.join(temp,'pr.json');const posts=path.join(temp,'posts');
+      const script=path.join(temp,'crash.ts');const runnerPath=path.resolve('src/connector/runner.ts');
+      await writeFile(script,`
+import { ConnectorRunner } from ${JSON.stringify(runnerPath)};
+import { readFile,writeFile,appendFile } from 'node:fs/promises';
+import { execFile as execCb } from 'node:child_process';import { promisify } from 'node:util';
+const git=promisify(execCb);const cfg=${JSON.stringify(f.config)};const claim=${JSON.stringify(f.claim)};let claimed=false;
+const hang=async()=>{await writeFile(${JSON.stringify(marker)},'ready');return new Promise(()=>{});};
+const client={claim:async()=>{if(claimed)return undefined;claimed=true;return claim;},renew:async()=>{},authorizeDeliveryEffect:async()=>({repositoryUrl:claim.project.repositoryUrl}),readRun:async()=>claim.run,deliveryProgress:async()=>{if(${JSON.stringify(stage)}==='phase')await hang();},complete:async()=>{throw Error('Unexpected completion');}};
+const transport=async(cwd,env,...args)=>(await git('git',args.map(a=>a===claim.project.repositoryUrl+'.git'?${JSON.stringify(f.bare)}:a),{cwd,encoding:'utf8'})).stdout;
+const fetcher=async(url,init)=>{if(init?.method==='POST'){await appendFile(${JSON.stringify(posts)},'POST\\n');const input=JSON.parse(init.body);const pr={number:71,html_url:'https://github.com/example/project/pull/71',head:{sha:claim.run.operation.commitSha},base:{ref:input.base},body:input.body,draft:true};await writeFile(${JSON.stringify(prFile)},JSON.stringify(pr));await hang();}return new Response('[]');};
+new ConnectorRunner(cfg,{native:()=>({start:async()=>[],stop:async()=>{}}),client:()=>client,delivery:{transport,fetcher}}).run();
+`);
+      child=spawn(process.execPath,['--import','tsx',script],{cwd:process.cwd(),env:process.env,stdio:'pipe'});let stderr='';child.stderr?.on('data',b=>{stderr+=b;});
+      await wait(async()=>{if(child?.exitCode!==null)throw new Error(stderr);return readFile(marker).then(()=>true,()=>false);});
+      const files=await readdir(path.join(f.config.dataDir,'spool'));const spool=JSON.parse(await readFile(path.join(f.config.dataDir,'spool',files[0]!), 'utf8'));
+      expect(spool.deliveryExecutor.pid).toBe(child.pid);expect(spool.deliveryProcessIdentity).toBeUndefined();expect(spool.completion).toBeUndefined();
+      let runner:ConnectorRunner;let acks=0;let authorized=0;let claims=0;let completed=0;let prResult:any;let remote={...f.claim.run,status:'interrupted' as const};
+      const client={readRun:async()=>remote,stopped:async()=>{acks++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
+      // A second Connector cannot release a reservation while the old HTTP/phase executor is alive.
+      runner=new ConnectorRunner(f.config,{native:()=>native,client:()=>client});await runner.run();expect(acks).toBe(0);expect(await readdir(path.join(f.config.dataDir,'spool'))).toHaveLength(1);
+      const exited=new Promise<void>(resolve=>child!.once('exit',()=>resolve()));child.kill('SIGKILL');await exited;
+      let retry=false;const retryClaim={...f.claim,run:{...f.claim.run,generation:2}};
+      const restarted={readRun:async()=>remote,stopped:async(_id:string,g:number)=>{expect(g).toBe(1);acks++;retry=true;},claim:async()=>{claims++;if(retry){retry=false;return retryClaim;}if(completed)await runner.stop();return undefined;},renew:async()=>{},authorizeDeliveryEffect:async(_id:string,g:number)=>{expect(g).toBe(2);expect(acks).toBe(1);authorized++;return {repositoryUrl:f.claim.project.repositoryUrl};},deliveryProgress:async(_id:string,_g:number,phase:any)=>{if(phase.phase==='pr_created')prResult=phase;},complete:async()=>{completed++;}} as unknown as WorkbenchConnectorClient;
+      const fetcher=(async(_url:string,init?:RequestInit)=>{if(init?.method==='POST'){await appendFile(posts,'POST\n');const input=JSON.parse(String(init.body));const pr={number:71,html_url:'https://github.com/example/project/pull/71',head:{sha:f.commitSha},base:{ref:input.base},body:input.body,draft:true};await writeFile(prFile,JSON.stringify(pr));return new Response(JSON.stringify(pr));}return new Response(JSON.stringify(await readFile(prFile,'utf8').then(s=>[JSON.parse(s)],()=>[])));}) as typeof fetch;
+      runner=new ConnectorRunner(f.config,{native:()=>native,client:()=>restarted,delivery:{transport:f.transport,fetcher}});await runner.run();
+      expect(acks).toBe(1);expect(completed).toBe(1);expect(prResult).toMatchObject({phase:'pr_created',pullRequestNumber:71,headSha:f.commitSha});expect(authorized).toBeGreaterThan(0);expect(claims).toBeGreaterThan(1);expect((await readFile(posts,'utf8')).trim().split('\n')).toHaveLength(1);expect(JSON.parse(await readFile(prFile,'utf8')).number).toBe(71);expect(await readdir(path.join(f.config.dataDir,'spool'))).toEqual([]);
+      if(stage==='phase')expect(await readdir(path.join(f.config.dataDir,'unsent-evidence'))).toHaveLength(1);
+    }finally{child?.kill('SIGKILL');if(prior===undefined)delete process.env.MENOTEAM_GITHUB_TOKEN;else process.env.MENOTEAM_GITHUB_TOKEN=prior;await rm(temp,{recursive:true,force:true});}
+  },20000);
+});

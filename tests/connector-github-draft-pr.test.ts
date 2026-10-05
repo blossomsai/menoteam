@@ -1,3 +1,4 @@
+import { draftFixture } from './helpers/draft-pr-fixture.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -13,24 +14,7 @@ const execFile=promisify(execFileCb);let temp='';let priorToken:string|undefined
 const git=async(cwd:string,...args:string[])=>await execFile('git',args,{cwd,encoding:'utf8'});
 const repository='https://github.com/example/project';
 
-async function fixture(){
-  temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-draft-pr-'));const root=path.join(temp,'repo');const bare=path.join(temp,'remote.git');const dataDir=path.join(temp,'connector-data');const checkout=path.join(dataDir,'worktrees','project','work');
-  await mkdir(root,{recursive:true});await mkdir(dataDir,{recursive:true});
-  await git(root,'init','-b','main');await git(root,'config','user.name','Local Test');await git(root,'config','user.email','local@example.test');
-  await writeFile(path.join(root,'README.md'),'base\n');await git(root,'add','.');await git(root,'commit','-m','base');const base=(await git(root,'rev-parse','HEAD')).stdout.trim();
-  await mkdir(bare);await git(bare,'init','--bare');await git(root,'remote','add','origin',`${repository}.git`);
-  await git(root,'worktree','add','--detach',checkout,base);await writeFile(path.join(checkout,'feature.txt'),'draft me\n');await git(checkout,'add','.');await git(checkout,'-c','user.name=Local Test','-c','user.email=local@example.test','commit','-m','candidate');
-  const commitSha=(await git(checkout,'rev-parse','HEAD')).stdout.trim();const diff=await createDiff(checkout,base);const candidateRevision=diffRevision(diff);const candidateFingerprint=await fingerprint(checkout);await persistWorktreeMap(dataDir,'work',{path:checkout,revision:commitSha,baseRevision:base,artifactRevision:candidateRevision});
-  const run:ClaimedRun['run']={id:'delivery-1',projectId:'project',workId:'work',prompt:'',kind:'delivery',model:'internal',reasoning:'none',status:'running',generation:1,connectorId:'connector',requestedBy:'actor',createdAt:'',updatedAt:'',operation:{action:'create_draft_pr',actorId:'actor',candidateRunId:'candidate-1',candidateRevision,artifactRevision:candidateRevision,commitSha,candidateFingerprint,repositoryUrl:repository,baseRevision:base,baseBranch:'main',remoteBranch:`codex/menoteam/work/${commitSha.slice(0,12)}`,workTitle:'Example Work',changeSummary:'feature.txt',qaStatus:'1 passed, 1 failed',phase:'queued'}};
-  const claim:ClaimedRun={run,project:{id:'project',name:'Project',instructions:'',repositoryUrl:repository,deliveryAuthorization:'',createdAt:''},messages:[],settings:[]};
-  const config:ConnectorConfig={serverUrl:'http://localhost:4313',token:'x'.repeat(32),connectorId:'connector',dataDir,projects:{project:root}};
-  const transport=async(_cwd:string,_env:NodeJS.ProcessEnv,...args:string[])=>{
-    if(args[0]==='ls-remote'){const ref=args.at(-1)!;const sha=(await git(bare,'rev-parse','--verify',ref).catch(()=>({stdout:''}))).stdout.trim();return sha?`${sha}\t${ref}\n`:'';}
-    if(args[0]==='push'){await git(checkout,'push',bare,args.at(-1)!);return '';}
-    throw new Error(`Unexpected local transport command: ${args[0]}`);
-  };
-  return {root,bare,checkout,base,commitSha,claim,config,transport};
-}
+async function fixture(){temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-draft-pr-'));return draftFixture(temp);}
 const create=(f:Awaited<ReturnType<typeof fixture>>,fetcher:typeof fetch=fetch,beforeEffect?:()=>Promise<string|void>,onPhase?:Parameters<typeof createDraftPullRequest>[3])=>createDraftPullRequest(f.config,f.claim,fetcher,onPhase,beforeEffect,f.transport);
 
 beforeEach(()=>{priorToken=process.env.MENOTEAM_GITHUB_TOKEN;process.env.MENOTEAM_GITHUB_TOKEN='local-test-token';});
@@ -46,6 +30,24 @@ describe('fixed Draft PR publication adapter',()=>{
     expect((await git(f.bare,'rev-parse',`refs/heads/${f.claim.run.operation!.remoteBranch}`)).stdout.trim()).toBe(f.commitSha);
     expect((await git(f.root,'rev-parse','HEAD')).stdout.trim()).toBe(baseHead);
     expect(pr?.draft).toBe(true);expect(pr?.body).toContain('1 passed, 1 failed');
+  });
+  it('atomically rejects an ancestor branch created after the absent lookup',async()=>{
+    const f=await fixture();const ref=`refs/heads/${f.claim.run.operation!.remoteBranch}`;let injected=false;let http=0;
+    const transport=async(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>{
+      if(args[0]==='push'){
+        expect(args).toContain(`--force-with-lease=${ref}:`);
+        await git(f.checkout,'push',f.bare,`${f.base}:${ref}`);injected=true;
+      }
+      return f.transport(cwd,env,...args);
+    };
+    await expect(createDraftPullRequest(f.config,f.claim,(async()=>{http++;return new Response('[]');}) as typeof fetch,undefined,undefined,transport)).rejects.toThrow('Atomic publication conflicted');
+    expect(injected).toBe(true);expect(http).toBe(0);expect((await git(f.bare,'rev-parse',ref)).stdout.trim()).toBe(f.base);
+  });
+  it('accepts a concurrent creator only when the ref is the exact candidate SHA',async()=>{
+    const f=await fixture();const ref=`refs/heads/${f.claim.run.operation!.remoteBranch}`;
+    const transport=async(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>{if(args[0]==='push')await git(f.checkout,'push',f.bare,`${f.commitSha}:${ref}`);return f.transport(cwd,env,...args);};
+    const mock=(async(_url:string,init?:RequestInit)=>new Response(JSON.stringify(init?.method==='POST'?{number:31,html_url:'https://github.com/example/project/pull/31',head:{sha:f.commitSha},draft:true}:[]))) as typeof fetch;
+    expect((await createDraftPullRequest(f.config,f.claim,mock,undefined,undefined,transport)).headSha).toBe(f.commitSha);
   });
   it('rejects a changed HEAD before any remote publication or HTTP call',async()=>{
     const f=await fixture();await writeFile(path.join(f.checkout,'drift.txt'),'changed\n');await git(f.checkout,'add','.');await git(f.checkout,'-c','user.name=Local Test','-c','user.email=local@example.test','commit','-m','drift');let httpCalls=0;

@@ -8,6 +8,7 @@ import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js'
 import { createDraftPullRequest } from './github-draft-pr.js';
 import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
 
+const activeDeliveryExecutors=new Set<string>();
 interface Spool {
   runId: string;
   generation: number;
@@ -19,6 +20,7 @@ interface Spool {
   stopped?: boolean;
   processIdentity?:CodexProcessIdentity;
   deliveryProcessIdentity?:GitProcessIdentity;
+  deliveryExecutor?:{pid:number;executionId:string;stage:'git'|'http'|'completion'};
 }
 const delay = (ms:number) => new Promise(resolve => setTimeout(resolve,ms));
 export function buildRunPrompt(claim: ClaimedRun): string {
@@ -38,6 +40,7 @@ export class ConnectorRunner {
   constructor(private readonly config: ConnectorConfig, private readonly dependencies?: {
     native: () => CodexAppServer;
     client: (models:string[]) => WorkbenchConnectorClient;
+    delivery?:{fetcher?:typeof fetch;transport?:Parameters<typeof createDraftPullRequest>[5]};
   }) {}
   private native():CodexAppServer { return this.dependencies?.native() ?? new CodexAppServer(this.config.codexBinary); }
 
@@ -119,12 +122,26 @@ export class ConnectorRunner {
       if (!spool || this.activeRuns.has(spool.runId)) continue;
       const remote = await this.client!.readRun(spool.runId);
       if (remote.generation !== spool.generation) continue; // Retain stale evidence for operator reconciliation.
+      if (['completed','failed'].includes(remote.status)) { await this.retainOrRemove(spool); continue; }
+      if(spool.deliveryExecutor&&!spool.completion&&!spool.stopped){
+        const executor=spool.deliveryExecutor;
+        if(!Number.isSafeInteger(executor.pid)||executor.pid<=1||!executor.executionId)continue;
+        let stopped=executor.pid===process.pid&&!activeDeliveryExecutors.has(executor.executionId);
+        if(executor.pid!==process.pid){
+          try{process.kill(executor.pid,0);}catch(error){stopped=(error as NodeJS.ErrnoException).code==='ESRCH';}
+        }
+        // A stage is evidence, not stop proof. Live/reused PID or EPERM fails closed.
+        if(!stopped)continue;
+        // A crash before the Git child identity was durably captured is not stopped proof.
+        if(executor.stage==='git'&&!spool.deliveryProcessIdentity)continue;
+      }
       if(spool.deliveryProcessIdentity) {
         const gone=await waitProcessGroup(spool.deliveryProcessIdentity.processGroupId,1);
         const terminated=gone||await terminateVerifiedGitProcessGroup(spool.deliveryProcessIdentity);
-        if(terminated){spool.deliveryProcessIdentity=undefined;spool.stopped=true;await this.save(spool);await this.flush(spool);continue;}
+        if(!terminated)continue;
+        spool.deliveryProcessIdentity=undefined;await this.save(spool);
       }
-      if (['completed','failed'].includes(remote.status)) { await this.retainOrRemove(spool); continue; }
+      if(spool.deliveryExecutor&&!spool.completion&&!spool.stopped){spool.stopped=true;await this.save(spool);await this.flush(spool);continue;}
       if (spool.stopped) { await this.flush(spool); continue; }
       if(spool.completion) {
         if(['paused','cancelled','interrupted'].includes(remote.status)) {spool.completion=undefined;spool.stopped=true;await this.save(spool);await this.flush(spool);}
@@ -249,18 +266,23 @@ export class ConnectorRunner {
   }
 
   private async executeDelivery(claim:ClaimedRun):Promise<void>{
-    const client=this.client!;const run=claim.run;const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[]};await this.save(spool);
+    const client=this.client!;const run=claim.run;const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[],deliveryExecutor:{pid:process.pid,executionId:randomUUID(),stage:'git'}};
+    activeDeliveryExecutors.add(spool.deliveryExecutor!.executionId);
     try{
+      await this.save(spool);
       await client.renew(run.id,run.generation);
-      await createDraftPullRequest(this.config,claim,fetch,async phase=>{
+      await createDraftPullRequest(this.config,claim,this.dependencies?.delivery?.fetcher??fetch,async phase=>{
         if(phase.phase==='published'&&run.operation?.phase==='pr_created')return;
-        spool.deliveryProgress=phase;await this.save(spool);await this.flush(spool);
-      },async()=>{const auth=await client.authorizeDeliveryEffect(run.id,run.generation);if(auth.repositoryUrl!==run.operation?.repositoryUrl)throw new Error('Delivery repository authorization changed');return auth.repositoryUrl;},undefined,{
-        started:async pid=>{const identity=await readGitProcessIdentity(pid);if(!identity||identity.processGroupId!==pid)throw new Error('Git transport process identity could not be verified');spool.deliveryProcessIdentity=identity;await this.save(spool);},
-        stopped:async()=>{spool.deliveryProcessIdentity=undefined;await this.save(spool);}
+        spool.deliveryExecutor!.stage='http';spool.deliveryProgress=phase;await this.save(spool);await this.flush(spool);
+      },async()=>{const auth=await client.authorizeDeliveryEffect(run.id,run.generation);if(auth.repositoryUrl!==run.operation?.repositoryUrl)throw new Error('Delivery repository authorization changed');return auth.repositoryUrl;},this.dependencies?.delivery?.transport,{
+        starting:async()=>{spool.deliveryExecutor!.stage='git';await this.save(spool);},
+        started:async pid=>{const identity=await readGitProcessIdentity(pid);if(!identity||identity.processGroupId!==pid)throw new Error('Git transport process identity could not be verified');spool.deliveryExecutor!.stage='git';spool.deliveryProcessIdentity=identity;await this.save(spool);},
+        stopped:async()=>{spool.deliveryExecutor!.stage='http';spool.deliveryProcessIdentity=undefined;await this.save(spool);}
       });
-      spool.completion={};await this.save(spool);await this.flush(spool);
+      spool.deliveryExecutor!.stage='completion';spool.completion={};await this.save(spool);await this.flush(spool);
     }catch(error){
+      // Replay successful completion after a lost server response; never re-execute effects.
+      if(spool.completion)throw error;
       if(spool.deliveryProcessIdentity||(error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){await this.save(spool);throw new Error('Draft PR transport stop is unconfirmed; reconciliation is required');}
       const current=await client.readRun(run.id).catch(()=>undefined);
       if(current?.generation===run.generation&&['paused','cancelled','interrupted'].includes(current.status)){
@@ -277,6 +299,6 @@ export class ConnectorRunner {
         }
       }
       throw new Error('Draft PR operation failed; inspect the durable delivery run');
-    }
+    }finally{activeDeliveryExecutors.delete(spool.deliveryExecutor!.executionId);}
   }
 }

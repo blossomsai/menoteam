@@ -14,7 +14,7 @@ const repoIdentity=(value:string)=>{
 };
 
 /** Publishes only an immutable saved candidate; all remote effects are explicit and retry-reconciled. */
-export async function createDraftPullRequest(config:ConnectorConfig,claim:ClaimedRun,fetcher:typeof fetch=fetch,onPhase?:(value:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string})=>Promise<void>,beforeEffect?:()=>Promise<string|void>,transport?:(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>Promise<string>,processTracking?:{started:(pid:number)=>Promise<void>;stopped:()=>Promise<void>}):Promise<DraftPullRequest>{
+export async function createDraftPullRequest(config:ConnectorConfig,claim:ClaimedRun,fetcher:typeof fetch=fetch,onPhase?:(value:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string})=>Promise<void>,beforeEffect?:()=>Promise<string|void>,transport?:(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>Promise<string>,processTracking?:{starting?:()=>Promise<void>;started:(pid:number)=>Promise<void>;stopped:()=>Promise<void>}):Promise<DraftPullRequest>{
   const run=claim.run as DeliveryRun;const op=run.operation;
   if(run.kind!=='delivery'||!op||op.action!=='create_draft_pr')throw new Error('Draft PR operation is unavailable');
   const token=process.env.MENOTEAM_GITHUB_TOKEN;if(!token)throw new Error('GitHub write capability is unavailable');
@@ -47,12 +47,22 @@ export async function createDraftPullRequest(config:ConnectorConfig,claim:Claime
   const ref=`refs/heads/${expectedBranch}`;
   const gitAuth={...gitConfigEnv,GIT_TERMINAL_PROMPT:'0',GIT_CONFIG_COUNT:'1',GIT_CONFIG_KEY_0:'http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0:`AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`};
   const repoUrl=`https://github.com/${repoIdentity(op.repositoryUrl).owner}/${repoIdentity(op.repositoryUrl).repo}.git`;
-  const runGit=(workingDirectory:string,env:NodeJS.ProcessEnv,...args:string[])=>transport?transport(workingDirectory,env,...args):gitWithEnv(workingDirectory,env,args,processTracking?.started,processTracking?.stopped);
+  const runGit=async(workingDirectory:string,env:NodeJS.ProcessEnv,...args:string[])=>{
+    await processTracking?.starting?.(); // Persist the spawn window before a child can exist.
+    if(!transport)return gitWithEnv(workingDirectory,env,args,processTracking?.started,processTracking?.stopped);
+    try{return await transport(workingDirectory,env,...args);}finally{await processTracking?.stopped();}
+  };
   const authorize=async()=>{const current=await beforeEffect?.();if(current!==undefined&&normalizeUrl(current)!==normalizeUrl(op.repositoryUrl))throw new Error('Current Draft PR repository authorization changed');};
   const remoteSha=async()=>{await authorize();return (await runGit(cwd,gitAuth,'ls-remote','--heads',repoUrl,ref)).trim().split(/\s+/u)[0]??'';};
   let remoteHead=await remoteSha();
   if(remoteHead&&remoteHead!==op.commitSha)throw new Error('Fixed publication branch already points to a different commit');
-  if(!remoteHead){await authorize();await runGit(cwd,gitAuth,'push',repoUrl,`${op.commitSha}:${ref}`);remoteHead=await remoteSha();}
+  if(!remoteHead){
+    await authorize();
+    // Empty expected value is a create-only CAS, never permission to replace a ref.
+    try{await runGit(cwd,gitAuth,'push',`--force-with-lease=${ref}:`,repoUrl,`${op.commitSha}:${ref}`);}
+    catch(error){if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS')throw error;remoteHead=await remoteSha();if(remoteHead!==op.commitSha)throw new Error('Atomic publication conflicted with another branch creator',{cause:error});}
+    remoteHead=await remoteSha();
+  }
   if(remoteHead!==op.commitSha)throw new Error('Published branch could not be reconciled to the exact candidate SHA');
   await onPhase?.({phase:'published',remoteHeadSha:remoteHead});
   const {owner,repo}=repoIdentity(claim.project.repositoryUrl);
