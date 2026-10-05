@@ -1,6 +1,6 @@
 # A14：基于现有 Work 的最小 Delivery 增量
 
-状态：architecture proposal，尚未实现。Reviewer baseline 为 `c50d855`；本文件不授权任何自动 merge/deploy。
+状态：delivery architecture proposal，merge/deploy 尚未实现。2026-10-06 只读检查 shared backend baseline `080e485f651ae2fd1d4a457f4c85620cd281b358`（包含 validation checkpoint `59c78c416e5989a4e31224d368f0a19edec5bcb4`）：Run.kind 仍为 master/implementation/review；没有 request_delivery route/tool 或固定 delivery executor。Draft PR 的 native Work 正在开发独立候选，不能当作已集成能力。本文件不执行或授权新的远端副作用。
 
 ## 当前可复用的基础与真正缺口
 
@@ -86,12 +86,88 @@ Draft PR不是merge approval：没有全绿QA也能提供review对象，但必�
 - HTTP fault tests：push/PR创建成功后丢response，重启仍回查同一branch/PR；phase证据落库后不重复效果。Mock结果不替代realPR proof。
 - Real disposable Draft PR：通过Menoteam实际Master请求，原Connector发布，GitHub查询确认 `draft=true`、headSHA正确、base正确；retry只返回同一PR，Changes/Overview可查看。这个结果只能证明A14的PR子步骤。
 
-## Profile/Skill 的最小完整用户路径（待确认，未实施）
+## Profile/Skill 的最小完整用户路径（已实现基础，browser 验证仍待完成）
 
-PRODUCT/requirements 规定 Agent profiles 是 workspace 复用的 model/skills preferences；当前 UI 仅在 Project settings 创建 project skills。只过滤 global skills 会留下空控件，不是完整修复；自动给 profile 加 projectId 又会把一套 reusable profiles 拆成多套。
+PRODUCT/requirements 规定 Agent profiles 是 workspace 复用的 model/skills preferences；此前 UI 仅在 Project settings 创建 project skills；当时只过滤 global skills 会留下空控件，不是完整修复。这个历史问题已由下面的 inline reusable skill 路径解决；自动给 profile 加 projectId 又会把一套 reusable profiles 拆成多套。
 
-保持一套 workspace profiles：在 profile 创建/编辑表单旁提供 inline `Create reusable skill`，复用已存在的 `POST /settings {kind:'skill',name,data}`（无 projectId）和 workspace-admin 权限；新 global skill 自动选中。没有 global skills 时显示这个入口，或允许只选 model/reasoning 创建 profile，不呈现无内容的多选控件。Project settings Skills 保留项目技能的创建/import/list，不增加 tab 或设置层。
+已集成于 `a6c326b66956591ee7fc5876c2f8838a067aaeaa`：保持一套 workspace profiles，在 profile 创建/编辑表单旁提供 inline `Create reusable skill`，复用已存在的 `POST /settings {kind:'skill',name,data}`（无 projectId）和 workspace-admin 权限；新 global skill 自动选中。没有 global skills 时显示这个入口，或允许只选 model/reasoning 创建 profile，不呈现无内容的多选控件。Project settings Skills 保留项目技能的创建/import/list，不增加 tab 或设置层。
 
-如需复用已安装的 project skill，由同时有源项目访问权与 workspace 管理权的用户显式 `Copy to reusable skill`，创建新的 global ID、保留来源引用；不 silent promote 原 skill，也不随意暴露未授权项目内容。第一步的完整路径可以只实现 inline text creation，GitHub import/copy 沿用同一 storage service 后补，不能提前显示不可用控制。
+如需复用已安装的 project skill，由同时有源项目访问权与 workspace 管理权的用户显式 `Copy to reusable skill`，创建新的 global ID、保留来源引用；不 silent promote 原 skill，也不随意暴露未授权项目内容。当前已实现 inline text creation，global GitHub import/copy 尚未实现；project GitHub import 是独立已验证 API 路径。后两项复用同一 storage service 后补，不能提前显示不可用控制。
 
-Workspace profile create/patch 即验证每个引用存在、kind='skill'、无 projectId；UI仅列出 global skills，makeRun仍重验以防历史数据/删除。旧非法引用明确报告skill ID，并允许管理员选择global replacement或显式copy后修正，不silentdrop、不在另一个Projectdispatch时才失败。不自动注入全部projectskills，不新增Work/profile设置层。
+已实现的 backend guard：Workspace profile create/patch 即验证每个引用存在、kind='skill'、无 projectId；UI仅列出 global skills，makeRun仍重验以防历史数据/删除。旧非法引用明确报告skill ID，并允许管理员选择global replacement或显式copy后修正，不silentdrop、不在另一个Projectdispatch时才失败。不自动注入全部projectskills，不新增Work/profile设置层。这个集成 checkpoint 已通过真实 PostgreSQL full suite 132/132 与 typecheck/build；后续133-test checkpoint属于后续tree，不能倒算为本commit结果。Browser profile创建/编辑与真实run复用仍需要独立观察。
+
+
+## Draft PR 之后必须完成的增量：Merge → Deploy → Verify
+
+以下是下一项可实施 specification，不是现有能力。A14 不会因 Draft PR 成功而缩小为 PR-only；完整目标仍包含经过授权的 merge、真实 deploy、用户流程验证和失败恢复。先复用已验收的 Draft PR operation 格式，再增加两个固定 action；不要先造通用 delivery engine。
+
+### 现有代码边界与最小修改面
+
+当前 shared backend 的 `actorAuthorized` 仅验证原始 actor 存在/项目 membership，**不足以授予 merge/deploy**；`leased` 验证 connector grant/lease/generation，也不能代替 delivery 权限。必须在同一 settings/membership 事务边界下，追加 delivery action 的 owner/admin + 当前严格 policy 检查。现有 artifact endpoint 接受 unknown data，review approval 与 delivery receipt 需新增 kind-specific validated shape，不能让 implementation/Master 伪造 reviewer approval。复用现有 `wb_records`、`wb_requests`、Run queue、租约、outbox、原 Master completion wakeup；无需新表、新 broker、新页面。
+
+实施分配：Luna 在固定 delivery executor 与严格 schema 上增量实现；Sol 独立审查授权、external-effect retry 与 exact candidate 绑定。Frontend 只在 Overview/Changes 显示来自 delivery artifacts 的实际阶段和失败原因，不用 native run completed 推导 Delivered。测试先 fake GitHub/target fault injection，再用真实 disposable PR 和 isolated staging target 验证；不能以 mock 替代真实闭环。
+
+### 一个 repo policy，一条 exact-candidate 请求
+
+复用现有 project GitHub connection，严格保存 `repository`, `baseBranch`, `mergeMethod`, `allowedActions`, `requiredChecks`, `deploymentTargetId`, `configuredBy`, `authorizationMessageId`, `updatedAt`。这条结构化记录由已授权 owner/admin 设置；自由文本 `deliveryAuthorization` 仍只是 context。`authorizationMessageId` 是依据引用，不是任意用户写一句话即可获得权限。无需 Scope 审批页面：同一 conversation/settings 操作可以表达现有授权，但服务端必须确认 configuring actor 的真实权限。
+
+在现有 delivery request 中使用：
+
+```ts
+// workId 在既有 Work route 或 Master tool 中绑定。
+{ action: 'merge_pr', priorDeliveryRunId, reviewRunId, requestId }
+{ action: 'deploy', priorDeliveryRunId, targetId, requestId }
+```
+
+`merge_pr` 仅消费已保存的 PR-creation receipt；`deploy` 仅消费同 Work 的 verified merge receipt。服务端推导 repo/PR/head/base/merged SHA，模型不能传任意 URL、branch、host、command、image tag 或替换 candidate。保存不可变 operation snapshot + current policy reference；role/policy/connector grant 每次 effect 前复核，policy 更新不会把旧 operation 自动升级授权。复用 canonical idempotency key：merge 为 `(project,PR,expectedHeadSHA,action)`；deploy 为 `(project,target,mergedSHA,action)`。相同请求返回同一 operation；失败/unknown 不靠新 requestId 随意再执行。
+
+Source intake 默认不包含这两个 action；reviewer read-only token、普通 member、跨项目 Master、过期 lease 均不得执行。GitHub read credential 不得因配置里写了 allowedActions 就被视为 write credential。Connector 只接明确 delivery capability；原 native agent 获得普通 shell 能力不代表获准执行 merge/deploy。
+
+### Merge gate：三个身份不能混为一谈
+
+保留 `artifactRevision`（diff identity）、`candidateFingerprint`（文件内容）与 `candidateSha`（Git commit）三个字段。增加最小 reviewer QA result：
+
+```ts
+{ targetRunId, candidateSha, candidateFingerprint,
+  disposition: 'approved' | 'changes_requested' | 'insufficient_evidence',
+  findings: [{ id, blocking, summary }], evidenceArtifactIds }
+```
+
+服务端只接受当前有效 `kind=review` run 在其 assigned candidate 上提交此结果；evidenceArtifactIds 必须同项目/候选、原始 QA 检查是实际记录，不由模型 invent。Approval 只能表达 reviewer 判断，不能把 command exitCode/unknown checks 改成 passed。所有 required checks 必须 bound to full candidate fingerprint、exitCode=0、非 stale；存在 blocking finding 或 evidence 不足即拒绝。后续实现改变 bytes/head 后需要新 review，Master 不能通过修改 finding 文本消除 gate。
+
+PR 必须同 configured repo/base，非 closed-unmerged，head 等于 reviewed candidateSha。Draft 必须通过经过授权的固定 ready operation/上游正常 review 流程变为可合并状态，不能跳过 GitHub draft/protection。Merge method 固定；禁用 branch-protection bypass/admin override。最后 GitHub merge 请求携带 exact expected head `sha`，不匹配则409，**不自动换成最新 head 重试**。
+
+Head 绑定仍不够：读取 base SHA 后再 merge 存在竞态。第一实现只支持已核实的 GitHub strict up-to-date required checks/merge queue，且 checks 来源可信；依赖 GitHub 在副作用处原子执行保护。若仓库没有可验证的 integration protection，则明确 unavailable，不用「我们刚看过 base」假装阻止竞态。集成候选的检查与实际 merge SHA 都记录在 receipt；GitHub head `sha` precondition 并不单独保证 base 不变。官方：[merge API](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)。
+
+发生 timeout 或进程重启，先查询同一 PR 是否 merged，并核对已保存 head/base/method、actual merge commit 与目标 branch ancestry；匹配则补 receipt，未知则保留 interrupted/unknown 并继续回查，不能盲目第二次 merge。Lease 只 fence 本地队列，不能撤回已在途 GitHub 请求；外部查询/固定 operation identity 才处理该窗口。授权撤销阻止新的 effect，已完成 effect 如实记录，不能谎称撤销已发生的 merge。
+
+### Deploy gate：只接一个具有持久 receipt 的固定 staging target
+
+第一 target 使用已配置的 repo deployment workflow 或固定 operator-managed adapter；参数只有保存的 merged SHA 与 operation ID。Target 配置固定 environment、executor ID、verification URLs、version-report contract、已批准 rollback 规则。Adapter credential 不进入模型 tool args、artifact或prompt，不提供远程 shell proxy；任务凭证只允许这一 repo/target/action。
+
+目标端必须以 operation ID 持久记录 accepted/running/succeeded/failed 与 immutable image digest + source SHA，并在同 target 上串行切换。优先由现有 CI/environment concurrency 执行；没有这项能力时先实现**这个固定 target**的 receipt/锁，而不是用自动 retry workflow dispatch 代替 idempotency。Workflow dispatch HTTP 204 没有足够的完成 receipt；收到204只记 requested，dispatch timeout 先按 operation marker 回查，无法确认时 unknown，不自动重复部署。官方：[workflow dispatch API](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)。
+
+Deployment record 使用 exact merged SHA、operation ID、environment，禁用 `auto_merge`；它只是追踪，不是部署成功证明。真实 executor 必须报告 GitHub deployment/workflow run ID、actual build digest/source SHA 与实际服务 version endpoint。只接受同 target、同 operation 的 receipt，不能让任意 callback 宣称成功。官方：[Deployment API](https://docs.github.com/en/rest/deployments/deployments#create-a-deployment)。
+
+状态由证据推进：`requested → deployed → verified`；workflow green 只能证明 executor 完成，`deployed` 还需实际服务版本匹配 digest/SHA，`verified` 需既定 health + auth + 一项真实 Menoteam user flow。应用/schema变化后检查 Work/conversation/settings persistence 与授权隔离；无部署环节的 Work 不显示这条状态。Verification failed 时保持 deployed-but-unverified，不能标 Done。A15 的 backup export 当前仍被 automatic approval review 拒绝，依赖其前提的 staging 步骤不绕过、不开始。
+
+### Rollback 是有证据的固定动作，不是逆向 merge
+
+Merge 不自动 revert。Deploy 前记录同 target 的前一个已验证 digest/SHA、migration compatibility 与 configuration version。第一次交付先选择 additive/backward-compatible schema；不可兼容迁移或无有效 previous digest 时阻止发布，不能用删除数据/倒跑 migration 冒充 rollback。
+
+健康/流程失败时，只能依据 project 已授权 policy 自动切回保存的前一 digest，或在 conversation 请求已有 owner/admin 决定；不重新 build mutable tag、不执行模型提供的命令。记录 rollback operation、真实目标版本和验证结果；数据库 volumes 与 V1/Caddy 原路由保留，回滚 app 不代表回滚已写数据。Rollback失败明确 failed、保留服务与证据，不能覆盖原 deploy failure。至少一次 isolated target drill 证明切回版本和 persisted data 可用，才能启用实际自动 rollback。
+
+### 下一增量的可判定 acceptance
+
+| 场景 | 必须观察到的结果 |
+|---|---|
+| Member/source/reviewer请求merge或deploy；actor/policy/grant撤销 | 服务端拒绝，外部调用计数零；同项目admin授权正常，不扩大其他项目能力 |
+| 旧QA、不同fingerprint/head、insufficient review、blocking finding、missing integration protections | 拒绝merge；不自动替换SHA或忽略check |
+| 请求与真实merge之间head/base变化 | exact-head precondition/protected integration拒绝或等待；不合并未审查候选 |
+| Merge成功后响应丢失 + connector重启/lease换代 | 查询原PR、补actualmergedSHA receipt；一个canonicaloperation，无第二次副作用 |
+| Deploy同SHA并发请求、dispatch/target成功后响应丢失 | 同target串行、同operationreceipt；unknown可回查，不能盲发第二次dispatch |
+| Target返回错误SHA/digest、workflow只accepted、服务版本不符、user flow失败 | 不显示Verified/Done；原因与真实版本在Work中可见 |
+| Deploy失败/verification失败 + rollback | 固定previousdigest恢复；version+userflow+persistence证明；无previous/迁移不兼容则先拒绝 |
+| 真实disposablePR与isolatedstaging | nativeMaster请求→实际保护merge→exactmergedSHA部署→真实版本+用户流程证据，Overview/Changes/QA可回查 |
+
+完成标准是最后一行真实闭环并通过以上拒绝/fault cases；PG/mock tests只是支持证据。当前 read-only 审查没有运行任何 GitHub write、remote mutation 或 deployment，A14/A15 状态不因此改变。
