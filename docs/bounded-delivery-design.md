@@ -171,3 +171,14 @@ Merge 不自动 revert。Deploy 前记录同 target 的前一个已验证 digest
 | 真实disposablePR与isolatedstaging | nativeMaster请求→实际保护merge→exactmergedSHA部署→真实版本+用户流程证据，Overview/Changes/QA可回查 |
 
 完成标准是最后一行真实闭环并通过以上拒绝/fault cases；PG/mock tests只是支持证据。当前 read-only 审查没有运行任何 GitHub write、remote mutation 或 deployment，A14/A15 状态不因此改变。
+
+
+## 已核实的 GitHub dependency — 2026-10-06
+
+Parent 在本轮对 baseline `080e485f651ae2fd1d4a457f4c85620cd281b358` 之后的设计文档候选 `e122a10cc907d0d41be68c4c7920c37b5fe5b2e2` 做只读 GitHub 检查：`repos/blossomsai/menoteam` 返回 public、default branch `main`，当前 authenticated actor 的 `admin`/`push` permissions 为 true；`branches/main/protection` 返回 HTTP404 `Branch not protected`；`rules/branches/main` 返回空数组，exit0。未执行远端 mutation。这是点时事实，不表示已授予任意 Work 自动 merge/deploy，也不能从 repository permissions 推导 target credential 或真实部署能力。
+
+因此第一次实际 merge 有明确、可完成的 dependency：由现有 owner/admin 在已授权 repository 上配置并测试所需 checks 与 up-to-date integration protection，随后按上面的 exact-head gate 验证。用户现有 full-app 授权覆盖通过 delegated workflow 做这项更强保护配置；具体配置形成 reviewable 实施任务后执行，不额外发明 generic approval gate。现有保护不能绕过或削弱；这是下一增量的配置/验收工作，不是无限期等待一个假定存在的保护。配置前先确认 repo 实际 CI check names/可信来源，以及公开仓库现有规则能力，不能在代码里填写虚构 required checks。
+
+如果用户明确选择一个 guarded alternative，必须记录其实际 trade-off 与执行边界再实现/验收：例如明确授权的一次 operator merge 使用 reviewed exact head，随后只对 actual merged SHA 运行 integration checks，未通过之前禁止 deploy；它不能宣称提供原子的 base-before-merge 保证，也不能被 Master 默认为长期 bypass policy。自动 runtime merge 若没有可验证的 upstream integration gate，仍 unavailable；operator 的这条一次性交付依据不会悄悄扩大其他项目权限。选择具体 alternative 是一个明确交付决策，不新增 Scope page 或通用审批体系。
+
+下一项真实证明应记录 protection 配置/检查结果或用户明确接受的 guarded alternative、exact reviewed head、actual merge SHA 和 integration checks，再推进 fixed-target deploy。当前无 GitHub write/merge/protection mutation，A14 的完整交付目标不变。
