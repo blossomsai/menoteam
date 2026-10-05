@@ -22,7 +22,7 @@
 }
 ```
 
-Repository、base branch、PR number、head SHA、deploy command/host 均从已保存的 project/candidate/operation 推导，不由模型任意指定。增加一个 `wb_delivery_operations` 表，而不是新的业务 Work 类型或 broker：project/work/actor/candidate ID、action、phase/status、generation/lease、external IDs、error，唯一键 `(project_id, request_id)`。DB 事务只记录/claim/fence；GitHub/Git/CI 网络操作在事务之外执行。
+Repository、base branch、PR number、head SHA、deploy command/host 均从已保存的 project/candidate/operation 推导，不由模型任意指定。第一步复用 `wb_records(kind='run')` 与现有 Run queue/lease/outbox，不新建 delivery table/engine/broker。固定操作 run 使用 internal `kind='delivery'` 与 validated `operation.action='create_draft_pr'`，不调用 LLM、不套 Agent profile，也不新增 UI tab。模型选择只对 native run 生效，delivery claim 要求明确的 Git/GitHub capability。DB 事务只记录/claim/fence；GitHub/Git 网络操作在事务之外执行。
 
 每次 effect 前检查原始 actor 当前权限与 project grant。Source intake 默认没有该 action。Reviewer 仍只有证据读取；Master 不能通过自由文本 Instructions 或普通 `update_settings` 悄悄启用 merge/deploy。
 
@@ -60,8 +60,38 @@ Repository、base branch、PR number、head SHA、deploy command/host 均从已�
 
 ## 可执行拆分与验收
 
-1. Luna 实现固定 branch publication + PR creation、operation table/lease/outbox 与 Changes/Overview 连接；Sol review scope/credential/remote mutation/idempotency。真实 disposable branch 验证 create/retry/restart，一次请求只得到一个 PR，不修改当前主 checkout。
+1. Luna 实现固定 branch publication + Draft PR creation、复用 Run queue/lease/outbox 与 Changes/Overview 连接；Sol review scope/credential/remote mutation/idempotency。真实 disposable branch 验证 create/retry/restart，一次请求只得到一个 PR，不修改当前主 checkout。
 2. Luna 增加 structured reviewer disposition 与 same-candidate delivery gate；Sol 验证 stale QA、changed PR head、revoked actor、insufficient review、base/integration changes 全部阻止 merge。先在 disposable PR 证明保护行为，之后才配置已授权的实际 branch。
 3. 接一个真实 staging target，证明 exact merge SHA、重复请求、disconnect/restart、failed deploy 和 post-deploy flow evidence。Production policy 未配置时明确 unavailable；不因此创建额外 tab、approval page 或 generic workflow engine。
 
 现阶段缺口：真实 GitHub write credential 未验证；repository protections/required checks 未核实；structured review disposition 未实现；durable delivery operation/executor 未实现；runtime staging target 未绑定；real deploy/post-deploy proof 未完成。因此 A14 保持 Pending，不能从129 tests 或 operator staging 推断为 Proven。
+
+
+## 当前批准的第一个增量：只有 Create Draft PR
+
+本阶段不实现 merge/deploy；上述两步保留为后续必须完成的 A14 增量。Master `request_delivery` 当前只接受 `{workId,candidateRunId,candidateRevision,action:'create_draft_pr',requestId}`。Browser 共用同一 service。返回 queued delivery Run，现有 claim/event/complete 恢复路径处理它；completion 仍唤醒同一个 Project Master。`targetConnectorId` 必须是原 candidate Connector，review/Master lease token不能执行此操作，source intake没有创建PR的权限。
+
+服务端从目标 diff artifact 的 `candidateRevision` 解析 Git commit SHA，从 QA artifact 获取完整 `candidateFingerprint`，不能把 diff identity 当作 Git SHA。保存不可变快照：project/work/actor、candidateRunId、artifactRevision、commitSha、fingerprint、baseRevision、configured baseBranch、deterministic remote branch、operation phase和 external result IDs。原 Run lease/generation、actor reauthorization、同 Work writer reservation、`wb_requests` idempotency 与 outbox皆复用。新增的数据只是 Run.operation 和 delivery artifact，不造第二套 queue。
+
+双层 dedup：client `requestId` 保持重试稳定；server另用 `(projectId,workId,candidateRunId,commitSha,'create_draft_pr')` canonical key记录 wb_requests，使 Master用新requestId再要求同一candidate时也返回同一delivery Run。GitHub副作用不能靠DB宣称 exactly-once：固定 remote branch，push前检查 absent/exactSHA；每次创建PR前按head/base查询，PR body带operation marker；timeout后先回查而非盲重做。分阶段保存 `queued → published → pr_created` 与 GitHub IDs。
+
+执行器只读取已注册 candidate checkout；确认 clean、HEAD exact SHA、full fingerprint、artifactRevision、remote URL全匹配。只 push固定branch上的exact commit；无force-push、无任意remote或模型shell参数、不重写当前主checkout。创建 `draft:true` PR，返回其真实URL/number/headSHA。PR body仅使用Work标题、明确的变更/验证摘要和operation marker，不自动导出完整聊天。没有GitHub write capability时明确 unavailable，不把existing read token假装可用。
+
+Draft PR不是merge approval：没有全绿QA也能提供review对象，但必须展示真实失败/unknown状态。Merge/deploy和structuredreviewdisposition在本阶段保持未实现；不把Draft PR成功写成Done或Delivered。
+
+### 独立验证合同
+
+- Real PG：并发请求/requestId重试/换requestId但samecandidate只产生一个delivery Run；角色撤销、别项目candidate、伪造revision、已失效connector拒绝；队列/lease过期不重复native execution。
+- Git测试：changedHEAD、dirtycheckout、changedfingerprint、remote不同、同branch不同SHA均拒绝；正常case只发布exactSHA，主checkout与其它Work不变。
+- HTTP fault tests：push/PR创建成功后丢response，重启仍回查同一branch/PR；phase证据落库后不重复效果。Mock结果不替代realPR proof。
+- Real disposable Draft PR：通过Menoteam实际Master请求，原Connector发布，GitHub查询确认 `draft=true`、headSHA正确、base正确；retry只返回同一PR，Changes/Overview可查看。这个结果只能证明A14的PR子步骤。
+
+## Profile/Skill 的最小完整用户路径（待确认，未实施）
+
+PRODUCT/requirements 规定 Agent profiles 是 workspace 复用的 model/skills preferences；当前 UI 仅在 Project settings 创建 project skills。只过滤 global skills 会留下空控件，不是完整修复；自动给 profile 加 projectId 又会把一套 reusable profiles 拆成多套。
+
+保持一套 workspace profiles：在 profile 创建/编辑表单旁提供 inline `Create reusable skill`，复用已存在的 `POST /settings {kind:'skill',name,data}`（无 projectId）和 workspace-admin 权限；新 global skill 自动选中。没有 global skills 时显示这个入口，或允许只选 model/reasoning 创建 profile，不呈现无内容的多选控件。Project settings Skills 保留项目技能的创建/import/list，不增加 tab 或设置层。
+
+如需复用已安装的 project skill，由同时有源项目访问权与 workspace 管理权的用户显式 `Copy to reusable skill`，创建新的 global ID、保留来源引用；不 silent promote 原 skill，也不随意暴露未授权项目内容。第一步的完整路径可以只实现 inline text creation，GitHub import/copy 沿用同一 storage service 后补，不能提前显示不可用控制。
+
+Workspace profile create/patch 即验证每个引用存在、kind='skill'、无 projectId；UI仅列出 global skills，makeRun仍重验以防历史数据/删除。旧非法引用明确报告skill ID，并允许管理员选择global replacement或显式copy后修正，不silentdrop、不在另一个Projectdispatch时才失败。不自动注入全部projectskills，不新增Work/profile设置层。
