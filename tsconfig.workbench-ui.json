@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "noUncheckedIndexedAccess": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/local/web/src/*"] },
+    "types": ["vite/client"]
+  },
+  "include": ["src/workbench/web/**/*.ts", "src/workbench/web/**/*.tsx", "src/workbench/types.ts"]
+}

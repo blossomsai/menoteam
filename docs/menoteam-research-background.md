@@ -1,5 +1,7 @@
 # Menoteam 背景研究：Lauren Tan、Grok Bots 与 agent workflow
 
+> Historical research/proposal, retained for provenance. Not current UI requirements. The 2026-10-06 [product direction](../PRODUCT.md) and its linked requirements supersede conflicting navigation, workflows and feature claims here.
+
 研究日期：2026-09-28。供理解 [Menoteam product vision](menoteam-product-vision.md) 的背景材料；竞争事实不等于产品判断，公开视频自述也不等于独立验证。
 
 ## Lauren Tan、pstack 与 DUNE

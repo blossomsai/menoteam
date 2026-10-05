@@ -1,37 +1,43 @@
-# Product
+# Menoteam · Current product direction
 
-## Register
+Updated 2026-10-06. This is the product direction agreed during the V3 prototype review. It supersedes earlier UI proposals, not the implemented V1 service contracts.
 
-product
+## Purpose and users
 
-## Users
+Menoteam is a multi-project agent workbench. People set goals and give feedback; each project's Master maintains context, coordinates responsible Agents and subagents, and follows work through to a result. It supports engineering, research, and document work without forcing every project into a software release workflow.
 
-Software and cross-functional teammates who already collaborate in Slack or Discord while using their own coding or knowledge-work agents. They need to understand durable work, ownership, dependencies, progress, and teammate context without switching to a new task-management workflow.
+## Current source of truth
 
-## Product Purpose
+- [Requirements](docs/personal-workspace-requirements.md): product decisions and future capabilities.
+- [Screen and navigation contract](docs/personal-workspace-mvp-screens.md): current labels, hierarchy, and interactions.
+- [V3 design](docs/prototypes/2026-10-02/team-workbench-v3/DESIGN.md): visual and component conventions.
+- [V3 prototype](docs/prototypes/2026-10-02/team-workbench-v3/README.md): build, scope, and verification boundaries.
+- [Context map](CONTEXT-MAP.md): separates current product concepts from existing implementation contracts.
 
-Menoteam Work Map gives a trusted team and its existing agents one maintained source of truth. The dashboard lets humans inspect the same Work, Living Docs, and teammate context that agents read and maintain through MCP. Success means a teammate can understand what exists, who owns it, how it relates, and what the current truth is without reconstructing the story from chat history or repository archaeology.
+When these conflict with older proposals, use these current documents. Sample copy in the prototype is illustrative, not a universal policy.
 
-## Brand Personality
+## Product principles
 
-Calm, precise, and quietly confident. Menoteam should feel like a shared working surface that recedes behind the team's judgment, not an autonomous-agent spectacle.
+1. Conversation is the primary way to direct work. Settings and work artifacts remain directly inspectable.
+2. Each Work has a current Overview and a continuous conversation. Do not introduce mandatory scope forms, fixed note templates, or a separate review workflow.
+3. Work detail shows work on the left and its participants' conversation on the right. Overview, Changes, and QA are the only work tabs.
+4. Keep team preferences flexible through free-text Project instructions. Real permissions must be enforced by the implementation, not merely written in instructions.
+5. Reuse context: relevant GitHub/Slack feedback links back to existing Work; an independent goal may become a new Work.
+6. Use React + Tailwind CSS + shadcn/ui. No custom component CSS, CSS modules, inline styles, or @apply component rules. Product text is English; Chinese localization is deferred.
+7. Report evidence accurately: tests passed, deployed, and verified are different facts. Do not imply live integrations or execution from sample data.
 
-## Anti-references
+## Product surface
 
-- Not a sci-fi agent command center or chat-bot control room.
-- Not an org chart, company simulator, or agent-observability console.
-- Not a Kanban clone, generic project-management suite, or dashboard of decorative metrics.
-- Not a cream-and-gradient AI SaaS template, glassmorphic control panel, or card-grid showcase.
-- Not an interface that implies uncertain inferences are verified facts.
+All projects presents independently scrollable project conversation cards. A Project Master is one focused conversation, without duplicate project tabs. Work rows open the detail page. New work opens Master with an editable preset prompt; it does not send automatically.
 
-## Design Principles
+Project settings: Instructions, Skills, Members, Connections. Workspace settings: Agent profiles, Model providers. Providers are a list of connections with Add connection and a default marker. Projects are not publicly searchable; membership is invitation-based.
 
-1. **Ground truth before decoration.** Ownership, relationships, recency, and Living Docs are the visual hierarchy.
-2. **Graph and list are equal tools.** Spatial relationships help discovery; dense lists help scanning and verification.
-3. **Evidence stays honest.** Candidate ownership and imported history visibly distinguish confirmed facts from inference.
-4. **Current work leads, completed work remains.** The surface emphasizes active context without hiding durable history.
-5. **Read-only means inspectable, not inert.** Navigation, filtering, search, and detail exploration should feel fast even though mutations happen through agents.
+Master should eventually modify settings and create/add skills through conversation, with changes reflected in settings and constrained to the user's permissions and intended project/workspace.
 
-## Accessibility & Inclusion
+## Current delivery boundary
 
-Target WCAG 2.2 AA. All navigation and disclosure controls must work by keyboard, focus must remain visible, text and states must not rely on color alone, touch targets must be usable on mobile, and motion must respect `prefers-reduced-motion`. Dense graph information must always have an equivalent list representation.
+Port 4313 is a static, example-data design prototype. Upload and microphone controls are icons only. It does not implement provider authentication, skill installation, autonomous Master operation, external source scanning, deployment, or real collaboration. The separate port-4311 execution experiment and V1 Work Map/Gateway code are not implementations of this complete product direction.
+
+## Accessibility
+
+Keep keyboard navigation and visible focus, readable contrast, non-color status cues, responsive layouts, and independent conversation scrolling. Build/typecheck is not visual or production acceptance.

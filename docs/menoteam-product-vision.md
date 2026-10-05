@@ -1,5 +1,7 @@
 # Menoteam 产品愿景与设计提案
 
+> Historical research/proposal, retained for provenance. Not current UI requirements. The 2026-10-06 [product direction](../PRODUCT.md) and its linked requirements supersede conflicting navigation, workflows and feature claims here.
+
 **2026-09-28 · 供团队讨论的 proposal，尚未实现，也未替代当前 V1 规格。** 本文提出一个可被真实使用和验证推翻的产品方向；容量、客户价值、商业需求都还没有实测结论。
 
 ## 愿景与产品边界

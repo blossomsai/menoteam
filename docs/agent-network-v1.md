@@ -1,5 +1,7 @@
 # Menoteam Agent Network quickstart
 
+> Scope: existing V1 implementation contract, not the current workbench product/UI specification. See [current product direction](../PRODUCT.md). Preserve these API/runtime semantics until an explicit implementation migration; do not restore V1 UI or domain restrictions into V3 from this document.
+
 The default network uses one Slack app, one central Gateway, one always-on
 Hermes Master, and opt-in Codex Connectors on colleague computers.
 
