@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Menoteam · Team workbench</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #1d2733;
+        background: #f5f7f9;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+        -webkit-font-smoothing: antialiased;
+        --ink: #1d2733;
+        --muted: #596675;
+        --line: #d9e0e7;
+        --surface: #ffffff;
+        --accent: #3e617d;
+        --focus: #276da4;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+      }
+
+      a { color: inherit; }
+
+      a:focus-visible,
+      button:focus-visible {
+        outline: 3px solid var(--focus);
+        outline-offset: 3px;
+      }
+
+      .page-header,
+      main {
+        width: min(100% - 40px, 1440px);
+        margin-inline: auto;
+      }
+
+      .page-header {
+        padding: 42px 0 28px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(1.65rem, 3vw, 2.35rem);
+        line-height: 1.15;
+        letter-spacing: -0.025em;
+        font-weight: 650;
+      }
+
+      .subtitle {
+        margin: 10px 0 0;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+
+      .group-nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 24px;
+      }
+
+      .group-nav a {
+        display: inline-flex;
+        align-items: center;
+        min-height: 40px;
+        padding: 0 13px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--surface);
+        color: #354556;
+        font-size: 0.87rem;
+        text-decoration: none;
+      }
+
+      .group-nav a:hover {
+        border-color: #aab8c5;
+        background: #f9fbfc;
+      }
+
+      main { padding-bottom: 56px; }
+
+      .gallery-group {
+        scroll-margin-top: 20px;
+        margin-top: 24px;
+      }
+
+      .group-heading {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        margin: 0 0 12px;
+        color: var(--ink);
+        font-size: 1.05rem;
+        font-weight: 620;
+        letter-spacing: -0.01em;
+      }
+
+      .open-hint {
+        color: var(--muted);
+        font-size: 0.78rem;
+        font-weight: 450;
+        letter-spacing: 0;
+      }
+
+      .image-frame {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #e9edf1;
+      }
+
+      .board-image {
+        display: block;
+        width: 100%;
+        height: auto;
+        cursor: zoom-in;
+      }
+
+      dialog {
+        width: min(96vw, 1800px);
+        max-width: none;
+        height: min(94dvh, 1200px);
+        max-height: none;
+        padding: 8px;
+        overflow: hidden;
+        border: 1px solid #cbd4dd;
+        border-radius: 8px;
+        background: #f5f7f9;
+        color: var(--ink);
+      }
+
+      dialog::backdrop { background: rgb(20 30 40 / 72%); }
+
+      .viewer {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        width: 100%;
+        height: 100%;
+      }
+
+      .viewer-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        min-height: 56px;
+        padding: 8px 12px 8px 18px;
+        border-bottom: 1px solid var(--line);
+        background: var(--surface);
+      }
+
+      .viewer-title {
+        overflow: hidden;
+        color: #344353;
+        font-size: 0.9rem;
+        font-weight: 580;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .viewer-actions { display: flex; gap: 7px; flex: 0 0 auto; }
+
+      .viewer-actions button {
+        min-height: 36px;
+        padding: 0 11px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: #2f4051;
+        font: inherit;
+        font-size: 0.82rem;
+        cursor: pointer;
+      }
+
+      .viewer-actions button:hover { background: #f1f5f8; }
+
+      .viewer-actions button[aria-pressed="true"] {
+        border-color: #9badbd;
+        background: #edf3f7;
+      }
+
+      .viewer-close {
+        width: 36px;
+        padding: 0 !important;
+        font-size: 1.25rem !important;
+      }
+
+      .viewer-scroll {
+        min-width: 0;
+        min-height: 0;
+        overflow: auto;
+        padding: 16px;
+        text-align: center;
+      }
+
+      .viewer-image {
+        display: block;
+        width: auto;
+        height: auto;
+        max-width: 100%;
+        max-height: 100%;
+        margin-inline: auto;
+        object-fit: contain;
+      }
+
+      .viewer-image.is-actual-size {
+        max-width: none;
+        max-height: none;
+        margin-inline: 0;
+        cursor: zoom-out;
+      }
+
+      @media (max-width: 600px) {
+        .page-header,
+        main { width: min(100% - 28px, 1440px); }
+        .page-header { padding-top: 28px; }
+        .group-heading { align-items: flex-start; flex-direction: column; gap: 5px; }
+        .image-frame { border-radius: 6px; }
+        dialog { width: 100vw; height: 100dvh; padding: 0; border: 0; border-radius: 0; }
+        .viewer-bar { padding-inline: 12px; }
+        .viewer-scroll { padding: 10px; }
+      }
+
+      @media print {
+        @page { size: landscape; margin: 12mm; }
+        :root, body { background: #fff; }
+        .page-header, main { width: 100%; }
+        .page-header { padding: 0 0 10mm; }
+        .group-nav, .open-hint, dialog { display: none !important; }
+        .gallery-group { margin: 0 0 8mm; break-inside: avoid; }
+        .image-frame { border-color: #cbd1d7; }
+        .board-image { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="page-header">
+      <h1>Menoteam · Team workbench</h1>
+      <p class="subtitle">视觉原型 · 示例数据</p>
+      <nav class="group-nav" aria-label="原型分组">
+        <a href="#project-work">Project &amp; context</a>
+        <a href="#execution-quality">Execution &amp; quality</a>
+        <a href="#delivery-learning">Delivery &amp; learning</a>
+        <a href="#team-continuity">Team &amp; continuity</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="gallery-group" id="project-work" aria-labelledby="project-work-title">
+        <h2 class="group-heading" id="project-work-title">Project &amp; context <span class="open-hint">点击图片放大</span></h2>
+        <div class="image-frame">
+          <img class="board-image" src="./01-project-work.png" alt="四个示例视图：Portfolio / Overview、Connect Project、Project Workspace、Work Map。视觉原型数据。" tabindex="0" data-title="Project &amp; context" data-image="./01-project-work.png">
+        </div>
+      </section>
+
+      <section class="gallery-group" id="execution-quality" aria-labelledby="execution-quality-title">
+        <h2 class="group-heading" id="execution-quality-title">Execution &amp; quality <span class="open-hint">点击图片放大</span></h2>
+        <div class="image-frame">
+          <img class="board-image" src="./02-execution-quality.png" alt="四个示例视图：Work Detail、Agents + Agent Detail、Local Resources &amp; Tools、Quality Evidence。视觉原型数据。" tabindex="0" data-title="Execution &amp; quality" data-image="./02-execution-quality.png">
+        </div>
+      </section>
+
+      <section class="gallery-group" id="delivery-learning" aria-labelledby="delivery-learning-title">
+        <h2 class="group-heading" id="delivery-learning-title">Delivery &amp; learning <span class="open-hint">点击图片放大</span></h2>
+        <div class="image-frame">
+          <img class="board-image" src="./03-delivery-learning.png" alt="四个示例视图：Releases、Reviews、Project Rules、Skills Library + Proposal。视觉原型数据。" tabindex="0" data-title="Delivery &amp; learning" data-image="./03-delivery-learning.png">
+        </div>
+      </section>
+
+      <section class="gallery-group" id="team-continuity" aria-labelledby="team-continuity-title">
+        <h2 class="group-heading" id="team-continuity-title">Team &amp; continuity <span class="open-hint">点击图片放大</span></h2>
+        <div class="image-frame">
+          <img class="board-image" src="./04-team-continuity.png" alt="四个示例视图：Members &amp; Access、Connections、Execution Profiles、Recovery。视觉原型数据。" tabindex="0" data-title="Team &amp; continuity" data-image="./04-team-continuity.png">
+        </div>
+      </section>
+    </main>
+
+    <dialog aria-label="图片查看器">
+      <div class="viewer">
+        <div class="viewer-bar">
+          <div class="viewer-title"></div>
+          <div class="viewer-actions" aria-label="查看器控制">
+            <button type="button" data-view="fit" aria-pressed="true">Fit</button>
+            <button type="button" data-view="actual" aria-pressed="false">1:1</button>
+            <button type="button" class="viewer-close" aria-label="关闭图片查看器">×</button>
+          </div>
+        </div>
+        <div class="viewer-scroll"><img class="viewer-image" src="./01-project-work.png" alt=""></div>
+      </div>
+    </dialog>
+
+    <script>
+      const dialog = document.querySelector("dialog");
+      const viewerImage = dialog.querySelector(".viewer-image");
+      const viewerTitle = dialog.querySelector(".viewer-title");
+      const fitButton = dialog.querySelector('[data-view="fit"]');
+      const actualButton = dialog.querySelector('[data-view="actual"]');
+
+      function setView(actual) {
+        viewerImage.classList.toggle("is-actual-size", actual);
+        fitButton.setAttribute("aria-pressed", String(!actual));
+        actualButton.setAttribute("aria-pressed", String(actual));
+        if (!actual) dialog.querySelector(".viewer-scroll").scrollTo(0, 0);
+      }
+
+      function openViewer(source) {
+        viewerImage.src = source.dataset.image;
+        viewerImage.alt = source.alt;
+        viewerTitle.textContent = source.dataset.title;
+        setView(false);
+        dialog.showModal();
+      }
+
+      document.querySelectorAll(".board-image").forEach((image) => {
+        image.addEventListener("click", () => openViewer(image));
+        image.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            openViewer(image);
+          }
+        });
+      });
+
+      fitButton.addEventListener("click", () => setView(false));
+      actualButton.addEventListener("click", () => setView(true));
+      viewerImage.addEventListener("click", () => setView(viewerImage.classList.contains("is-actual-size") ? false : true));
+      dialog.querySelector(".viewer-close").addEventListener("click", () => dialog.close());
+      dialog.addEventListener("click", (event) => {
+        if (event.target === dialog) dialog.close();
+      });
+    </script>
+  </body>
+</html>

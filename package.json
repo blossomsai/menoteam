@@ -6,10 +6,10 @@
   "type": "module",
   "packageManager": "pnpm@11.19.0",
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && vite build --config vite.local.config.ts && vite build --config vite.workbench.config.ts",
     "dev": "tsx src/server/main.ts",
     "start": "node dist/server/main.js",
     "gateway:dev": "tsx src/gateway/main.ts",
@@ -22,26 +22,44 @@
     "test:postgres": "vitest run tests/postgres-repository.test.ts",
     "test:watch": "vitest",
     "onboarding:check": "node scripts/check-agent-prereqs.mjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.local-ui.json && tsc --noEmit -p tsconfig.workbench-ui.json",
     "migrate": "tsx src/db/migrate-cli.ts",
     "export": "tsx src/db/export-cli.ts",
     "backup": "tsx src/db/backup-cli.ts",
     "restore": "tsx src/db/restore-cli.ts",
-    "import:safedriver": "tsx src/importer/apply-safedriver.ts"
+    "import:safedriver": "tsx src/importer/apply-safedriver.ts",
+    "local:start": "npm run build && node dist/local/main.js",
+    "workbench:dev": "tsx src/workbench/main.ts",
+    "workbench:start": "node dist/workbench/main.js",
+    "workbench:build": "tsc -p tsconfig.json && vite build --config vite.workbench.config.ts",
+    "connector:dev": "tsx src/connector/main.ts",
+    "connector:start": "node dist/connector/main.js"
   },
   "dependencies": {
     "@fastify/cors": "^11.0.1",
     "@fastify/helmet": "^13.0.2",
     "@fastify/rate-limit": "^10.3.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "class-variance-authority": "^0.7.1",
+    "cn": "^0.4.0",
     "fastify": "^5.12.1",
     "postgres": "^3.4.9",
+    "radix-ui": "^1.6.7",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "zod": "^4.1.11"
   },
   "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^22.12.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "shadcn": "^4.21.0",
+    "tailwindcss": "^4.3.3",
     "tsx": "^4.20.6",
     "typescript": "^5.9.2",
+    "vite": "^8.3.1",
     "vitest": "^3.2.4"
   }
 }

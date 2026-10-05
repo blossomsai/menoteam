@@ -1,5 +1,13 @@
 # Menoteam
 
+## Current product direction · 2026-10-06
+
+Menoteam is being shaped as a multi-project Master/Agent workbench. Start with [PRODUCT.md](PRODUCT.md), [current requirements](docs/personal-workspace-requirements.md), and the [V3 design prototype](docs/prototypes/2026-10-02/team-workbench-v3/README.md) at port 4313. This is a design prototype, not a completed implementation of the product.
+
+## Existing V1 services
+
+The following describes the existing Work Map/Gateway implementation and its operational setup; it must not be read as the latest workbench UX specification.
+
 Shared context and opt-in local agent routing for a team of humans and their existing AI agents.
 
 The repository contains two deliberately separate services:
@@ -53,6 +61,8 @@ Open `http://127.0.0.1:3000/dashboard`, then follow:
 3. [Advanced: connect other native harnesses](docs/connect-agents.md)
 4. [Read the V1 product and architecture spec](docs/work-map-v1-spec.md)
 
+For an isolated personal execution prototype, see the [Local workspace guide](docs/local-workspace.md). It runs separately on loopback port 4311 and stores its state under the ignored `data/` folder.
+
 Every teammate Codex installs the same team plugin, confirms one repository,
 and completes one short admin-approved device pairing. Hermes Master uses the small connector in `connectors/hermes/` on a
 separate always-on macOS or Linux host. A sleeping teammate computer simply
@@ -72,7 +82,8 @@ Work, copy private memory, or write activity logs into Work Map.
 
 The broader Menoteam worldview is preserved in the
 [manifesto](docs/worldview-manifesto-v0.1.md) and [idea bank](docs/idea-bank.md).
-The canonical product language is in [`CONTEXT-MAP.md`](CONTEXT-MAP.md).
+The future direction is described in this [product vision proposal](docs/menoteam-product-vision.md); it is unimplemented and does not change V1 scope.
+The separation of current product language and V1 implementation contracts is in [`CONTEXT-MAP.md`](CONTEXT-MAP.md).
 
 ## License
 
