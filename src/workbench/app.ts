@@ -1,6 +1,7 @@
 import Fastify, { type FastifyRequest, type FastifyInstance } from "fastify";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
+import { rateLimitKey } from "./rate-limit.js";
 import { z } from "zod";
 import type { Sql } from "postgres";
 import { registerSourceRoutes } from "./sources.js";
@@ -33,7 +34,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     await app.register(helmet);
     await app.register(rateLimit, {
         max: 180,
-        timeWindow: "1 minute"
+        timeWindow: "1 minute",
+        keyGenerator: rateLimitKey(sql)
     });
     if (options.bootstrapEmail && options.bootstrapPassword) {
         if (options.bootstrapPassword.length < 12)

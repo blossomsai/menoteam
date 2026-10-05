@@ -61,13 +61,13 @@ export class ConnectorRunner {
         if (claim) {
           this.activeRuns.add(claim.run.id);
           this.activeKinds.set(claim.run.id,claim.run.kind);
-          const task = this.execute(claim).catch(()=>{console.error('Run execution failed; inspect preserved scoped evidence');}).finally(()=>{this.tasks.delete(task);this.activeRuns.delete(claim.run.id);this.activeKinds.delete(claim.run.id);});
+          const task = this.execute(claim).catch(error=>{console.error(error instanceof ConnectorHttpError ? error.safeSummary : 'Run execution failed; inspect preserved scoped evidence');}).finally(()=>{this.tasks.delete(task);this.activeRuns.delete(claim.run.id);this.activeKinds.delete(claim.run.id);});
           this.tasks.add(task);
         }
         else await delay(this.config.pollIntervalMs ?? 2000);
       } catch (error) {
         // Never print server bodies, prompts, tokens, or native command output.
-        console.error(error instanceof ConnectorHttpError ? `Connector request failed (${error.status})` : 'Connector operation failed; preserved local state');
+        console.error(error instanceof ConnectorHttpError ? error.safeSummary : 'Connector operation failed; preserved local state');
         await delay(3000);
       }
     }
@@ -143,6 +143,7 @@ export class ConnectorRunner {
     let monitorPromise:Promise<void>|undefined;
     let eventWrites = Promise.resolve();
     let bridgeFile:string|undefined;
+    let stage='prepare-workspace';
     const monitor = async () => {
       if (monitoring) return;
       monitoring = true;
@@ -172,15 +173,19 @@ export class ConnectorRunner {
         }
       }
       if (claim.run.kind === 'master' || claim.run.kind === 'review') {
+        stage='bridge-token';
         const grant = await client.createBridgeToken(claim.run.id,claim.run.generation);
         bridgeFile = path.join(this.config.dataDir,'bridge',`${randomUUID()}.json`);
         await writeSecureJson(bridgeFile,{serverUrl:this.config.serverUrl,token:grant.token,runId:claim.run.id,generation:claim.run.generation});
       }
+      stage='native-start';
       await native.start(cwd);
+      stage='process-identity';
       spool.processIdentity=await native.processIdentity();
       if(!spool.processIdentity) throw new Error('Native process identity could not be verified');
       await this.save(spool);
       const before = claim.run.kind === 'review' ? await fingerprint(cwd) : '';
+      stage='native-run';
       const result = await native.run(claim,cwd,buildRunPrompt(claim),claim.run.threadId,event => {
         const entry:ConnectorEvent = {id:randomUUID(),...event,text:event.text.slice(0,60000)};
         eventWrites = eventWrites.then(async()=>{
@@ -214,6 +219,16 @@ export class ConnectorRunner {
       }
       spool.completion={threadId:result.threadId}; await this.save(spool); await this.flush(spool);
     } catch (error) {
+      if (!(error instanceof ConnectorHttpError)) {
+        const cause=error as {nativeStage?:string;nativeCategory?:string;nativeCode?:number;message?:string};
+        const allowedStages=['prepare-workspace','bridge-token','native-start','process-identity','native-run','native-initialize','model-list','model-validation','thread-resume','thread-start','turn-start','native-rpc'];
+        const failureStage=allowedStages.includes(cause?.nativeStage ?? '') ? cause.nativeStage! : stage;
+        const category=['rpc-failure','unavailable-model'].includes(cause?.nativeCategory ?? '') ? cause.nativeCategory! : 'local-failure';
+        const code=typeof cause?.nativeCode==='number' && Number.isInteger(cause.nativeCode) ? cause.nativeCode : undefined;
+        console.error(`Native execution failure stage=${failureStage} category=${category}${code===undefined?'':` code=${code}`}`);
+        // Raw native cause stays local/private: never include it in logs, API completion or prompts.
+        try { await writeSecureJson(path.join(this.config.dataDir,'diagnostics',`${stateKey(claim.run.id,String(claim.run.generation))}.json`),{runId:claim.run.id,generation:claim.run.generation,stage:failureStage,category,code,cause:typeof cause?.message==='string'?cause.message:'Unknown local error'}); } catch { /* Preserve primary failure even if private evidence cannot be written. */ }
+      }
       await native.stop(); await eventWrites;
       // A transport failure after successful execution must not rewrite it as a model failure.
       // Keep its original completion and outbox for the next poll/restart.

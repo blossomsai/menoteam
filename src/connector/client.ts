@@ -3,7 +3,34 @@ import type { ClaimedRun, ConnectorEvent, ConnectorConfig, UploadArtifact } from
 import { z } from 'zod';
 
 export class ConnectorHttpError extends Error {
-  constructor(public readonly status: number, message: string, public readonly issues: Array<{ path: string; code: string }> = []) { super(message); }
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly issues: Array<{ path: string; code: string }> = [],
+    public readonly method: string = 'OTHER',
+    public readonly routeCategory: string = 'unknown',
+    public readonly retryAfterSeconds?: number,
+  ) { super(message); }
+
+  get safeSummary(): string {
+    return `Connector HTTP failure method=${this.method} route=${this.routeCategory} status=${this.status} retryAfterSeconds=${this.retryAfterSeconds ?? 'none'}`;
+  }
+}
+
+function routeCategory(path: string): string {
+  if (path === '/api/workbench/connector/claim') return 'connector.claim';
+  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools)$/u)?.[1];
+  if (route) return `connector.runs.${route}`;
+  if (/^\/api\/workbench\/connector\/runs\/[^/]+$/u.test(path)) return 'connector.runs.read';
+  return 'unknown';
+}
+
+function retryAfterSeconds(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const header = value.trim();
+  if (/^\d{1,6}$/u.test(header)) return Math.min(86_400, Number(header));
+  const date = Date.parse(header);
+  return Number.isFinite(date) ? Math.min(86_400, Math.max(0, Math.ceil((date - Date.now()) / 1000))) : undefined;
 }
 
 export class WorkbenchConnectorClient {
@@ -103,7 +130,8 @@ export class WorkbenchConnectorClient {
       }).slice(0, 8) : [];
       const summary = typeof payload?.message === 'string' ? payload.message.slice(0, 500) : `Workbench connector request failed (${response.status})`;
       const detail = issues.length ? ` (${issues.map(item => `${item.path}:${item.code}`).join(', ')})` : '';
-      throw new ConnectorHttpError(response.status, `${summary}${detail}`.slice(0, 900), issues);
+      const method = ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'].includes(options.method.toUpperCase()) ? options.method.toUpperCase() : 'OTHER';
+      throw new ConnectorHttpError(response.status, `${summary}${detail}`.slice(0, 900), issues, method, routeCategory(path), retryAfterSeconds(response.headers.get('retry-after')));
     }
     const validated = validateResponse(path, payload);
     return validated as T;

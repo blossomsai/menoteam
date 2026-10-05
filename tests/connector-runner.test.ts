@@ -3,10 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createServer } from 'node:http';
 import { WorkbenchConnectorClient as HttpClient } from '../src/connector/client.js';
-import { describe,it,expect } from 'vitest';
+import { describe,it,expect,vi } from 'vitest';
 import { ConnectorRunner,buildRunPrompt } from '../src/connector/runner.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
-import type { WorkbenchConnectorClient } from '../src/connector/client.js';
+import { ConnectorHttpError, type WorkbenchConnectorClient } from '../src/connector/client.js';
 import { stateKey,writeSecureJson } from '../src/connector/state.js';
 import type { ClaimedRun,ConnectorConfig } from '../src/connector/types.js';
 function claim():ClaimedRun {
@@ -46,6 +46,47 @@ describe('Integrated connector lifecycle',()=>{
     runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
     try {await runner.run();const files=await readdir(path.join(dataDir,'unsent-evidence'));expect(files).toHaveLength(1);expect(JSON.parse(await readFile(path.join(dataDir,'unsent-evidence',files[0]!),'utf8'))).toEqual(spool);expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);}
     finally{await rm(dataDir,{recursive:true,force:true});}
+  });
+  it('logs a safe route category for a bridge-token HTTP failure during execution',async()=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-bridge-429-'));
+    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'connector-wide-secret',connectorId:'one',dataDir,projects:{},pollIntervalMs:1};
+    let claimed=false;let runner:ConnectorRunner;
+    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{},run:async()=>{throw new Error('Native turn must not start before bridge authorization');}} as unknown as CodexAppServer;
+    const client={
+      claim:async()=>{if(claimed){await runner.stop();return undefined;}claimed=true;return claim();},
+      createBridgeToken:async()=>{throw new ConnectorHttpError(429,'private response body contains secret-token',[], 'POST','connector.runs.bridge-token',37);},
+      readRun:async()=>claim().run,
+      complete:async()=>({}),
+    } as unknown as WorkbenchConnectorClient;
+    const log=vi.spyOn(console,'error').mockImplementation(()=>{});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    try{
+      await runner.run();
+      expect(log).toHaveBeenCalledWith('Connector HTTP failure method=POST route=connector.runs.bridge-token status=429 retryAfterSeconds=37');
+      const output=JSON.stringify(log.mock.calls);
+      expect(output).not.toContain('connector-wide-secret');
+      expect(output).not.toContain('private response body');
+      expect(output).not.toContain('secret-token');
+      expect(output).not.toContain('run-one');
+    }finally{log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
+  });
+  it('keeps raw native RPC cause private while logging only bounded stage metadata',async()=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-native-diagnostic-'));
+    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'enrollment-secret',connectorId:'one',dataDir,projects:{},pollIntervalMs:1};
+    let claimed=false;let completed=false;let runner:ConnectorRunner;
+    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{},run:async()=>{throw Object.assign(new Error('private raw native cause secret-token'),{nativeStage:'thread-resume',nativeCategory:'rpc-failure',nativeCode:-32602});}} as unknown as CodexAppServer;
+    const client={claim:async()=>{if(!claimed){claimed=true;return claim();}if(completed)await runner.stop();return undefined;},createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>claim().run,complete:async(_id:string,_gen:number,value:{error?:string})=>{expect(value.error).not.toContain('secret-token');completed=true;}} as unknown as WorkbenchConnectorClient;
+    const log=vi.spyOn(console,'error').mockImplementation(()=>{});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    try{
+      await runner.run();
+      expect(log).toHaveBeenCalledWith('Native execution failure stage=thread-resume category=rpc-failure code=-32602');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('private raw native cause');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('secret-token');
+      const file=path.join(dataDir,'diagnostics',`${stateKey('run-one','1')}.json`);
+      expect((await stat(file)).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(await readFile(file,'utf8')).cause).toBe('private raw native cause secret-token');
+    }finally{log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
   });
   it('retries durable IDs across real socket loss without executing the native turn twice',async()=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-transport-'));

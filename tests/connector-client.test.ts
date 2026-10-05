@@ -36,3 +36,20 @@ it('surfaces only safe validation paths and codes from API errors', async () => 
   expect(error.message).toContain('prompt:too_big');
   expect(error.message).not.toContain('MUST NOT BE EXPOSED');
 });
+
+it('reports only the static route category, method, status, and bounded Retry-After on connector HTTP errors', async () => {
+  const fetcher = vi.fn(async (_url: URL | RequestInfo, _init?: RequestInit) => new Response(JSON.stringify({
+    message: 'body and credential values must stay private',
+    token: 'secret-token',
+  }), { status: 429, headers: { 'retry-after': '37' } }));
+  const client = new WorkbenchConnectorClient(auth, fetcher as typeof fetch);
+  const error = await client.createBridgeToken('private-run-id', 4).catch(value => value as Error & {
+    status?: number; method?: string; routeCategory?: string; retryAfterSeconds?: number; safeSummary?: string;
+  });
+  expect(error).toMatchObject({ status: 429, method: 'POST', routeCategory: 'connector.runs.bridge-token', retryAfterSeconds: 37 });
+  expect(error.safeSummary).toBe('Connector HTTP failure method=POST route=connector.runs.bridge-token status=429 retryAfterSeconds=37');
+  expect(error.safeSummary).not.toContain('private-run-id');
+  expect(error.safeSummary).not.toContain('secret-token');
+  expect(error.safeSummary).not.toContain('body and credential values');
+  expect(error.routeCategory).not.toContain('private-run-id');
+});

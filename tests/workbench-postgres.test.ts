@@ -1,3 +1,7 @@
+import { randomUUID } from 'node:crypto';
+import { digest } from '../src/workbench/auth.js';
+import { rateLimitKey } from '../src/workbench/rate-limit.js';
+import type { FastifyRequest } from 'fastify';
 import postgres from "postgres";
 import { createHmac } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
@@ -664,4 +668,74 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(snap.json().projects.map((p:any)=>p.id).sort()).toEqual(before.projects.map((p:any)=>p.id).sort());
         expect(snap.json().messages.length).toBeGreaterThan(1);
     });
+});
+
+describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
+ let sql:ReturnType<typeof postgres>;
+ let app:Awaited<ReturnType<typeof createWorkbenchApp>>;
+ const suffix=randomUUID(), owner=`rate-${suffix}@example.invalid`;
+ const connectorIds=[`rate-a-${suffix}`,`rate-b-${suffix}`];
+ const tokens=[randomUUID(),randomUUID()];
+ let cookie='';
+ beforeAll(async()=>{
+  const location=new URL(url!);
+  if(!['localhost','127.0.0.1'].includes(location.hostname)||!location.pathname.endsWith('_test'))throw Error('Loopback *_test database required');
+  sql=postgres(url!);
+  app=await createWorkbenchApp({sql,bootstrapEmail:owner,bootstrapPassword:'rate-limit-test-password'});
+  const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:owner,password:'rate-limit-test-password'}});
+  expect(login.statusCode).toBe(200);cookie=String(login.headers['set-cookie']).split(';')[0]!;
+  for(let i=0;i<2;i++)await sql`INSERT INTO wb_connectors(id,digest,project_ids) VALUES (${connectorIds[i]!},${digest(tokens[i]!)},'[]'::jsonb)`;
+ });
+ afterAll(async()=>{
+  await app?.close();
+  if(sql){await sql`DELETE FROM wb_connectors WHERE id=ANY(${connectorIds})`;await sql`DELETE FROM wb_sessions WHERE user_id IN (SELECT id FROM wb_users WHERE email=${owner})`;await sql`DELETE FROM wb_users WHERE email=${owner}`;await sql.end();}
+ });
+ it('two connectors and a member share an egress without sharing their 180-request budgets',async()=>{
+  for(let n=0;n<100;n++){
+   for(const token of tokens){const r=await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${token}`},payload:{}});expect(r.statusCode).toBe(204);}
+   expect((await app.inject({url:'/api/workbench/me',headers:{cookie}})).statusCode).toBe(200);
+  }
+  for(let n=100;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${tokens[0]}`},payload:{}})).statusCode).toBe(204);
+  expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${tokens[0]}`},payload:{}})).statusCode).toBe(429);
+  expect((await app.inject({url:'/api/workbench/me',headers:{cookie}})).statusCode).toBe(200);
+ });
+ it('login remains IP-limited despite valid cookies and rotating supplied bearer credentials',async()=>{
+  for(let n=0;n<10;n++)expect((await app.inject({method:'POST',url:'/api/workbench/session',remoteAddress:'127.0.0.21',headers:{cookie,authorization:`Bearer ${randomUUID()}`},payload:{email:owner,password:'wrong'}})).statusCode).toBe(401);
+  expect((await app.inject({method:'POST',url:'/api/workbench/session',remoteAddress:'127.0.0.21',headers:{cookie},payload:{email:owner,password:'rate-limit-test-password'}})).statusCode).toBe(429);
+ });
+ it('invalid and revoked credentials cannot partition the anonymous IP budget',async()=>{
+  await sql`DELETE FROM wb_connectors WHERE id=${connectorIds[1]!}`;
+  for(let n=0;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',remoteAddress:'127.0.0.22',headers:{cookie,authorization:`Bearer ${n%2?tokens[1]:randomUUID()}`},payload:{}})).statusCode).toBe(401);
+  expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',remoteAddress:'127.0.0.22',headers:{authorization:`Bearer ${randomUUID()}`},payload:{}})).statusCode).toBe(429);
+ });
+ it('rotating bridge grants share the connector identity and revoked actors lose that identity',async()=>{
+  const actor=(await sql`SELECT id FROM wb_users WHERE email=${owner}`)[0]!.id;
+  const projectId=`rate-project-${suffix}`, runId=`rate-run-${suffix}`;
+  const grants=[randomUUID(),randomUUID()];
+  const bridgeConnector=`rate-bridge-${suffix}`, bridgeEnrollment=randomUUID();
+  connectorIds.push(bridgeConnector);
+  await sql`INSERT INTO wb_connectors(id,digest,project_ids) VALUES (${bridgeConnector},${digest(bridgeEnrollment)},${sql.json([projectId])})`;
+  const run={id:runId,projectId,connectorId:bridgeConnector,requestedBy:actor,generation:1,status:'running',leaseUntil:new Date(Date.now()+60000).toISOString()};
+  await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${runId},'run',${projectId},${sql.json(run)})`;
+  for(const raw of grants)await sql`INSERT INTO wb_bridge_tokens(digest,run_id,generation,expires_at) VALUES (${digest(raw)},${runId},1,now()+interval '1 minute')`;
+  const key=rateLimitKey(sql);
+  const req=(raw:string)=>({ip:'127.0.0.24',routeOptions:{url:'/api/workbench/connector/runs/:id/tools'},params:{id:runId},headers:{authorization:`Bearer ${raw}`}} as FastifyRequest);
+  try{
+   for(let n=0;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${bridgeEnrollment}`},payload:{}})).statusCode).toBe(204);
+   for(const raw of grants){expect(await key(req(raw))).toBe(`connector:${bridgeConnector}`);expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/tools`,headers:{authorization:`Bearer ${raw}`},payload:{generation:1}})).statusCode).toBe(429);}
+   await sql`UPDATE wb_users SET role='member' WHERE id=${actor}`;
+   expect(await key(req(grants[0]!))).toBe('ip:127.0.0.24');
+   await sql`UPDATE wb_users SET role='owner' WHERE id=${actor}`;
+   await sql`UPDATE wb_records SET data=jsonb_set(data,'{generation}','2') WHERE id=${runId}`;
+   expect(await key(req(grants[1]!))).toBe('ip:127.0.0.24');
+  }finally{
+   await sql`UPDATE wb_users SET role='owner' WHERE id=${actor}`;
+   await sql`DELETE FROM wb_bridge_tokens WHERE run_id=${runId}`;
+   await sql`DELETE FROM wb_records WHERE id=${runId}`;
+  }
+ });
+ it('unknown routes remain anonymous even with a valid session',async()=>{
+  const key=rateLimitKey(sql);
+  expect(await key({ip:'127.0.0.23',routeOptions:{url:'/*'},headers:{cookie}} as FastifyRequest)).toBe('ip:127.0.0.23');
+ });
 });

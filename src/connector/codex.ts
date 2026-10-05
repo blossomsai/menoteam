@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 
 const execFile = promisify(execFileCb);
 
-type RpcMessage = { id?: number | string; method?: string; params?: any; result?: any; error?: { message?: string } };
+type RpcMessage = { id?: number | string; method?: string; params?: any; result?: any; error?: { message?: string; code?: number } };
 type ToolHandler = (name: string, input: Record<string, unknown>, requestId: string) => Promise<unknown>;
 
 const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','post_message','update_settings','create_skill'];
@@ -74,7 +74,7 @@ export class CodexAppServer {
     onEvent: (event: Omit<ConnectorEvent, 'id'>) => void,
     bridgeContextFile?: string): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
     if (!this.child) await this.start(cwd);
-    if (!this.models.includes(claim.run.model)) throw new Error(`Requested model is unavailable on this connector: ${claim.run.model}`);
+    if (!this.models.includes(claim.run.model)) throw Object.assign(new Error(`Requested model is unavailable on this connector: ${claim.run.model}`), {nativeStage:'model-validation',nativeCategory:'unavailable-model'});
     if ((claim.run.kind === 'master' || claim.run.kind === 'review') && !bridgeContextFile) {
       throw new Error(`${claim.run.kind} run needs its scoped MCP context file`);
     }
@@ -83,7 +83,7 @@ export class CodexAppServer {
     const sandbox = claim.run.kind === 'implementation' ? 'workspace-write' : 'read-only';
     const boundary = { cwd, sandbox, approvalPolicy: 'never', model: claim.run.model, ...(config ? { config } : {}) };
     const thread = threadId
-      ? await this.request('thread/resume', { threadId, ...boundary })
+      ? await this.request('thread/resume', { threadId, excludeTurns: true, ...boundary })
       : await this.request('thread/start', {
         ...boundary,
       });
@@ -163,11 +163,14 @@ export class CodexAppServer {
 
   private request(method: string, params: unknown): Promise<any> {
     const id = ++this.serial;
-    return new Promise((resolve, reject) => {
+    return new Promise<any>((resolve, reject) => {
       const timeout = setTimeout(() => { this.pending.delete(id); reject(new Error(`Codex RPC timed out: ${method}`)); }, 30_000);
       timeout.unref();
       this.pending.set(id, { resolve: value => { clearTimeout(timeout); resolve(value); }, reject: error => { clearTimeout(timeout); reject(error); } });
       this.child!.stdin.write(`${JSON.stringify({ id, method, params })}\n`, error => { if (error) { this.pending.delete(id); clearTimeout(timeout); reject(error); } });
+    }).catch(error => {
+      const stages:Record<string,string> = {initialize:'native-initialize','model/list':'model-list','thread/resume':'thread-resume','thread/start':'thread-start','turn/start':'turn-start'};
+      throw Object.assign(error instanceof Error ? error : new Error('Native RPC failed'), {nativeStage:stages[method] ?? 'native-rpc',nativeCategory:'rpc-failure'});
     });
   }
   private notify(method: string, params: unknown): void { this.child!.stdin.write(`${JSON.stringify({ method, params })}\n`); }
@@ -176,7 +179,7 @@ export class CodexAppServer {
     this.buffer += chunk;
     if (this.buffer.length > 8 * 1024 * 1024) { const error = new Error('Codex app-server output buffer exceeded limit'); this.failAll(error); for (const reject of this.activeRejectors) reject(error); void this.stop(); return; }
     for (;;) { const end = this.buffer.indexOf('\n'); if (end < 0) return; const line = this.buffer.slice(0,end).trim(); this.buffer = this.buffer.slice(end+1); if (!line) continue; let msg: RpcMessage; try { msg = JSON.parse(line); } catch { continue; }
-      if (msg.id !== undefined && !msg.method && this.pending.has(Number(msg.id))) { const p = this.pending.get(Number(msg.id))!; this.pending.delete(Number(msg.id)); msg.error ? p.reject(new Error(msg.error.message ?? 'Codex RPC error')) : p.resolve(msg.result); }
+      if (msg.id !== undefined && !msg.method && this.pending.has(Number(msg.id))) { const p = this.pending.get(Number(msg.id))!; this.pending.delete(Number(msg.id)); msg.error ? p.reject(Object.assign(new Error(msg.error.message ?? 'Codex RPC error'), {nativeCode:typeof msg.error.code==='number' ? msg.error.code : undefined})) : p.resolve(msg.result); }
       else this.events.emit('message', msg);
     }
   }
