@@ -484,6 +484,38 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await send('/claim',{capabilities:{runKinds:['implementation']}})).statusCode).toBe(204);
         expect((await send('/claim',{capabilities:{runKinds:['master']}})).json().run.kind).toBe('master');
     });
+    it('reviewer bridge reads exact candidate evidence and denies wider reads or mutations',async()=>{
+        const p=(await user('POST','/projects',{name:'Scoped review proof'})).json();
+        const work=(await user('POST',`/projects/${p.id}/works`,{title:'Review candidate'})).json();
+        const other=(await user('POST',`/projects/${p.id}/works`,{title:'Private other Work'})).json();
+        const credential=(await user('POST','/connectors',{id:'review-bridge-connector',projectIds:[p.id]})).json().token;
+        const send=(path:string,payload:unknown,bearer=credential)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${bearer}`},payload:payload as never});
+        await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Implement candidate',requestId:'review-bridge-implementation'});
+        const candidate=(await send('/claim',{})).json().run;
+        const diff=await send(`/runs/${candidate.id}/artifacts`,{generation:candidate.generation,kind:'diff',revision:'exact-candidate-revision',data:{files:[{path:'src/example.ts',added:1,removed:0,lines:['+ actual evidence']}],candidateFingerprint:'candidate-bytes'},requestId:'candidate-diff'});
+        expect(diff.statusCode).toBe(200);
+        await send(`/runs/${candidate.id}/complete`,{generation:candidate.generation,threadId:'candidate-thread'});
+        const master=(await send('/claim',{})).json().run;
+        const invalid=await send(`/runs/${master.id}/tools`,{generation:master.generation,action:'dispatch',input:{workId:work.id,kind:'review',model:'gpt-6.1-sol',prompt:'x'.repeat(12001)},requestId:'oversized-review'});
+        expect(invalid.statusCode).toBe(400);
+        expect(invalid.json().issues).toEqual([{path:['prompt'],code:'too_big'}]);
+        expect(invalid.body).not.toContain('x'.repeat(100));
+        const review=(await send(`/runs/${master.id}/tools`,{generation:master.generation,action:'dispatch',input:{workId:work.id,kind:'review',model:'gpt-6.1-sol',prompt:'Review exact evidence'},requestId:'dispatch-review'})).json();
+        await send(`/runs/${master.id}/complete`,{generation:master.generation,threadId:'master-thread'});
+        const claimed=(await send('/claim',{capabilities:{runKinds:['review']}})).json().run;
+        expect(claimed.id).toBe(review.id);
+        const bridge=(await send(`/runs/${claimed.id}/bridge-token`,{generation:claimed.generation})).json().token;
+        const tool=(action:string,input:unknown)=>send(`/runs/${claimed.id}/tools`,{generation:claimed.generation,action,input,requestId:crypto.randomUUID()},bridge);
+        const evidence=await tool('read_run',{runId:candidate.id});
+        expect(evidence.statusCode).toBe(200);
+        expect(evidence.json().artifacts[0].data.files[0].lines).toEqual(['+ actual evidence']);
+        expect((await tool('read_work',{workId:work.id})).statusCode).toBe(200);
+        expect((await tool('read_work',{workId:other.id})).statusCode).toBe(403);
+        expect((await tool('read_run',{runId:master.id})).statusCode).toBe(403);
+        expect((await tool('read_context',{})).statusCode).toBe(403);
+        expect((await tool('create_skill',{name:'Escalate',data:{content:'No'}})).statusCode).toBe(403);
+        expect((await send('/claim',{},bridge)).statusCode).toBe(401);
+    });
     it('rejects credential-bearing source and settings URLs before any external fetch',async()=>{
         for(const url of ['https://secret@github.com/blossomsai/menoteam','https://github.com/blossomsai/menoteam?token=secret','http://github.com/blossomsai/menoteam']) {
             const result=await user('POST','/settings',{kind:'connection',name:'Unsafe metadata',projectId,data:{provider:'github',url}});

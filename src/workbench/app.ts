@@ -42,6 +42,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.setErrorHandler((error, _req, reply) => reply.code(error instanceof z.ZodError ? 400 : Number((error as {
         statusCode?: number;
     }).statusCode) || 500).send({
+        ...(error instanceof z.ZodError ? {issues:error.issues.map(issue=>({path:issue.path,code:issue.code}))} : {}),
         error: error instanceof z.ZodError ? "BAD_REQUEST" : Number((error as {
             statusCode?: number;
         }).statusCode) < 500 ? "REQUEST_FAILED" : "INTERNAL_ERROR",
@@ -789,7 +790,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return r;
     }));
     app.post('/api/workbench/connector/runs/:id/bridge-token',async req=>store.transaction('bridge-token',async tx=>{
-        const r=await leased(req,tx);if(r.kind!=='master')fail(403,'Only Master receives tool grants');
+        const r=await leased(req,tx);if(!['master','review'].includes(r.kind))fail(403,'This run does not receive tool grants');
         const raw=token();const expiresAt=new Date(Date.now()+7200000).toISOString();
         await tx`DELETE FROM wb_bridge_tokens WHERE expires_at<now()`;
         await tx`INSERT INTO wb_bridge_tokens(digest,run_id,generation,expires_at) VALUES (${digest(raw)},${r.id},${r.generation},${expiresAt})`;
@@ -805,8 +806,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         id: string;
     }).id}`, async (tx) => {
         const r = await leased(req, tx,true);
-        if (r.kind !== "master")
-            fail(403, "Master tools required");
+        if (!["master", "review"].includes(r.kind))
+            fail(403, "Scoped tools required");
         const actors = await tx `SELECT id,email,name,role FROM wb_users WHERE id=${r.requestedBy ?? ""}`;
         if (!actors[0])
             fail(403, "Run actor unavailable");
@@ -817,6 +818,13 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             input: z.record(z.string(), z.unknown()),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
+        if (r.kind === 'review') {
+            if (!['read_work', 'read_run'].includes(b.action)) fail(403, 'Reviewer grant is read-only');
+            if (b.action === 'read_work' && (!r.workId || b.input.workId !== r.workId))
+                fail(403, 'Reviewer can read only the assigned Work');
+            if (b.action === 'read_run' && (!r.targetRunId || b.input.runId !== r.targetRunId))
+                fail(403, 'Reviewer can read only the assigned candidate run');
+        }
         if(b.action==='dispatch'&&r.sourceIds?.length&&!(await store.get<Project>('project',r.projectId,tx))?.feedbackIntake?.allowExecution)fail(403,'Feedback execution grant revoked');
         if(r.allowedActions&&!r.allowedActions.includes(b.action))fail(403,'This intake grant does not authorize that action');
         const scope = `tools:${r.id}`;
@@ -847,10 +855,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             const target = await store.get<Run>("run", String(b.input.runId), tx);
             if (target?.projectId !== r.projectId)
                 fail(404, "Run missing");
+            if (r.kind === 'review' && target!.workId !== r.workId)
+                fail(403, 'Candidate Work scope mismatch');
             result = {
                 run: target,
-                events: (await store.scopedList<RunEvent>("event", [r.projectId], 500, tx)).filter(e => e.runId === target!.id),
-                artifacts: (await store.scopedList<Artifact>("artifact", [r.projectId], 500, tx)).filter(a => a.runId === target!.id)
+                events: (await tx`SELECT data FROM wb_records WHERE kind='event' AND project_id=${r.projectId} AND data->>'runId'=${target!.id} ORDER BY (data->>'sequence')::int LIMIT 500`).map(row=>row.data as RunEvent),
+                artifacts: (await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${r.projectId} AND data->>'runId'=${target!.id} ORDER BY updated_at,id LIMIT 100`).map(row=>row.data as Artifact)
             };
         }
         else if (b.action === "create_work")

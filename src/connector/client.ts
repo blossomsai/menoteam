@@ -3,7 +3,7 @@ import type { ClaimedRun, ConnectorEvent, ConnectorConfig, UploadArtifact } from
 import { z } from 'zod';
 
 export class ConnectorHttpError extends Error {
-  constructor(public readonly status: number, message: string) { super(message); }
+  constructor(public readonly status: number, message: string, public readonly issues: Array<{ path: string; code: string }> = []) { super(message); }
 }
 
 export class WorkbenchConnectorClient {
@@ -93,9 +93,18 @@ export class WorkbenchConnectorClient {
       signal: AbortSignal.timeout(20_000),
     });
     if (response.status === 204 && options.allowNoContent) return undefined as T;
-    const payload = await response.json().catch(() => undefined) as { message?: unknown } | undefined;
-    if (!response.ok) throw new ConnectorHttpError(response.status,
-      typeof payload?.message === 'string' ? payload.message.slice(0, 500) : `Workbench connector request failed (${response.status})`);
+    const payload = await response.json().catch(() => undefined) as { message?: unknown; issues?: unknown } | undefined;
+    if (!response.ok) {
+      const issues = Array.isArray(payload?.issues) ? payload.issues.flatMap((item: any) => {
+        if (!item || typeof item !== 'object') return [];
+        const path = Array.isArray(item.path) ? item.path.map((part: unknown) => String(part).slice(0, 80)).join('.').slice(0, 200) : '';
+        const code = typeof item.code === 'string' ? item.code.slice(0, 80) : '';
+        return path && code ? [{ path, code }] : [];
+      }).slice(0, 8) : [];
+      const summary = typeof payload?.message === 'string' ? payload.message.slice(0, 500) : `Workbench connector request failed (${response.status})`;
+      const detail = issues.length ? ` (${issues.map(item => `${item.path}:${item.code}`).join(', ')})` : '';
+      throw new ConnectorHttpError(response.status, `${summary}${detail}`.slice(0, 900), issues);
+    }
     const validated = validateResponse(path, payload);
     return validated as T;
   }

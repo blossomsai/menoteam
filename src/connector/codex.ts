@@ -12,9 +12,10 @@ const execFile = promisify(execFileCb);
 type RpcMessage = { id?: number | string; method?: string; params?: any; result?: any; error?: { message?: string } };
 type ToolHandler = (name: string, input: Record<string, unknown>, requestId: string) => Promise<unknown>;
 
-const BRIDGE_TOOL_NAMES = ['read_context','read_work','read_run','create_work','update_work','dispatch','post_message','update_settings','create_skill'];
+const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','post_message','update_settings','create_skill'];
+const REVIEW_BRIDGE_TOOLS = ['read_work','read_run'];
 
-function masterBridgeConfig(contextFile: string) {
+function scopedBridgeConfig(contextFile: string, tools: string[]) {
   const compiledPath = fileURLToPath(new URL('./mcp-bridge.js', import.meta.url));
   const sourcePath = fileURLToPath(new URL('./mcp-bridge.ts', import.meta.url));
   const isSource = import.meta.url.endsWith('.ts');
@@ -26,8 +27,8 @@ function masterBridgeConfig(contextFile: string) {
     env: { MENOTEAM_RUN_CONTEXT_FILE: contextFile },
     enabled: true,
     required: true,
-    enabled_tools: BRIDGE_TOOL_NAMES,
-    tools: Object.fromEntries(BRIDGE_TOOL_NAMES.map(name => [name, { approval_mode: 'approve' }]))
+    enabled_tools: tools,
+    tools: Object.fromEntries(tools.map(name => [name, { approval_mode: 'approve' }]))
   } } };
 }
 
@@ -71,11 +72,14 @@ export class CodexAppServer {
 
   async run(claim: ClaimedRun, cwd: string, prompt: string, threadId: string | undefined,
     onEvent: (event: Omit<ConnectorEvent, 'id'>) => void,
-    masterContextFile?: string): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
+    bridgeContextFile?: string): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
     if (!this.child) await this.start(cwd);
     if (!this.models.includes(claim.run.model)) throw new Error(`Requested model is unavailable on this connector: ${claim.run.model}`);
-    if (claim.run.kind === 'master' && !masterContextFile) throw new Error('Master run needs its scoped MCP context file');
-    const config = claim.run.kind === 'master' ? masterBridgeConfig(masterContextFile!) : undefined;
+    if ((claim.run.kind === 'master' || claim.run.kind === 'review') && !bridgeContextFile) {
+      throw new Error(`${claim.run.kind} run needs its scoped MCP context file`);
+    }
+    const bridgeTools = claim.run.kind === 'master' ? MASTER_BRIDGE_TOOLS : claim.run.kind === 'review' ? REVIEW_BRIDGE_TOOLS : undefined;
+    const config = bridgeTools ? scopedBridgeConfig(bridgeContextFile!, bridgeTools) : undefined;
     const sandbox = claim.run.kind === 'implementation' ? 'workspace-write' : 'read-only';
     const boundary = { cwd, sandbox, approvalPolicy: 'never', model: claim.run.model, ...(config ? { config } : {}) };
     const thread = threadId
@@ -216,9 +220,11 @@ export async function readCodexProcessIdentity(pid: number): Promise<CodexProces
       const processGroupId = Number(fields[2]);
       const startTicks = fields[19];
       if (!Number.isSafeInteger(processGroupId) || !startTicks) return undefined;
+      const bootId = (await readFileCb('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+      if (!bootId) return undefined;
       const command = (await readFileCb(`/proc/${pid}/cmdline`)).toString('utf8').replaceAll('\0', ' ').trim();
       if (!command.includes('codex') || !command.includes('app-server')) return undefined;
-      return { pid, processGroupId, startedAt: `linux:${startTicks}`, command };
+      return { pid, processGroupId, startedAt: `linux:${bootId}:${startTicks}`, command };
     }
     const [group, started, command] = await Promise.all(['pgid=', 'lstart=', 'command='].map(async field =>
       (await execFile('ps', ['-o', field, '-p', String(pid)], { encoding: 'utf8', maxBuffer: 16_384 })).stdout.trim()));
