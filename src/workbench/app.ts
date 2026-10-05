@@ -379,10 +379,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(404, "Work missing");
         if (w!.revision !== b.revision)
             fail(409, "Work changed; reload");
-        Object.assign(w!, b, {
-            revision: w!.revision + 1,
-            updatedAt: now()
-        });
+        if (b.overview !== undefined) w!.overview = b.overview;
+        if (b.status !== undefined) w!.status = b.status;
+        w!.revision += 1;
+        w!.updatedAt = now();
         await store.put("work", w!, tx);
         return w;
     }

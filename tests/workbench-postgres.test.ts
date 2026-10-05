@@ -1,6 +1,6 @@
 import postgres from "postgres";
 import { createHmac } from "node:crypto";
-import { beforeAll, afterAll, describe, it, expect } from "vitest";
+import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
@@ -423,6 +423,51 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(runtime.every((r:{connectorId:string}) => r.connectorId !== provider.id)).toBe(true);
         expect(runtime.some((r:{verifiedRunId?:string}) => !!r.verifiedRunId)).toBe(true);
     });
+    it("imports GitHub SKILL.md over HTTP, persists the returned text, and rejects bad upstream content", async () => {
+        const ref = "a".repeat(40);
+        const sourceUrl = `https://github.com/example/skills/blob/${ref}/review/SKILL.md`;
+        const skillText = "# Review skill\nCheck the changed behavior against its acceptance criteria.";
+        const githubResponse = (status: number, body: unknown) => new Response(JSON.stringify(body), {
+            status,
+            headers: { "content-type": "application/json" }
+        });
+        const fetchMock = vi.fn<typeof fetch>();
+        vi.stubGlobal("fetch", fetchMock);
+        try {
+            fetchMock.mockResolvedValueOnce(githubResponse(200, {
+                type: "file",
+                encoding: "base64",
+                content: Buffer.from(skillText).toString("base64"),
+                size: Buffer.byteLength(skillText)
+            }));
+            const imported = await user("POST", `/projects/${projectId}/skills/import`, { url: sourceUrl });
+            expect(imported.statusCode).toBe(200);
+            expect(fetchMock.mock.calls[0]?.[0]).toBe(`https://api.github.com/repos/example/skills/contents/review/SKILL.md?ref=${ref}`);
+            expect(imported.json()).toMatchObject({
+                kind: "skill",
+                projectId,
+                name: "review",
+                data: { content: skillText, sourceUrl, enabled: true }
+            });
+            expect((await user("GET", "/snapshot")).json().settings).toContainEqual(imported.json());
+
+            fetchMock.mockResolvedValueOnce(githubResponse(404, { message: "Not Found" }));
+            const missing = await user("POST", `/projects/${projectId}/skills/import`, { url: sourceUrl });
+            expect(missing.statusCode).toBe(502);
+
+            fetchMock.mockResolvedValueOnce(githubResponse(200, {
+                type: "file",
+                encoding: "base64",
+                content: Buffer.from("x").toString("base64"),
+                size: 64001
+            }));
+            const oversized = await user("POST", `/projects/${projectId}/skills/import`, { url: sourceUrl });
+            expect(oversized.statusCode).toBe(400);
+            expect(fetchMock).toHaveBeenCalledTimes(3);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
     it('requires connector stop proof before browser reconciliation',async()=>{
         const p=(await user('POST','/projects',{name:'Recovery proof'})).json();
         await user('POST',`/projects/${p.id}/messages`,{text:'Recover safely',requestId:'recovery-run'});
@@ -515,6 +560,32 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await tool('read_context',{})).statusCode).toBe(403);
         expect((await tool('create_skill',{name:'Escalate',data:{content:'No'}})).statusCode).toBe(403);
         expect((await send('/claim',{},bridge)).statusCode).toBe(401);
+    });
+    it('Master partial Work updates preserve omitted overview/status and allow explicit clearing',async()=>{
+        const p=(await user('POST','/projects',{name:'Partial Work update proof'})).json();
+        const work=(await user('POST',`/projects/${p.id}/works`,{title:'Preserve definition',overview:'Original task definition',sources:['source:original']})).json();
+        await user('POST',`/projects/${p.id}/messages`,{text:'Update only current progress',requestId:'partial-work-master'});
+        const credential=(await user('POST','/connectors',{id:'partial-work-connector',projectIds:[p.id]})).json().token;
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        const run=(await send('/claim',{})).json().run;
+        const tool=(input:unknown)=>send(`/runs/${run.id}/tools`,{generation:run.generation,action:'update_work',input,requestId:crypto.randomUUID()});
+        const progress=await tool({workId:work.id,revision:work.revision,status:'in_progress'});
+        expect(progress.statusCode).toBe(200);
+        expect(progress.json().overview).toBe('Original task definition');
+        expect(progress.json().sources).toEqual(['source:original']);
+        expect((await user('GET',`/works/${work.id}`)).json().work.overview).toBe('Original task definition');
+        const definition=await tool({workId:work.id,revision:progress.json().revision,overview:'Updated task definition'});
+        expect(definition.statusCode).toBe(200);
+        expect(definition.json().status).toBe('in_progress');
+        const browser=await user('PATCH',`/works/${work.id}`,{revision:definition.json().revision,status:'paused'});
+        expect(browser.json().overview).toBe('Updated task definition');
+        const cleared=await tool({workId:work.id,revision:browser.json().revision,overview:''});
+        expect(cleared.json().overview).toBe('');
+        expect(cleared.json().status).toBe('paused');
+        const persisted=(await user('GET',`/works/${work.id}`)).json().work;
+        expect(persisted.overview).toBe('');
+        expect(persisted.status).toBe('paused');
+        expect(persisted.sources).toEqual(['source:original']);
     });
     it('rejects credential-bearing source and settings URLs before any external fetch',async()=>{
         for(const url of ['https://secret@github.com/blossomsai/menoteam','https://github.com/blossomsai/menoteam?token=secret','http://github.com/blossomsai/menoteam']) {
