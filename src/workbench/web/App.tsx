@@ -6,7 +6,7 @@ import { Label } from '../../local/web/src/components/ui/label';
 import { Textarea } from '../../local/web/src/components/ui/textarea';
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { ApiError, workbenchApi, type Snapshot } from './api';
-import { canManageProject, readRoute, selectProject, selectWork, type Route, type View } from './routes';
+import { canManageProject, filterWorks, readRoute, selectProject, selectWork, type Route, type View } from './routes';
 
 function href(view: View, projectId = '', workId = '') {
   const url = new URL('/workbench/', window.location.origin);
@@ -276,11 +276,25 @@ function RunNotice({ run, canManageProject, refresh, setError }: { run: Run; can
 
 function WorkList({ project, works }: { project: Project; works: Work[] }) {
   const url = new URL(window.location.href); const selectedStatus = url.searchParams.get('status') ?? 'All';
-  const visibleWorks = works.filter(work => selectedStatus === 'All' || selectedStatus === 'In progress' && work.status === 'in_progress' || selectedStatus === 'Paused' && work.status === 'paused' || selectedStatus === 'Done' && work.status === 'done');
+  const [query, setQuery] = useState(url.searchParams.get('q') ?? '');
+  const visibleWorks = filterWorks(works, selectedStatus, query);
+  const updateQuery = (value: string) => {
+    setQuery(value);
+    const next = new URL(window.location.href);
+    if (value) next.searchParams.set('q', value); else next.searchParams.delete('q');
+    window.history.replaceState(null, '', `${next.pathname}${next.search}${next.hash}`);
+  };
   const newWorkHref = `${href('master', project.id)}&draft=${encodeURIComponent('Help me plan a new work: ')}`;
+  const workListHref = (status: string) => {
+    const next = new URL(href('work', project.id), window.location.origin);
+    if (status !== 'All') next.searchParams.set('status', status);
+    if (query) next.searchParams.set('q', query);
+    return `${next.pathname}${next.search}`;
+  };
   return <><header className="mb-5 flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-semibold">Work</h1><p className="mt-1 text-sm text-muted-foreground">{project.name}</p></div><a href={newWorkHref}><Button>＋ New work</Button></a></header>
-    <nav className="mb-4 flex gap-5 border-b" aria-label="Filter work">{['All', 'In progress', 'Paused', 'Done'].map(status => <a key={status} className={`border-b-2 px-1 py-3 text-sm no-underline ${selectedStatus === status ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground'}`} href={`${href('work', project.id)}${status === 'All' ? '' : `&status=${encodeURIComponent(status)}`}`}>{status}</a>)}</nav>
-    {visibleWorks.length ? <div className="overflow-hidden rounded-xl border bg-background">{visibleWorks.map(work => <a key={work.id} className="grid min-h-20 grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-b px-4 py-3 text-foreground no-underline last:border-b-0 hover:bg-muted/40" href={href('work-detail', project.id, work.id)}><span className="min-w-0"><strong className="block truncate text-sm">{work.title}</strong><span className="mt-1 block line-clamp-2 text-sm text-muted-foreground">{work.overview}</span></span><Badge variant="outline" className="capitalize">{work.status.replace('_', ' ')}</Badge></a>)}</div> : <EmptyState title={selectedStatus === 'All' ? 'No Work yet' : `No ${selectedStatus.toLowerCase()} Work`} detail="Start a conversation with Master to define a new Work." action={<a href={newWorkHref}><Button>Start with Master</Button></a>} />}
+    <nav className="mb-4 flex gap-5 border-b" aria-label="Filter work">{['All', 'In progress', 'Paused', 'Done'].map(status => <a key={status} aria-current={selectedStatus === status ? 'page' : undefined} className={`border-b-2 px-1 py-3 text-sm no-underline ${selectedStatus === status ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground'}`} href={workListHref(status)}>{status}</a>)}</nav>
+    <div className="mb-5 max-w-xl"><Label htmlFor="work-search">Search Work</Label><Input id="work-search" type="search" value={query} onChange={event => updateQuery(event.target.value)} placeholder="Search titles and overviews" /></div>
+    {visibleWorks.length ? <div className="overflow-hidden rounded-xl border bg-background">{visibleWorks.map(work => <a key={work.id} className="grid min-h-20 grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-b px-4 py-3 text-foreground no-underline last:border-b-0 hover:bg-muted/40" href={href('work-detail', project.id, work.id)}><span className="min-w-0"><strong className="block truncate text-sm">{work.title}</strong><span className="mt-1 block line-clamp-2 text-sm text-muted-foreground">{work.overview}</span></span><Badge variant="outline" className="capitalize">{work.status.replace('_', ' ')}</Badge></a>)}</div> : query.trim() ? <EmptyState title="No matching Work" detail={`No Work matches “${query.trim()}” in ${selectedStatus}. Clear the search to see this status again.`} action={<Button variant="outline" onClick={() => updateQuery('')}>Clear search</Button>} /> : <EmptyState title={selectedStatus === 'All' ? 'No Work yet' : `No ${selectedStatus.toLowerCase()} Work`} detail="Start a conversation with Master to define a new Work." action={<a href={newWorkHref}><Button>Start with Master</Button></a>} />}
   </>;
 }
 

@@ -21,6 +21,14 @@ export function selectWork(works: Work[], requestedId: string, projectId?: strin
   return works.find(work => work.id === requestedId && work.projectId === projectId);
 }
 
+export function filterWorks(works: Work[], status: string, query: string): Work[] {
+  const search = query.trim().toLowerCase();
+  return works.filter(work =>
+    (status === 'All' || status === 'In progress' && work.status === 'in_progress' || status === 'Paused' && work.status === 'paused' || status === 'Done' && work.status === 'done') &&
+    (!search || work.title.toLowerCase().includes(search) || work.overview.toLowerCase().includes(search))
+  );
+}
+
 export function canManageProject(member: Member, memberships: Pick<Member, 'id' | 'role'>[]): boolean {
   return member.role === 'owner' || memberships.some(item => item.id === member.id && ['owner', 'admin'].includes(item.role));
 }
