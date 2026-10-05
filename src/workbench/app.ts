@@ -249,13 +249,18 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await grant(user, pid, true);
         const b = z.object({
             instructions: z.string().max(16000).optional(),
+            expectedInstructions: z.string().max(16000).optional(),
             deliveryAuthorization: z.string().max(16000).optional(),feedbackIntake:z.object({enabled:z.boolean(),allowExecution:z.boolean().default(false)}).optional()
         }).strict().parse(req.body);
+        if (b.instructions !== undefined && b.expectedInstructions === undefined) fail(400, 'Expected project instructions are required');
         return store.transaction('project',async tx=>{
             await grant(user,pid,true);
             const p=await store.get<Project>('project',pid,tx);
             if(!p)fail(404,'Project missing');
-            Object.assign(p!,b,{...(b.feedbackIntake?{feedbackIntake:{...b.feedbackIntake,actorId:user.id}}:{})});
+            if (b.instructions !== undefined && p!.instructions !== b.expectedInstructions) fail(409, 'Project instructions changed remotely. Review the latest version before saving.');
+            const changes = { ...b };
+            delete changes.expectedInstructions;
+            Object.assign(p!,changes,{...(b.feedbackIntake?{feedbackIntake:{...b.feedbackIntake,actorId:user.id}}:{})});
             await store.put('project',p!,tx);return p;
         });
     });
@@ -928,8 +933,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);
             } else {
                 await toolSettingsGrant(r);
-                const input=z.object({instructions:z.string().max(16000)}).strict().parse(b.input);
+                const input=z.object({instructions:z.string().max(16000),expectedInstructions:z.string().max(16000)}).strict().parse(b.input);
                 const project=(await store.get<Project>('project',r.projectId,tx))!;
+                if(project.instructions!==input.expectedInstructions)fail(409,'Project instructions changed remotely. Review the latest version before saving.');
                 project.instructions=input.instructions;
                 await store.put('project',project,tx);result=project;
             }

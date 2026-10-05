@@ -7,6 +7,8 @@ import { Textarea } from '../../local/web/src/components/ui/textarea';
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { ApiError, workbenchApi, type Snapshot } from './api';
 import { canManageProject, filterWorks, readRoute, selectProject, selectWork, type Route, type View } from './routes';
+import { cancelInstructionsDraft, completeInstructionsSave, editInstructionsDraft, hasRemoteInstructionsUpdate, keepInstructionsDraft, startInstructionsDraft, useLatestInstructions } from './instructions-draft';
+import { createSnapshotRequestHandler } from './snapshot-request';
 
 function href(view: View, projectId = '', workId = '') {
   const url = new URL('/workbench/', window.location.origin);
@@ -23,59 +25,120 @@ function App() {
   const inviteToken = new URL(window.location.href).searchParams.get('invite');
   const [member, setMember] = useState<Member | null>(null);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [sessionState, setSessionState] = useState<'loading' | 'anonymous' | 'ready' | 'error'>('loading');
+  const [sessionState, setSessionState] = useState<'loading' | 'authenticating' | 'anonymous' | 'ready' | 'error'>('loading');
   const [error, setError] = useState('');
+  const sessionGenerationRef = useRef(0);
+  const snapshotRequestsEnabledRef = useRef(true);
 
-  const refresh = useCallback(async () => {
-    const next = await workbenchApi.snapshot();
-    setSnapshot(next);
-    setMember(next.member);
-    setError('');
-    setSessionState('ready');
+  const invalidateSession = useCallback((state: 'loading' | 'authenticating' | 'anonymous') => {
+    const generation = ++sessionGenerationRef.current;
+    snapshotRequestsEnabledRef.current = false;
+    setSnapshot(null); setMember(null); setError(''); setSessionState(state);
+    return generation;
   }, []);
+
+  const requestSnapshot = useCallback(createSnapshotRequestHandler(
+    () => workbenchApi.snapshot(),
+    () => sessionGenerationRef.current,
+    (next: Snapshot) => {
+      setSnapshot(next);
+      setMember(next.member);
+      setError('');
+      setSessionState('ready');
+    },
+    (cause: unknown) => {
+      if (cause instanceof ApiError && cause.status === 401) invalidateSession('anonymous');
+      else setError(errorMessage(cause));
+    },
+    () => snapshotRequestsEnabledRef.current,
+  ), [invalidateSession]);
+
+  const checkSession = useCallback(async () => {
+    const generation = sessionGenerationRef.current;
+    setError(''); setSessionState('loading');
+    try {
+      const current = await workbenchApi.me();
+      if (generation !== sessionGenerationRef.current) return;
+      setMember(current);
+      snapshotRequestsEnabledRef.current = true;
+      setSessionState('ready');
+    } catch (cause) {
+      if (generation !== sessionGenerationRef.current) return;
+      if (cause instanceof ApiError && cause.status === 401) invalidateSession('anonymous');
+      else { setError(errorMessage(cause)); setSessionState('error'); }
+      return;
+    }
+    await requestSnapshot().catch(() => undefined);
+  }, [invalidateSession, requestSnapshot]);
+
+  const sessionGeneration = sessionGenerationRef.current;
+  const refresh = useCallback(async () => {
+    if (sessionGeneration !== sessionGenerationRef.current) return;
+    await requestSnapshot();
+  }, [requestSnapshot, sessionGeneration]);
 
   useEffect(() => {
-    let live = true;
-    void workbenchApi.me().then(async (current) => {
-      if (!live) return;
-      setMember(current);
-      const next = await workbenchApi.snapshot();
-      if (live) { setSnapshot(next); setMember(current); setSessionState('ready'); }
-    }).catch((cause: unknown) => {
-      if (!live) return;
-      if (cause instanceof ApiError && cause.status === 401) setSessionState('anonymous');
-      else { setError(errorMessage(cause)); setSessionState('error'); }
-    });
-    return () => { live = false; };
-  }, []);
+    void checkSession();
+    return () => { ++sessionGenerationRef.current; snapshotRequestsEnabledRef.current = false; };
+  }, [checkSession]);
 
   useEffect(() => {
     if (sessionState !== 'ready') return;
+    const sessionGeneration = sessionGenerationRef.current;
     let active = false;
     const timer = window.setInterval(() => {
-      if (active) return;
+      if (active || sessionGeneration !== sessionGenerationRef.current) return;
       active = true;
-      void workbenchApi.snapshot().then((next) => { setSnapshot(next); setMember(next.member); setError(''); }).catch((cause: unknown) => {
-        if (cause instanceof ApiError && cause.status === 401) setSessionState('anonymous');
-        else setError(errorMessage(cause));
-      }).finally(() => { active = false; });
+      void requestSnapshot().catch(() => undefined).finally(() => { active = false; });
     }, 2_000);
     return () => window.clearInterval(timer);
-  }, [sessionState]);
+  }, [sessionState, requestSnapshot, sessionGeneration]);
 
+  const authenticate = async (generation: number, email: string, password: string) => {
+    try {
+      await workbenchApi.login(email, password);
+    } catch (cause) {
+      if (generation !== sessionGenerationRef.current) return;
+      setError(errorMessage(cause)); setSessionState('anonymous');
+      return;
+    }
+    if (generation !== sessionGenerationRef.current) return;
+    snapshotRequestsEnabledRef.current = true;
+    setSessionState('ready');
+    await requestSnapshot().catch(() => undefined);
+  };
   const onLogin = async (email: string, password: string) => {
-    setError('');
-    try { await workbenchApi.login(email, password); await refresh(); }
-    catch (cause) { setError(errorMessage(cause)); }
+    await authenticate(invalidateSession('authenticating'), email, password);
+  };
+  const onAcceptInvite = async (token: string, name: string, password: string) => {
+    const generation = invalidateSession('loading');
+    let accepted: { email: string };
+    try {
+      accepted = await workbenchApi.acceptInvite({ token, name, password });
+    } catch (cause) {
+      if (generation !== sessionGenerationRef.current) return;
+      setError(errorMessage(cause)); setSessionState('anonymous');
+      return;
+    }
+    if (generation !== sessionGenerationRef.current) return;
+    // The token is consumed even if the subsequent login fails. Retry through Login.
+    window.history.replaceState(null, '', '/workbench/');
+    setSessionState('authenticating');
+    await authenticate(generation, accepted.email, password);
   };
 
-  if (inviteToken) return <InviteAccept token={inviteToken} onAccepted={async (email, password) => { await workbenchApi.login(email, password); window.history.replaceState(null, '', '/workbench/'); await refresh(); }} />;
-  if (sessionState === 'loading') return <CenteredState title="Loading Menoteam" detail="Checking your workspace session…" />;
+  if (inviteToken) return <InviteAccept key={inviteToken} token={inviteToken} onSubmit={onAcceptInvite} error={error} />;
+  if (sessionState === 'loading' || sessionState === 'authenticating') return <CenteredState title="Loading Menoteam" detail="Checking your workspace session…" />;
   if (sessionState === 'anonymous') return <Login onSubmit={onLogin} error={error} />;
-  if (sessionState === 'error' && !snapshot) return <CenteredState title="Menoteam is unavailable" detail={error} action={<Button variant="outline" onClick={() => { setSessionState('loading'); void workbenchApi.me().then(current => { setMember(current); return refresh(); }).catch(cause => { setError(errorMessage(cause)); setSessionState(cause instanceof ApiError && cause.status === 401 ? 'anonymous' : 'error'); }); }}>Try again</Button>} />;
-  if (!member || !snapshot) return <CenteredState title="Loading workspace" detail="Preparing your projects…" />;
+  if (sessionState === 'error' && !snapshot) return <CenteredState title="Menoteam is unavailable" detail={error} action={<Button variant="outline" onClick={() => void checkSession()}>Try again</Button>} />;
+  if (!member || !snapshot) return error ? <CenteredState title="Workspace is unavailable" detail={<span role="alert">{error}</span>} action={<Button variant="outline" onClick={() => void refresh().catch(() => undefined)}>Retry</Button>} /> : <CenteredState title="Loading workspace" detail="Preparing your projects…" />;
 
-  return <WorkbenchShell member={member} snapshot={snapshot} route={route} error={error} refresh={refresh} onLogout={async () => { await workbenchApi.logout().catch(() => undefined); setSnapshot(null); setMember(null); setSessionState('anonymous'); }} />;
+  return <WorkbenchShell key={member.id} member={member} snapshot={snapshot} route={route} error={error} refresh={refresh} onLogout={async () => {
+    const generation = invalidateSession('loading');
+    try { await workbenchApi.logout(); }
+    catch (cause) { if (generation === sessionGenerationRef.current) setError(errorMessage(cause)); }
+    if (generation === sessionGenerationRef.current) setSessionState('anonymous');
+  }} />;
 }
 
 function WorkbenchShell({ member, snapshot, route, error, refresh, onLogout }: { member: Member; snapshot: Snapshot; route: Route; error: string; refresh: () => Promise<void>; onLogout: () => Promise<void> }) {
@@ -97,7 +160,7 @@ function WorkbenchShell({ member, snapshot, route, error, refresh, onLogout }: {
           : selectedView === 'master' && project ? <ConversationPage title="Master" messages={snapshot.messages.filter(message => message.projectId === project.id && !message.workId)} project={project} snapshot={snapshot} refresh={refresh} setError={setLocalError} initialDraft={new URL(window.location.href).searchParams.get('draft') ?? ''} />
             : selectedView === 'work' && project ? <WorkList project={project} works={workForProject} />
               : selectedView === 'work-detail' && project ? currentWork ? <WorkDetail work={currentWork} project={project} snapshot={snapshot} refresh={refresh} setError={setLocalError} /> : <EmptyState title="Work not found" detail="Choose a Work from the project list." action={<a href={href('work', project.id)}>Open Work</a>} />
-                : selectedView === 'instructions' && project ? <Instructions project={project} member={member} refresh={refresh} setError={setLocalError} />
+                : selectedView === 'instructions' && project ? <Instructions key={project.id} project={project} member={member} refresh={refresh} setError={setLocalError} />
                   : selectedView === 'members' && project ? <Members project={project} snapshot={snapshot} refresh={refresh} setError={setLocalError} />
                     : selectedView === 'skills' || selectedView === 'connections' || selectedView === 'agent-profiles' || selectedView === 'model-providers' ? ['agent-profiles', 'model-providers'].includes(selectedView) && member.role === 'member' ? <EmptyState title="Workspace administrator access required" detail="Workspace-wide Agent profiles and runtime status are visible to workspace administrators." /> : <SettingsPage view={selectedView} project={project} member={member} snapshot={snapshot} refresh={refresh} setError={setLocalError} />
                       : <EmptyState title="Choose a Work" detail="Work details include the current overview, changes, QA, and the ongoing participant conversation." />;
@@ -128,7 +191,7 @@ function WorkbenchShell({ member, snapshot, route, error, refresh, onLogout }: {
         <Button variant="ghost" size="icon-sm" className="md:hidden" aria-label="Open navigation" onClick={() => setMobileNav(!mobileNav)}>☰</Button>
         <Breadcrumb route={route} project={project} work={currentWork} />
       </header>
-      {report && <div role="alert" className="flex items-center justify-between gap-3 border-b border-destructive/30 bg-destructive/5 px-5 py-2.5 text-sm text-destructive"><span>{report}</span><Button variant="ghost" size="sm" onClick={() => void refresh().catch(cause => setLocalError(errorMessage(cause)))}>Retry</Button></div>}
+      {report && <div role="alert" className="flex items-center justify-between gap-3 border-b border-destructive/30 bg-destructive/5 px-5 py-2.5 text-sm text-destructive"><span>{report}</span><Button variant="ghost" size="sm" onClick={() => { setLocalError(''); void refresh().catch(() => undefined); }}>Retry</Button></div>}
       <div className="min-w-0 flex-1 p-4 md:p-8">{content}</div>
     </main>
   </div>;
@@ -157,9 +220,9 @@ function Login({ onSubmit, error }: { onSubmit: (email: string, password: string
   </form></main>;
 }
 
-function InviteAccept({ token, onAccepted }: { token: string; onAccepted: (email: string, password: string) => Promise<void> }) {
-  const [name, setName] = useState(''); const [password, setPassword] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
-  return <main className="grid min-h-screen place-items-center bg-muted/50 p-4"><form className="grid w-full max-w-sm gap-5 rounded-xl border bg-background p-6 shadow-sm" onSubmit={async event => { event.preventDefault(); setBusy(true); setError(''); try { const accepted = await workbenchApi.acceptInvite({ token, name, password }); await onAccepted(accepted.email, password); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); } }}>
+function InviteAccept({ token, onSubmit, error }: { token: string; onSubmit: (token: string, name: string, password: string) => Promise<void>; error: string }) {
+  const [name, setName] = useState(''); const [password, setPassword] = useState(''); const [busy, setBusy] = useState(false);
+  return <main className="grid min-h-screen place-items-center bg-muted/50 p-4"><form className="grid w-full max-w-sm gap-5 rounded-xl border bg-background p-6 shadow-sm" onSubmit={async event => { event.preventDefault(); setBusy(true); try { await onSubmit(token, name, password); } finally { setBusy(false); } }}>
     <header><h1 className="text-xl font-semibold">Join Menoteam</h1><p className="mt-1 text-sm text-muted-foreground">Set up your account to accept this invitation.</p></header>
     <div className="grid gap-2"><Label htmlFor="invite-name">Name</Label><Input id="invite-name" autoComplete="name" required value={name} onChange={event => setName(event.target.value)} /></div>
     <div className="grid gap-2"><Label htmlFor="invite-password">Password</Label><Input id="invite-password" autoComplete="new-password" type="password" minLength={12} required value={password} onChange={event => setPassword(event.target.value)} /></div>
@@ -167,7 +230,7 @@ function InviteAccept({ token, onAccepted }: { token: string; onAccepted: (email
   </form></main>;
 }
 
-function CenteredState({ title, detail, action }: { title: string; detail: string; action?: React.ReactNode }) { return <main className="grid min-h-screen place-items-center p-6"><div className="grid max-w-md justify-items-center gap-3 text-center"><span className="grid size-9 place-items-center rounded-lg bg-accent font-semibold text-accent-foreground">M</span><h1 className="text-lg font-semibold">{title}</h1><p className="text-sm text-muted-foreground">{detail}</p>{action}</div></main>; }
+function CenteredState({ title, detail, action }: { title: string; detail: React.ReactNode; action?: React.ReactNode }) { return <main className="grid min-h-screen place-items-center p-6"><div className="grid max-w-md justify-items-center gap-3 text-center"><span className="grid size-9 place-items-center rounded-lg bg-accent font-semibold text-accent-foreground">M</span><h1 className="text-lg font-semibold">{title}</h1><p className="text-sm text-muted-foreground">{detail}</p>{action}</div></main>; }
 function EmptyState({ title, detail, action }: { title: string; detail: string; action?: React.ReactNode }) { return <section className="grid min-h-64 content-center justify-items-center gap-3 rounded-xl border border-dashed p-8 text-center"><h1 className="text-lg font-semibold">{title}</h1><p className="max-w-md text-sm text-muted-foreground">{detail}</p>{action}</section>; }
 
 function AllProjects({ snapshot, member, setError, refresh }: { snapshot: Snapshot; member: Member; setError: (value: string) => void; refresh: () => Promise<void> }) {
@@ -376,8 +439,9 @@ function useProjectAdmin(projectId: string, member: Member, projectRole?: Member
 
 function Instructions({ project, member, refresh, setError }: { project: Project; member: Member; refresh: () => Promise<void>; setError: (value: string) => void }) {
   const canEdit = useProjectAdmin(project.id, member, undefined);
-  const [draft, setDraft] = useState(project.instructions); const [busy, setBusy] = useState(false); const [editing, setEditing] = useState(false);
-  useEffect(() => setDraft(project.instructions), [project.id, project.instructions]);
+  const [draftState, setDraftState] = useState(() => startInstructionsDraft(project.instructions)); const { draft, base: baseInstructions } = draftState; const [busy, setBusy] = useState(false); const [editing, setEditing] = useState(false);
+  const draftRef = useRef(draft);
+  const hasRemoteUpdate = editing && hasRemoteInstructionsUpdate(draftState, project.instructions);
   const suggestions = [
     ['Project context', 'Describe who this project serves and what matters most to them.'],
     ['Working style', 'Prefer small, focused changes. Follow the existing project conventions.'],
@@ -392,8 +456,8 @@ function Instructions({ project, member, refresh, setError }: { project: Project
     ['Sensitive information', 'Keep credentials and private data out of messages, logs, and source control.'],
     ['Definition of done', 'Summarize what changed and how it was checked before closing the work.'],
   ];
-  const save = async () => { setBusy(true); setError(''); try { await workbenchApi.updateProject(project.id, { instructions: draft }); await refresh(); setEditing(false); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); } };
-  return <section className="w-full"><ProjectSettingsNav project={project} active="instructions"/><header className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-2xl font-semibold">Instructions</h1><p className="mt-1 text-sm text-muted-foreground">Project context that Master and Agents can use.</p></div>{editing ? <div className="flex gap-2"><Button variant="outline" disabled={busy} onClick={() => { setDraft(project.instructions); setEditing(false); }}>Cancel</Button><Button disabled={busy || draft === project.instructions} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</Button></div> : canEdit && <Button variant="outline" onClick={() => { setDraft(project.instructions); setEditing(true); }}>Edit</Button>}</header>{editing && canEdit ? <><Textarea className="min-h-[40vh] resize-y" value={draft} onChange={event => setDraft(event.target.value)} placeholder="Add project context, working preferences, or quality expectations…" /><div className="mt-4 flex flex-wrap items-center gap-2"><span className="mr-1 text-sm text-muted-foreground">Optional starting points</span>{suggestions.map(([label, text]) => <Button key={label} type="button" variant="outline" size="sm" onClick={() => setDraft(current => `${current}${current && !current.endsWith('\n') ? '\n\n' : ''}${text}`)}>{label} ＋</Button>)}</div></> : <p className="min-h-32 whitespace-pre-wrap rounded-lg border bg-muted/20 p-4 text-sm leading-relaxed">{project.instructions || 'No project instructions yet.'}</p>}</section>;
+  const save = async () => { const submittedDraft = draft; setBusy(true); setError(''); try { await workbenchApi.updateProject(project.id, { instructions: submittedDraft, expectedInstructions: baseInstructions }); await refresh(); const completion = completeInstructionsSave({ draft: draftRef.current, base: baseInstructions }, submittedDraft); setDraftState(completion.state); if (completion.closeEditor) setEditing(false); } catch (cause) { if (cause instanceof ApiError && cause.status === 409) await refresh().catch(() => undefined); setError(errorMessage(cause)); } finally { setBusy(false); } };
+  return <section className="w-full"><ProjectSettingsNav project={project} active="instructions"/><header className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-2xl font-semibold">Instructions</h1><p className="mt-1 text-sm text-muted-foreground">Project context that Master and Agents can use.</p></div>{editing ? <div className="flex gap-2"><Button variant="outline" disabled={busy} onClick={() => { const next = cancelInstructionsDraft(project.instructions); draftRef.current = next.draft; setDraftState(next); setEditing(false); }}>Cancel</Button><Button disabled={busy || draft === baseInstructions} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</Button></div> : canEdit && <Button variant="outline" onClick={() => { const next = startInstructionsDraft(project.instructions); draftRef.current = next.draft; setDraftState(next); setEditing(true); }}>Edit</Button>}</header>{hasRemoteUpdate && <div role="status" className="mb-4 grid gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm"><p><strong>Instructions changed elsewhere.</strong> Your draft is preserved. The latest saved version is shown below.</p><pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 font-sans">{project.instructions || 'No project instructions yet.'}</pre><div className="flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { const next = useLatestInstructions(project.instructions); draftRef.current = next.draft; setDraftState(next); }}>Use latest version</Button><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { const next = keepInstructionsDraft({ draft: draftRef.current, base: baseInstructions }, project.instructions); draftRef.current = next.draft; setDraftState(next); }}>Keep editing my draft</Button></div></div>}{editing && canEdit ? <><Textarea className="min-h-[40vh] resize-y" value={draft} onChange={event => { draftRef.current = event.target.value; setDraftState(current => editInstructionsDraft(current, event.target.value)); }} placeholder="Add project context, working preferences, or quality expectations…" /><div className="mt-4 flex flex-wrap items-center gap-2"><span className="mr-1 text-sm text-muted-foreground">Optional starting points</span>{suggestions.map(([label, text]) => <Button key={label} type="button" variant="outline" size="sm" onClick={() => { const nextDraft = `${draftRef.current}${draftRef.current && !draftRef.current.endsWith('\n') ? '\n\n' : ''}${text}`; draftRef.current = nextDraft; setDraftState(current => editInstructionsDraft(current, nextDraft)); }}>{label} ＋</Button>)}</div></> : <p className="min-h-32 whitespace-pre-wrap rounded-lg border bg-muted/20 p-4 text-sm leading-relaxed">{project.instructions || 'No project instructions yet.'}</p>}</section>;
 }
 
 function Members({ project, snapshot, refresh, setError }: { project: Project; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {

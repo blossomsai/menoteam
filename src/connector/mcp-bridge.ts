@@ -35,9 +35,9 @@ tool('create_work', 'Create a Work in this project.', z.object({ title: text, ov
 tool('update_work', 'Update a Work overview or status using its current revision.', z.object({ workId, revision: z.number().int().min(1), overview: z.string().max(32_000).optional(), status: z.enum(['queued','in_progress','paused','done']).optional() }).strict(), 'update_work');
 tool('dispatch', 'Assign an implementation or review run for a Work.', z.object({ workId, prompt: z.string().min(1).max(12_000), kind: z.enum(['implementation','review']), model: z.enum(['gpt-6-luna','gpt-6.1-sol']), reasoning: z.enum(['low','medium','high','xhigh']).default('medium') }).strict(), 'dispatch');
 tool('post_message', 'Post a message to a Work conversation.', z.object({ workId: workId.optional(), text }).strict(), 'post_message');
-tool('update_settings', 'Update project instructions, or rename/change a setting after reading its current updatedAt. Setting changes require settingId and expectedUpdatedAt, plus name and/or data; workspace-wide settings require an owner or admin.', z.union([
+tool('update_settings', 'Update project instructions using the current expectedInstructions value, or rename/change a setting after reading its current updatedAt. Setting changes require settingId and expectedUpdatedAt, plus name and/or data; workspace-wide settings require an owner or admin.', z.union([
   z.object({ settingId: workId, expectedUpdatedAt: z.string().min(1), name: text.optional(), data: z.record(z.string(), z.unknown()).optional() }).strict().refine(input => input.name !== undefined || input.data !== undefined, 'Provide a setting name or data change.'),
-  z.object({ instructions: z.string().max(16_000) }).strict(),
+  z.object({ instructions: z.string().max(16_000), expectedInstructions: z.string().max(16_000) }).strict(),
 ]), 'update_settings');
 tool('create_skill', 'Add a skill to this project.', z.object({ name: text, data: z.record(z.string(), z.unknown()) }).strict(), 'create_skill');
 

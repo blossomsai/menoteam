@@ -78,6 +78,30 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const snapshot = await user("GET", "/snapshot");
         expect(snapshot.json().messages).toHaveLength(1);
     });
+    it("rejects stale Project Instructions saves at the persistence boundary without losing either version", async () => {
+        const initial = (await user("GET", "/snapshot")).json().projects.find((project: { id: string }) => project.id === projectId).instructions;
+        expect((await user("PATCH", `/projects/${projectId}`, { instructions: "Remote version", expectedInstructions: initial })).statusCode).toBe(200);
+        const stale = await user("PATCH", `/projects/${projectId}`, { instructions: "Local stale draft", expectedInstructions: initial });
+        expect(stale.statusCode).toBe(409);
+        expect(stale.json().message).toContain("changed remotely");
+        const current = (await user("GET", "/snapshot")).json().projects.find((project: { id: string }) => project.id === projectId);
+        expect(current.instructions).toBe("Remote version");
+        expect((await user("PATCH", `/projects/${projectId}`, { instructions: "Missing precondition" })).statusCode).toBe(400);
+    });
+    it("serializes overlapping Project Instructions saves and rejects the stale writer", async () => {
+        const project = (await user("POST", "/projects", { name: "Concurrent instructions" })).json();
+        const initial = project.instructions;
+        const [first, second] = await Promise.all([
+            user("PATCH", `/projects/${project.id}`, { instructions: "Concurrent writer A", expectedInstructions: initial }),
+            user("PATCH", `/projects/${project.id}`, { instructions: "Concurrent writer B", expectedInstructions: initial })
+        ]);
+        expect([first.statusCode, second.statusCode].sort()).toEqual([200, 409]);
+        const persisted = (await user("GET", "/snapshot")).json().projects.find((item: { id: string }) => item.id === project.id).instructions;
+        const accepted = first.statusCode === 200 ? "Concurrent writer A" : "Concurrent writer B";
+        const rejected = first.statusCode === 409 ? "Concurrent writer A" : "Concurrent writer B";
+        expect(persisted).toBe(accepted);
+        expect(persisted).not.toBe(rejected);
+    });
     it("claims once, fences stale events, deduplicates, records artifacts and completes", async () => {
         const c = await user("POST", "/connectors", {
             id: "test-connector",
@@ -500,6 +524,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
         const run=(await send('/claim',{})).json().run;
         const tool=(r:any,input:unknown,requestId:string)=>send(`/runs/${r.id}/tools`,{generation:r.generation,action:'update_settings',input,requestId});
+        const masterInstructions=await tool(run,{instructions:'Master version',expectedInstructions:p.instructions},'master-instructions-first');
+        expect(masterInstructions.statusCode).toBe(200);
+        expect((await user('PATCH',`/projects/${p.id}`,{instructions:'UI version',expectedInstructions:'Master version'})).statusCode).toBe(200);
+        expect((await tool(run,{instructions:'Stale Master version',expectedInstructions:p.instructions},'master-instructions-stale')).statusCode).toBe(409);
+        expect((await user('GET','/snapshot')).json().projects.find((project:any)=>project.id===p.id).instructions).toBe('UI version');
         const context=(await send(`/runs/${run.id}/tools`,{generation:run.generation,action:'read_context',input:{},requestId:'settings-read'})).json();
         expect(context.settings.some((s:any)=>s.id===skill.id)).toBe(true);
         const updated=(await tool(run,{settingId:skill.id,expectedUpdatedAt:skill.updatedAt,data:{content:'Updated by Master'}},'settings-update')).json();
