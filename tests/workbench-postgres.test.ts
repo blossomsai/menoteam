@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { digest } from '../src/workbench/auth.js';
 import { rateLimitKey } from '../src/workbench/rate-limit.js';
 import type { FastifyRequest } from 'fastify';
@@ -7,6 +7,7 @@ import { createHmac } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
 import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
+import type { Artifact, Project, Run, Work } from "../src/workbench/types.js";
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
 describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     let sql: ReturnType<typeof postgres>;
@@ -43,6 +44,15 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(r.statusCode).toBe(200);
         cookie = String(r.headers["set-cookie"]).split(";")[0]!;
     });
+    beforeEach(async () => {
+        // Keep durable fixtures/session continuity, but isolate each test's real rate-limit bucket.
+        await app.close();
+        app = await createWorkbenchApp({sql, sourceFetcher: (...args) => sourceFetch(...args)});
+    });
+    const checkedJson = (response: {statusCode: number; body: string; json(): any}, status = 200) => {
+        expect(response.statusCode, response.statusCode === status ? undefined : response.statusCode >= 400 ? response.body : "Unexpected success response; credential-bearing body withheld").toBe(status);
+        return response.json();
+    };
     afterAll(async () => {
         await app?.close();
         await sql?.end();
@@ -570,6 +580,107 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await send('/claim',{capabilities:{runKinds:['implementation']}})).statusCode).toBe(204);
         expect((await send('/claim',{capabilities:{runKinds:['master']}})).json().run.kind).toBe('master');
     });
+    it('strictly queues one authorized delivery Run for the exact candidate and fences retry generations',async()=>{
+        const p=checkedJson((await user('POST','/projects',{name:'Draft PR idempotency',repositoryUrl:'https://github.com/example/draft-pr'}))) as Project;
+        const work=checkedJson((await user('POST',`/projects/${p.id}/works`,{title:'Create a bounded draft'}))) as Work;
+        const connector=checkedJson((await user('POST','/connectors',{id:'draft-pr-connector',projectIds:[p.id]})));
+        const connRequest=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${connector.token}`},payload:payload as never});
+        expect((await connRequest('/claim',{capabilities:{git:true,githubWrite:true,deliveryActions:['create_draft_pr']}})).statusCode).toBe(204);
+        const connection=await user('POST','/settings',{projectId:p.id,kind:'connection',name:'Draft PR delivery',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',baseBranch:'main',allowDraftPr:true}});
+        expect(connection.statusCode).toBe(200);
+        const sourceConnection=await user('POST','/settings',{projectId:p.id,kind:'connection',name:'GitHub source',data:{provider:'github',url:p.repositoryUrl}});
+        expect(sourceConnection.statusCode).toBe(200);
+        const invite=checkedJson((await user('POST','/invites',{email:'draft-pr-member@test.example',projectId:p.id,role:'member'})));
+        const accepted=await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invite.token,name:'Draft PR member',password:'draft-pr-password'}});
+        checkedJson(accepted);const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:'draft-pr-member@test.example',password:'draft-pr-password'}});checkedJson(login);const memberCookie=String(login.headers['set-cookie']).split(';')[0]!;
+        const memberReq=(method:'GET'|'POST'|'PATCH',path:string,payload?:unknown)=>app.inject({method,url:'/api/workbench'+path,headers:{cookie:memberCookie},payload:payload as never});
+        const member=checkedJson((await memberReq('GET','/me')));const candidateId=crypto.randomUUID();const commitSha='a'.repeat(40);const baseRevision='b'.repeat(40);const revision=createHash('sha256').update(baseRevision).update('\0').update(commitSha).digest('hex');const fingerprint='c'.repeat(64);
+        const candidate:Run={id:candidateId,projectId:p.id,workId:work.id,prompt:'Implement bounded change',requestedBy:member.id,kind:'implementation',model:'gpt-6-luna',reasoning:'medium',status:'completed',connectorId:'draft-pr-connector',generation:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+        const diff:Artifact={id:`artifact:${candidateId}:diff`,projectId:p.id,workId:work.id,runId:candidateId,kind:'diff',revision,data:{source:'git',candidateRevision:commitSha,baseRevision,files:[{path:'src/example.ts'}]},createdAt:new Date().toISOString()};
+        const qa:Artifact={id:`artifact:${candidateId}:qa`,projectId:p.id,workId:work.id,runId:candidateId,kind:'qa',revision,data:{candidateFingerprint:fingerprint,checks:[{name:'focused',exitCode:1}],stale:false},createdAt:new Date().toISOString()};
+        await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${candidate.id},'run',${p.id},${sql.json(candidate as never)}),(${diff.id},'artifact',${p.id},${sql.json(diff as never)}),(${qa.id},'artifact',${p.id},${sql.json(qa as never)})`;
+        await user('POST',`/projects/${p.id}/messages`,{text:'Request an exact-candidate draft PR',requestId:'draft-pr-master-message'});
+        const masterClaim=await connRequest('/claim',{capabilities:{runKinds:['master'],git:true,githubWrite:true,deliveryActions:['create_draft_pr']}});expect(masterClaim.statusCode).toBe(200);const master=checkedJson(masterClaim).run as Run;
+        const bridge=checkedJson((await connRequest(`/runs/${master.id}/bridge-token`,{generation:master.generation}))).token;
+        const masterSettings=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'update_settings',input:{settingId:checkedJson(sourceConnection).id,expectedUpdatedAt:checkedJson(sourceConnection).updatedAt,data:{purpose:'delivery',allowDraftPr:true,baseBranch:'release'}},requestId:'master-cannot-expand-delivery-policy'} as never});expect(masterSettings.statusCode).toBe(403);
+        const masterTool=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'request_delivery',input:{workId:work.id,candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'delivery-from-master'},requestId:'master-tool-delivery'} as never});
+        expect(masterTool.statusCode).toBe(200);
+        expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'request_delivery',input:{workId:work.id,candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'delivery-from-master',targetId:'forbidden'},requestId:'master-tool-extra'} as never})).statusCode).toBe(400);
+        const other=checkedJson((await user('POST','/projects',{name:'Other candidate scope'}))) as Project;const otherWork=checkedJson((await user('POST',`/projects/${other.id}/works`,{title:'Other project candidate'}))) as Work;
+        const crossMaster=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'request_delivery',input:{workId:otherWork.id,candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'master-cross-project'},requestId:'master-cross-project'} as never});expect(crossMaster.statusCode).toBe(403);
+        await connRequest(`/runs/${master.id}/complete`,{generation:master.generation,threadId:'draft-pr-master-thread'});
+        const request=(requestId:string,input:Record<string,unknown>={candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId})=>memberReq('POST',`/works/${work.id}/delivery`,input);
+        expect((await request('strict-extra',{candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'strict-extra',targetConnectorId:'forged'})).statusCode).toBe(400);
+        expect((await request('forged-revision',{candidateRunId:candidateId,candidateRevision:'f'.repeat(64),action:'create_draft_pr',requestId:'forged-revision'})).statusCode).toBe(409);
+        const [first,concurrent]=await Promise.all([request('delivery-first'),request('delivery-concurrent')]);
+        expect(first.statusCode).toBe(200);expect(concurrent.statusCode).toBe(200);expect(checkedJson(concurrent).run.id).toBe(checkedJson(first).run.id);
+        expect(checkedJson(first).run.id).toBe(checkedJson(masterTool).run.id);
+        expect(checkedJson((await request('delivery-first'))).run.id).toBe(checkedJson(first).run.id);
+        const count=await sql`SELECT count(*)::int AS count FROM wb_records WHERE kind='run' AND data->>'kind'='delivery' AND data->>'workId'=${work.id}`;
+        expect(count[0]!.count).toBe(1);
+        const queued=checkedJson(first).run as Run;
+        const owner=checkedJson(await user('GET','/me'));
+        expect(queued.requestedBy).toBe(owner.id);expect(queued.operation?.actorId).toBe(owner.id);
+        const persistedDelivery = async (runId:string) => (await sql`SELECT data FROM wb_records WHERE id=${runId} AND kind='run'`)[0]!.data as Run;
+        expect(await persistedDelivery(queued.id)).toMatchObject({requestedBy:owner.id,operation:{actorId:owner.id}});
+        const secondId=crypto.randomUUID();const secondSha='d'.repeat(40);const secondBase='e'.repeat(40);const secondRevision=createHash('sha256').update(secondBase).update('\0').update(secondSha).digest('hex');const second:Run={...candidate,id:secondId};const secondDiff:Artifact={...diff,id:`artifact:${secondId}:diff`,runId:secondId,revision:secondRevision,data:{source:'git',candidateRevision:secondSha,baseRevision:secondBase,files:[{path:'src/second.ts'}]}};const secondQa:Artifact={...qa,id:`artifact:${secondId}:qa`,runId:secondId,revision:secondRevision,data:{candidateFingerprint:'d'.repeat(64),checks:[],stale:false}};await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${second.id},'run',${p.id},${sql.json(second as never)}),(${secondDiff.id},'artifact',${p.id},${sql.json(secondDiff as never)}),(${secondQa.id},'artifact',${p.id},${sql.json(secondQa as never)})`;
+        const queuedSecond=await request('delivery-second',{candidateRunId:secondId,candidateRevision:secondRevision,action:'create_draft_pr',requestId:'delivery-second'});expect(queuedSecond.statusCode).toBe(200);expect(checkedJson(queuedSecond).run.id).not.toBe(queued.id);
+        const secondQueued=checkedJson(queuedSecond).run as Run;
+        expect(await persistedDelivery(secondQueued.id)).toMatchObject({requestedBy:member.id,operation:{actorId:member.id}});
+        const ownerDedup=checkedJson(await user('POST',`/works/${work.id}/delivery`,{candidateRunId:secondId,candidateRevision:secondRevision,action:'create_draft_pr',requestId:'owner-dedups-member-delivery'}));
+        expect(ownerDedup.run.id).toBe(secondQueued.id);
+        expect(await persistedDelivery(secondQueued.id)).toMatchObject({requestedBy:member.id,operation:{actorId:member.id}});
+        const firstClaim=await connRequest('/claim',{capabilities:{runKinds:['delivery'],git:true,githubWrite:true,deliveryActions:['create_draft_pr']}});expect(firstClaim.statusCode).toBe(200);const claimed=checkedJson(firstClaim).run as Run;expect(claimed.id).toBe(queued.id);expect(claimed.generation).toBe(queued.generation+1);
+        const authorizePath=`/runs/${claimed.id}/delivery-authorize`;
+        expect((await connRequest(authorizePath,{generation:claimed.generation})).statusCode).toBe(200);
+        const changedPolicy=await user('PATCH',`/settings/${checkedJson(connection).id}`,{expectedUpdatedAt:checkedJson(connection).updatedAt,data:{purpose:'source'}});expect(changedPolicy.statusCode).toBe(200);
+        expect((await connRequest(authorizePath,{generation:claimed.generation})).statusCode).toBe(403);
+        const restorePolicy=await user('PATCH',`/settings/${checkedJson(connection).id}`,{expectedUpdatedAt:checkedJson(changedPolicy).updatedAt,data:{purpose:'delivery'}});expect(restorePolicy.statusCode).toBe(200);
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{repositoryUrl}','"https://github.com/example/changed"'::jsonb) WHERE id=${p.id}`;
+        expect((await connRequest(authorizePath,{generation:claimed.generation})).statusCode).toBe(409);
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{repositoryUrl}',${sql.json(p.repositoryUrl as never)}) WHERE id=${p.id}`;
+        await sql`DELETE FROM wb_memberships WHERE project_id=${p.id} AND user_id=${member.id}`;
+        // The implementation author is not the immutable OWNER delivery actor.
+        expect(checkedJson(await connRequest(authorizePath,{generation:claimed.generation}))).toMatchObject({authorized:true});
+        expect(await persistedDelivery(claimed.id)).toMatchObject({requestedBy:owner.id,operation:{actorId:owner.id}});
+        await sql`INSERT INTO wb_memberships(project_id,user_id,role) VALUES (${p.id},${member.id},'member')`;
+        for(const status of ['interrupted','cancelled']){
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}',${sql.json(status as never)})-'stoppedAt' WHERE id=${queued.id}`;
+            expect((await request(`retry-before-stopped-proof-${status}`)).statusCode).toBe(409);
+        }
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{stoppedAt}',to_jsonb(now()::text)) WHERE id=${queued.id}`;
+        const changedBase=await user('PATCH',`/settings/${checkedJson(connection).id}`,{expectedUpdatedAt:checkedJson(restorePolicy).updatedAt,data:{baseBranch:'release'}});expect(changedBase.statusCode).toBe(200);
+        expect((await request('retry-after-base-branch-change')).statusCode).toBe(409);
+        const restoredBase=await user('PATCH',`/settings/${checkedJson(connection).id}`,{expectedUpdatedAt:checkedJson(changedBase).updatedAt,data:{baseBranch:'main'}});expect(restoredBase.statusCode).toBe(200);
+        const retry=checkedJson((await request('delivery-retry'))).run as Run;
+        expect(retry.id).toBe(queued.id);expect(retry.status).toBe('queued');expect(retry.generation).toBe(claimed.generation+1);expect(retry.operation?.phase).toBe('queued');
+        expect((await connRequest(`/runs/${queued.id}/delivery-progress`,{generation:queued.generation,phase:'published',remoteHeadSha:commitSha})).statusCode).toBe(409);
+        const retryClaim=await connRequest('/claim',{capabilities:{runKinds:['delivery'],git:true,githubWrite:true,deliveryActions:['create_draft_pr']}});expect(retryClaim.statusCode).toBe(200);expect(checkedJson(retryClaim).run.id).toBe(queued.id);expect(checkedJson(retryClaim).run.generation).toBe(retry.generation+1);
+        expect((await connRequest(`/runs/${queued.id}/delivery-progress`,{generation:claimed.generation,phase:'published',remoteHeadSha:commitSha})).statusCode).toBe(409);
+        expect((await connRequest('/claim',{capabilities:{runKinds:['delivery'],git:true,githubWrite:true,deliveryActions:['create_draft_pr']}})).statusCode).toBe(204);
+        const active=checkedJson(retryClaim).run as Run;expect((await connRequest(`/runs/${active.id}/complete`,{generation:active.generation})).statusCode).toBe(200);
+        const next=await connRequest('/claim',{capabilities:{runKinds:['delivery'],git:true,githubWrite:true,deliveryActions:['create_draft_pr']}});expect(next.statusCode).toBe(200);expect(checkedJson(next).run.id).toBe(checkedJson(queuedSecond).run.id);
+        const memberDelivery=checkedJson(next).run as Run;
+        expect(memberDelivery.requestedBy).toBe(member.id);expect(memberDelivery.operation?.actorId).toBe(member.id);
+        const memberAuthorize=`/runs/${memberDelivery.id}/delivery-authorize`;
+        const assertMemberEffect = async (status:number) => checkedJson(await connRequest(memberAuthorize,{generation:memberDelivery.generation}),status);
+        expect(await assertMemberEffect(200)).toMatchObject({authorized:true});
+        // Reauthorize before each subsequent effect, including reconciliation after publication.
+        for(const phase of ['queued','published','pr_created']){
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{operation,phase}',${sql.json(phase as never)}) WHERE id=${memberDelivery.id}`;
+            await sql`DELETE FROM wb_memberships WHERE project_id=${p.id} AND user_id=${member.id}`;
+            await assertMemberEffect(403);
+            expect((await request(`revoked-actor-retry-${phase}`,{candidateRunId:secondId,candidateRevision:secondRevision,action:'create_draft_pr',requestId:`revoked-actor-retry-${phase}`})).statusCode).toBe(403);
+            expect(await persistedDelivery(memberDelivery.id)).toMatchObject({requestedBy:member.id,generation:memberDelivery.generation,operation:{actorId:member.id,phase}});
+            await sql`INSERT INTO wb_memberships(project_id,user_id,role) VALUES (${p.id},${member.id},'member')`;
+            expect(await assertMemberEffect(200)).toMatchObject({authorized:true});
+        }
+        expect((await connRequest(`/runs/${memberDelivery.id}/complete`,{generation:memberDelivery.generation})).statusCode).toBe(200);
+        expect((await user('DELETE',`/projects/${p.id}/members/${member.id}`)).statusCode).toBe(200);
+        expect((await request('delivery-after-revocation')).statusCode).toBe(403);
+        const cross=(await memberReq('POST',`/works/${otherWork.id}/delivery`,{candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'cross-project'}));
+        expect(cross.statusCode).toBe(403);
+    });
     it('reviewer bridge reads exact candidate evidence and denies wider reads or mutations',async()=>{
         const p=(await user('POST','/projects',{name:'Scoped review proof'})).json();
         const work=(await user('POST',`/projects/${p.id}/works`,{title:'Review candidate'})).json();
@@ -603,27 +714,27 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await send('/claim',{},bridge)).statusCode).toBe(401);
     });
     it('Master partial Work updates preserve omitted overview/status and allow explicit clearing',async()=>{
-        const p=(await user('POST','/projects',{name:'Partial Work update proof'})).json();
-        const work=(await user('POST',`/projects/${p.id}/works`,{title:'Preserve definition',overview:'Original task definition',sources:['source:original']})).json();
+        const p=checkedJson((await user('POST','/projects',{name:'Partial Work update proof'})));
+        const work=checkedJson((await user('POST',`/projects/${p.id}/works`,{title:'Preserve definition',overview:'Original task definition',sources:['source:original']})));
         await user('POST',`/projects/${p.id}/messages`,{text:'Update only current progress',requestId:'partial-work-master'});
-        const credential=(await user('POST','/connectors',{id:'partial-work-connector',projectIds:[p.id]})).json().token;
+        const credential=checkedJson((await user('POST','/connectors',{id:'partial-work-connector',projectIds:[p.id]}))).token;
         const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
-        const run=(await send('/claim',{})).json().run;
+        const run=checkedJson((await send('/claim',{}))).run;
         const tool=(input:unknown)=>send(`/runs/${run.id}/tools`,{generation:run.generation,action:'update_work',input,requestId:crypto.randomUUID()});
         const progress=await tool({workId:work.id,revision:work.revision,status:'in_progress'});
         expect(progress.statusCode).toBe(200);
-        expect(progress.json().overview).toBe('Original task definition');
-        expect(progress.json().sources).toEqual(['source:original']);
-        expect((await user('GET',`/works/${work.id}`)).json().work.overview).toBe('Original task definition');
-        const definition=await tool({workId:work.id,revision:progress.json().revision,overview:'Updated task definition'});
+        expect(checkedJson(progress).overview).toBe('Original task definition');
+        expect(checkedJson(progress).sources).toEqual(['source:original']);
+        expect(checkedJson((await user('GET',`/works/${work.id}`))).work.overview).toBe('Original task definition');
+        const definition=await tool({workId:work.id,revision:checkedJson(progress).revision,overview:'Updated task definition'});
         expect(definition.statusCode).toBe(200);
-        expect(definition.json().status).toBe('in_progress');
-        const browser=await user('PATCH',`/works/${work.id}`,{revision:definition.json().revision,status:'paused'});
-        expect(browser.json().overview).toBe('Updated task definition');
-        const cleared=await tool({workId:work.id,revision:browser.json().revision,overview:''});
-        expect(cleared.json().overview).toBe('');
-        expect(cleared.json().status).toBe('paused');
-        const persisted=(await user('GET',`/works/${work.id}`)).json().work;
+        expect(checkedJson(definition).status).toBe('in_progress');
+        const browser=await user('PATCH',`/works/${work.id}`,{revision:checkedJson(definition).revision,status:'paused'});
+        expect(checkedJson(browser).overview).toBe('Updated task definition');
+        const cleared=await tool({workId:work.id,revision:checkedJson(browser).revision,overview:''});
+        expect(checkedJson(cleared).overview).toBe('');
+        expect(checkedJson(cleared).status).toBe('paused');
+        const persisted=checkedJson((await user('GET',`/works/${work.id}`))).work;
         expect(persisted.overview).toBe('');
         expect(persisted.status).toBe('paused');
         expect(persisted.sources).toEqual(['source:original']);

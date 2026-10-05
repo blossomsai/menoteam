@@ -1,21 +1,26 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, unlink, rename } from 'node:fs/promises';
 import path from 'node:path';
-import { CodexAppServer, terminateVerifiedProcessGroup, waitProcessGroup, type CodexProcessIdentity } from './codex.js';
+import { CodexAppServer, readGitProcessIdentity, terminateVerifiedGitProcessGroup, terminateVerifiedProcessGroup, waitProcessGroup, type CodexProcessIdentity, type GitProcessIdentity } from './codex.js';
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
 import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
+import { createDraftPullRequest } from './github-draft-pr.js';
 import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
 
+const activeDeliveryExecutors=new Set<string>();
 interface Spool {
   runId: string;
   generation: number;
   events: ConnectorEvent[];
   artifacts: UploadArtifact[];
+  deliveryProgress?: {phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string};
   threadId?: string;
   completion?: {threadId?:string;error?:string};
   stopped?: boolean;
   processIdentity?:CodexProcessIdentity;
+  deliveryProcessIdentity?:GitProcessIdentity;
+  deliveryExecutor?:{pid:number;executionId:string;stage:'git'|'http'|'completion'};
 }
 const delay = (ms:number) => new Promise(resolve => setTimeout(resolve,ms));
 export function buildRunPrompt(claim: ClaimedRun): string {
@@ -35,6 +40,7 @@ export class ConnectorRunner {
   constructor(private readonly config: ConnectorConfig, private readonly dependencies?: {
     native: () => CodexAppServer;
     client: (models:string[]) => WorkbenchConnectorClient;
+    delivery?:{fetcher?:typeof fetch;transport?:Parameters<typeof createDraftPullRequest>[5]};
   }) {}
   private native():CodexAppServer { return this.dependencies?.native() ?? new CodexAppServer(this.config.codexBinary); }
 
@@ -56,7 +62,7 @@ export class ConnectorRunner {
         await this.recover();
         if (this.tasks.size >= 2) { await Promise.race(this.tasks); continue; }
         const kinds=[...this.activeKinds.values()];
-        const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review']:undefined;
+        const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
         const claim = await this.client.claim(runKinds);
         if (claim) {
           this.activeRuns.add(claim.run.id);
@@ -79,7 +85,7 @@ export class ConnectorRunner {
   }
   private async save(spool:Spool):Promise<void> { await writeSecureJson(this.spoolPath(spool.runId,spool.generation),spool); }
   private async retainOrRemove(spool:Spool):Promise<void> {
-    if(spool.events.length || spool.artifacts.length) {
+    if(spool.events.length || spool.artifacts.length || spool.deliveryProgress) {
       const directory=path.join(this.config.dataDir,'unsent-evidence');
       await mkdir(directory,{recursive:true,mode:0o700});
       await rename(this.spoolPath(spool.runId,spool.generation),path.join(directory,`${stateKey(spool.runId,String(spool.generation))}.json`));
@@ -102,6 +108,7 @@ export class ConnectorRunner {
       await client.addArtifact(spool.runId,spool.generation,spool.artifacts[0]!);
       spool.artifacts.shift(); await this.save(spool);
     }
+    if(spool.deliveryProgress){await client.deliveryProgress(spool.runId,spool.generation,spool.deliveryProgress);spool.deliveryProgress=undefined;await this.save(spool);}
     if (spool.stopped) await client.stopped(spool.runId,spool.generation,spool.threadId);
     else if (spool.completion) await client.complete(spool.runId,spool.generation,spool.completion);
     if (spool.stopped || spool.completion) await unlink(this.spoolPath(spool.runId,spool.generation));
@@ -116,8 +123,31 @@ export class ConnectorRunner {
       const remote = await this.client!.readRun(spool.runId);
       if (remote.generation !== spool.generation) continue; // Retain stale evidence for operator reconciliation.
       if (['completed','failed'].includes(remote.status)) { await this.retainOrRemove(spool); continue; }
+      if(spool.deliveryExecutor&&!spool.completion&&!spool.stopped){
+        const executor=spool.deliveryExecutor;
+        if(!Number.isSafeInteger(executor.pid)||executor.pid<=1||!executor.executionId)continue;
+        let stopped=executor.pid===process.pid&&!activeDeliveryExecutors.has(executor.executionId);
+        if(executor.pid!==process.pid){
+          try{process.kill(executor.pid,0);}catch(error){stopped=(error as NodeJS.ErrnoException).code==='ESRCH';}
+        }
+        // A stage is evidence, not stop proof. Live/reused PID or EPERM fails closed.
+        if(!stopped)continue;
+        // A crash before the Git child identity was durably captured is not stopped proof.
+        if(executor.stage==='git'&&!spool.deliveryProcessIdentity)continue;
+      }
+      if(spool.deliveryProcessIdentity) {
+        const gone=await waitProcessGroup(spool.deliveryProcessIdentity.processGroupId,1);
+        const terminated=gone||await terminateVerifiedGitProcessGroup(spool.deliveryProcessIdentity);
+        if(!terminated)continue;
+        spool.deliveryProcessIdentity=undefined;await this.save(spool);
+      }
+      if(spool.deliveryExecutor&&!spool.completion&&!spool.stopped){spool.stopped=true;await this.save(spool);await this.flush(spool);continue;}
       if (spool.stopped) { await this.flush(spool); continue; }
-      if(spool.completion) { await this.flush(spool); continue; }
+      if(spool.completion) {
+        if(['paused','cancelled','interrupted'].includes(remote.status)) {spool.completion=undefined;spool.stopped=true;await this.save(spool);await this.flush(spool);}
+        else await this.flush(spool);
+        continue;
+      }
       if(spool.processIdentity) {
         const gone = await waitProcessGroup(spool.processIdentity.processGroupId,1);
         const terminated = gone || await terminateVerifiedProcessGroup(spool.processIdentity);
@@ -132,6 +162,7 @@ export class ConnectorRunner {
   }
 
   async execute(claim: ClaimedRun):Promise<void> {
+    if(claim.run.kind==='delivery')return this.executeDelivery(claim);
     const client = this.client!;
     const spool:Spool = {runId:claim.run.id,generation:claim.run.generation,events:[],artifacts:[]};
     await this.save(spool);
@@ -247,5 +278,42 @@ export class ConnectorRunner {
       if(bridgeFile) await unlink(bridgeFile).catch(()=>undefined);
       this.active.delete(native);
     }
+  }
+
+  private async executeDelivery(claim:ClaimedRun):Promise<void>{
+    const client=this.client!;const run=claim.run;const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[],deliveryExecutor:{pid:process.pid,executionId:randomUUID(),stage:'git'}};
+    activeDeliveryExecutors.add(spool.deliveryExecutor!.executionId);
+    try{
+      await this.save(spool);
+      await client.renew(run.id,run.generation);
+      await createDraftPullRequest(this.config,claim,this.dependencies?.delivery?.fetcher??fetch,async phase=>{
+        if(phase.phase==='published'&&run.operation?.phase==='pr_created')return;
+        spool.deliveryExecutor!.stage='http';spool.deliveryProgress=phase;await this.save(spool);await this.flush(spool);
+      },async()=>{const auth=await client.authorizeDeliveryEffect(run.id,run.generation);if(auth.repositoryUrl!==run.operation?.repositoryUrl)throw new Error('Delivery repository authorization changed');return auth.repositoryUrl;},this.dependencies?.delivery?.transport,{
+        starting:async()=>{spool.deliveryExecutor!.stage='git';await this.save(spool);},
+        started:async pid=>{const identity=await readGitProcessIdentity(pid);if(!identity||identity.processGroupId!==pid)throw new Error('Git transport process identity could not be verified');spool.deliveryExecutor!.stage='git';spool.deliveryProcessIdentity=identity;await this.save(spool);},
+        stopped:async()=>{spool.deliveryExecutor!.stage='http';spool.deliveryProcessIdentity=undefined;await this.save(spool);}
+      });
+      spool.deliveryExecutor!.stage='completion';spool.completion={};await this.save(spool);await this.flush(spool);
+    }catch(error){
+      // Replay successful completion after a lost server response; never re-execute effects.
+      if(spool.completion)throw error;
+      if(spool.deliveryProcessIdentity||(error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){await this.save(spool);throw new Error('Draft PR transport stop is unconfirmed; reconciliation is required');}
+      const current=await client.readRun(run.id).catch(()=>undefined);
+      if(current?.generation===run.generation&&['paused','cancelled','interrupted'].includes(current.status)){
+        // The bounded local Git process has exited; acknowledge the stop before any retry may advance generation.
+        spool.stopped=true;await this.save(spool);await this.flush(spool).catch(()=>undefined);
+        throw new Error('Draft PR operation stopped; inspect the durable delivery run');
+      }
+      // Existing Connector spool replays phase and completion; retry re-queries the fixed branch and operation marker.
+      spool.completion={error:'Draft PR publication failed; inspect delivery evidence and retry reconciliation'};await this.save(spool);
+      try{await this.flush(spool);}catch{
+        const latest=await client.readRun(run.id).catch(()=>undefined);
+        if(latest?.generation===run.generation&&['running','paused','cancelled','interrupted'].includes(latest.status)){
+          spool.completion=undefined;spool.stopped=true;await this.save(spool);await this.flush(spool).catch(()=>undefined);
+        }
+      }
+      throw new Error('Draft PR operation failed; inspect the durable delivery run');
+    }finally{activeDeliveryExecutors.delete(spool.deliveryExecutor!.executionId);}
   }
 }

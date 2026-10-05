@@ -55,6 +55,7 @@ export const workbenchApi = {
   createWork: (projectId: string, input: { title: string; overview: string }) => request<Work>(`/projects/${encodeURIComponent(projectId)}/works`, { method: 'POST', body: JSON.stringify(input) }),
   sendMessage: (projectId: string, input: { text: string; workId?: string; requestId: string }) => request<{ message: Message; run: Run }>(`/projects/${encodeURIComponent(projectId)}/messages`, { method: 'POST', body: JSON.stringify(input) }),
   updateWork: (workId: string, input: { revision: number; overview?: string; status?: Work['status'] }) => request<Work>(`/works/${encodeURIComponent(workId)}`, { method: 'PATCH', body: JSON.stringify(input) }),
+  requestDraftPr: (workId: string, input: { candidateRunId: string; candidateRevision: string; action: 'create_draft_pr'; requestId: string }) => request<{ run: Run; operationId: string }>(`/works/${encodeURIComponent(workId)}/delivery`, { method: 'POST', body: JSON.stringify(input) }),
   cancelRun: (runId: string) => request<Run>(`/runs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
   pauseRun: (runId: string) => request<Run>(`/runs/${encodeURIComponent(runId)}/pause`, { method: 'POST' }),
   resumeRun: (runId: string) => request<Run>(`/runs/${encodeURIComponent(runId)}/resume`, { method: 'POST' }),
