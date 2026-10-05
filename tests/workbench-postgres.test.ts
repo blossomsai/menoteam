@@ -7,6 +7,7 @@ import { createHmac } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
 import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
+import { WorkbenchConnectorClient } from "../src/connector/client.js";
 import type { Artifact, Project, Run, Work } from "../src/workbench/types.js";
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
 describe.skipIf(!url)("Real workbench PostgreSQL", () => {
@@ -631,9 +632,14 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(ownerDedup.run.id).toBe(secondQueued.id);
         expect(await persistedDelivery(secondQueued.id)).toMatchObject({requestedBy:member.id,operation:{actorId:member.id}});
         const firstClaim=await connRequest('/claim',{capabilities:{runKinds:['delivery'],git:true,githubWrite:true,deliveryActions:['create_draft_pr']}});expect(firstClaim.statusCode).toBe(200);const claimed=checkedJson(firstClaim).run as Run;expect(claimed.id).toBe(queued.id);expect(claimed.generation).toBe(queued.generation+1);
+        const serverUrl=await app.listen({port:0,host:'127.0.0.1'});
+        const deliveryClient=new WorkbenchConnectorClient({serverUrl,token:connector.token});
         const authorizePath=`/runs/${claimed.id}/delivery-authorize`;
+        await expect(deliveryClient.authorizeDeliveryEffect(claimed.id,claimed.generation)).resolves.toMatchObject({authorized:true,repositoryUrl:p.repositoryUrl});
+        await expect(deliveryClient.authorizeDeliveryEffect(claimed.id,claimed.generation+1)).rejects.toMatchObject({status:409});
         expect((await connRequest(authorizePath,{generation:claimed.generation})).statusCode).toBe(200);
         const changedPolicy=await user('PATCH',`/settings/${checkedJson(connection).id}`,{expectedUpdatedAt:checkedJson(connection).updatedAt,data:{purpose:'source'}});expect(changedPolicy.statusCode).toBe(200);
+        await expect(deliveryClient.authorizeDeliveryEffect(claimed.id,claimed.generation)).rejects.toMatchObject({status:403,routeCategory:'connector.runs.delivery-authorize'});
         expect((await connRequest(authorizePath,{generation:claimed.generation})).statusCode).toBe(403);
         const restorePolicy=await user('PATCH',`/settings/${checkedJson(connection).id}`,{expectedUpdatedAt:checkedJson(changedPolicy).updatedAt,data:{purpose:'delivery'}});expect(restorePolicy.statusCode).toBe(200);
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{repositoryUrl}','"https://github.com/example/changed"'::jsonb) WHERE id=${p.id}`;
@@ -663,16 +669,24 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const memberDelivery=checkedJson(next).run as Run;
         expect(memberDelivery.requestedBy).toBe(member.id);expect(memberDelivery.operation?.actorId).toBe(member.id);
         const memberAuthorize=`/runs/${memberDelivery.id}/delivery-authorize`;
+        await expect(deliveryClient.authorizeDeliveryEffect(memberDelivery.id,memberDelivery.generation)).resolves.toMatchObject({authorized:true,repositoryUrl:p.repositoryUrl});
         const assertMemberEffect = async (status:number) => checkedJson(await connRequest(memberAuthorize,{generation:memberDelivery.generation}),status);
         expect(await assertMemberEffect(200)).toMatchObject({authorized:true});
+        const published=await deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'published',remoteHeadSha:secondSha});
+        expect(published).toMatchObject({run:{id:memberDelivery.id,generation:memberDelivery.generation},artifact:{kind:'delivery',revision:secondRevision,data:{phase:'published'}}});
+        const prCreated=await deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'pr_created',pullRequestNumber:42,pullRequestUrl:`${p.repositoryUrl}/pull/42`,headSha:secondSha});
+        expect(prCreated).toMatchObject({run:{id:memberDelivery.id,generation:memberDelivery.generation,operation:{phase:'pr_created'}},artifact:{kind:'delivery',revision:secondRevision,data:{phase:'pr_created',pullRequestNumber:42}}});
+        await expect(deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'pr_created',pullRequestNumber:43,pullRequestUrl:`${p.repositoryUrl}/pull/43`,headSha:'f'.repeat(40)})).rejects.toMatchObject({status:409,routeCategory:'connector.runs.delivery-progress'});
         // Reauthorize before each subsequent effect, including reconciliation after publication.
         for(const phase of ['queued','published','pr_created']){
             await sql`UPDATE wb_records SET data=jsonb_set(data,'{operation,phase}',${sql.json(phase as never)}) WHERE id=${memberDelivery.id}`;
             await sql`DELETE FROM wb_memberships WHERE project_id=${p.id} AND user_id=${member.id}`;
+            await expect(deliveryClient.authorizeDeliveryEffect(memberDelivery.id,memberDelivery.generation)).rejects.toMatchObject({status:403});
             await assertMemberEffect(403);
             expect((await request(`revoked-actor-retry-${phase}`,{candidateRunId:secondId,candidateRevision:secondRevision,action:'create_draft_pr',requestId:`revoked-actor-retry-${phase}`})).statusCode).toBe(403);
             expect(await persistedDelivery(memberDelivery.id)).toMatchObject({requestedBy:member.id,generation:memberDelivery.generation,operation:{actorId:member.id,phase}});
             await sql`INSERT INTO wb_memberships(project_id,user_id,role) VALUES (${p.id},${member.id},'member')`;
+            await expect(deliveryClient.authorizeDeliveryEffect(memberDelivery.id,memberDelivery.generation)).resolves.toMatchObject({authorized:true});
             expect(await assertMemberEffect(200)).toMatchObject({authorized:true});
         }
         expect((await connRequest(`/runs/${memberDelivery.id}/complete`,{generation:memberDelivery.generation})).statusCode).toBe(200);

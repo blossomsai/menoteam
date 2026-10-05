@@ -19,7 +19,7 @@ export class ConnectorHttpError extends Error {
 
 function routeCategory(path: string): string {
   if (path === '/api/workbench/connector/claim') return 'connector.claim';
-  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools)$/u)?.[1];
+  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|delivery-authorize|delivery-progress)$/u)?.[1];
   if (route) return `connector.runs.${route}`;
   if (/^\/api\/workbench\/connector\/runs\/[^/]+$/u.test(path)) return 'connector.runs.read';
   return 'unknown';
@@ -81,7 +81,7 @@ export class WorkbenchConnectorClient {
       method: 'POST', body: { generation, ...artifact },
     });
   }
-  deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string}):Promise<unknown>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
+  deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string}):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
 
   pauseState(runId: string): Promise<Run> { return this.readRun(runId); }
 
@@ -149,6 +149,11 @@ function validateResponse(path: string, value: unknown): unknown {
   if (path.endsWith('/events')) return z.object({ accepted: z.boolean() }).parse(value);
   if (path.endsWith('/tools')) return z.record(z.string(), z.unknown()).parse(value);
   if (path.includes('/artifacts')) return z.object({ id: z.string(), kind: z.enum(['diff','qa','delivery','source']), revision: z.string(), data: z.unknown() }).passthrough().parse(value);
+  if (path.endsWith('/delivery-authorize')) return z.object({ authorized: z.literal(true), repositoryUrl: z.string().url() }).parse(value);
+  if (path.endsWith('/delivery-progress')) return z.object({
+    run: z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough(),
+    artifact: z.object({ id: z.string(), kind: z.literal('delivery'), revision: z.string(), data: z.unknown() }).passthrough(),
+  }).parse(value);
   if (path.includes('/runs/')) return z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough().parse(value);
   return value;
 }
