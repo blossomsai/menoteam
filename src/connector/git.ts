@@ -14,6 +14,7 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await execFile('git', args, { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
   return stdout;
 }
+export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,...args:string[]):Promise<string>{const {stdout}=await execFile('git',args,{cwd,encoding:'utf8',maxBuffer:MAX_BUFFER,env:{...process.env,...env}});return stdout;}
 
 export interface Worktree { path: string; revision: string; baseRevision: string; artifactRevision?: string; }
 

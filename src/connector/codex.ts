@@ -12,7 +12,7 @@ const execFile = promisify(execFileCb);
 type RpcMessage = { id?: number | string; method?: string; params?: any; result?: any; error?: { message?: string } };
 type ToolHandler = (name: string, input: Record<string, unknown>, requestId: string) => Promise<unknown>;
 
-const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','post_message','update_settings','create_skill'];
+const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','post_message','update_settings','create_skill'];
 const REVIEW_BRIDGE_TOOLS = ['read_work','read_run'];
 
 function scopedBridgeConfig(contextFile: string, tools: string[]) {

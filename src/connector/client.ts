@@ -26,6 +26,7 @@ export class WorkbenchConnectorClient {
       codexAppServer: true,
       models: this.codexModels,
       localWorktrees: true,
+      ...(process.env.MENOTEAM_GITHUB_TOKEN ? { git: true, githubWrite: true, deliveryActions: ['create_draft_pr'] } : {}),
       ...(runKinds ? { runKinds: [...new Set(runKinds)] } : {}),
     };
     const result = await this.request<ClaimedRun | undefined>('/api/workbench/connector/claim', {
@@ -52,6 +53,7 @@ export class WorkbenchConnectorClient {
       method: 'POST', body: { generation, ...artifact },
     });
   }
+  deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string}):Promise<unknown>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
 
   pauseState(runId: string): Promise<Run> { return this.readRun(runId); }
 
@@ -112,7 +114,7 @@ export class WorkbenchConnectorClient {
 
 function validateResponse(path: string, value: unknown): unknown {
   if (path.endsWith('/claim')) {
-    return z.object({ run: z.object({ id: z.string(), generation: z.number(), model: z.string(), reasoning: z.string(), kind: z.enum(['master','implementation','review']), status: z.string() }).passthrough(), project: z.object({ id: z.string(), repositoryUrl: z.string().optional() }).passthrough(), messages: z.array(z.object({ id: z.string(), role: z.string(), speaker: z.string(), text: z.string(), createdAt: z.string() }).passthrough()), settings: z.array(z.object({ id: z.string(), kind: z.string(), name: z.string(), data: z.record(z.string(), z.unknown()) }).passthrough()) }).parse(value);
+    return z.object({ run: z.object({ id: z.string(), generation: z.number(), model: z.string(), reasoning: z.string(), kind: z.enum(['master','implementation','review','delivery']), status: z.string() }).passthrough(), project: z.object({ id: z.string(), repositoryUrl: z.string().optional() }).passthrough(), messages: z.array(z.object({ id: z.string(), role: z.string(), speaker: z.string(), text: z.string(), createdAt: z.string() }).passthrough()), settings: z.array(z.object({ id: z.string(), kind: z.string(), name: z.string(), data: z.record(z.string(), z.unknown()) }).passthrough()) }).parse(value);
   }
   if (path.endsWith('/bridge-token')) return z.object({ token: z.string().min(32), expiresAt: z.string() }).parse(value);
   if (path.endsWith('/events')) return z.object({ accepted: z.boolean() }).parse(value);

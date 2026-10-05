@@ -5,6 +5,7 @@ import { CodexAppServer, terminateVerifiedProcessGroup, waitProcessGroup, type C
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
 import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
+import { createDraftPullRequest } from './github-draft-pr.js';
 import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
 
 interface Spool {
@@ -12,6 +13,7 @@ interface Spool {
   generation: number;
   events: ConnectorEvent[];
   artifacts: UploadArtifact[];
+  deliveryProgress?: {phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string};
   threadId?: string;
   completion?: {threadId?:string;error?:string};
   stopped?: boolean;
@@ -56,7 +58,7 @@ export class ConnectorRunner {
         await this.recover();
         if (this.tasks.size >= 2) { await Promise.race(this.tasks); continue; }
         const kinds=[...this.activeKinds.values()];
-        const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review']:undefined;
+        const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
         const claim = await this.client.claim(runKinds);
         if (claim) {
           this.activeRuns.add(claim.run.id);
@@ -79,7 +81,7 @@ export class ConnectorRunner {
   }
   private async save(spool:Spool):Promise<void> { await writeSecureJson(this.spoolPath(spool.runId,spool.generation),spool); }
   private async retainOrRemove(spool:Spool):Promise<void> {
-    if(spool.events.length || spool.artifacts.length) {
+    if(spool.events.length || spool.artifacts.length || spool.deliveryProgress) {
       const directory=path.join(this.config.dataDir,'unsent-evidence');
       await mkdir(directory,{recursive:true,mode:0o700});
       await rename(this.spoolPath(spool.runId,spool.generation),path.join(directory,`${stateKey(spool.runId,String(spool.generation))}.json`));
@@ -102,6 +104,7 @@ export class ConnectorRunner {
       await client.addArtifact(spool.runId,spool.generation,spool.artifacts[0]!);
       spool.artifacts.shift(); await this.save(spool);
     }
+    if(spool.deliveryProgress){await client.deliveryProgress(spool.runId,spool.generation,spool.deliveryProgress);spool.deliveryProgress=undefined;await this.save(spool);}
     if (spool.stopped) await client.stopped(spool.runId,spool.generation,spool.threadId);
     else if (spool.completion) await client.complete(spool.runId,spool.generation,spool.completion);
     if (spool.stopped || spool.completion) await unlink(this.spoolPath(spool.runId,spool.generation));
@@ -132,6 +135,7 @@ export class ConnectorRunner {
   }
 
   async execute(claim: ClaimedRun):Promise<void> {
+    if(claim.run.kind==='delivery')return this.executeDelivery(claim);
     const client = this.client!;
     const spool:Spool = {runId:claim.run.id,generation:claim.run.generation,events:[],artifacts:[]};
     await this.save(spool);
@@ -231,6 +235,22 @@ export class ConnectorRunner {
       await native.stop();
       if(bridgeFile) await unlink(bridgeFile).catch(()=>undefined);
       this.active.delete(native);
+    }
+  }
+
+  private async executeDelivery(claim:ClaimedRun):Promise<void>{
+    const client=this.client!;const run=claim.run;const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[]};await this.save(spool);
+    try{
+      await client.renew(run.id,run.generation);
+      await createDraftPullRequest(this.config,claim,fetch,async phase=>{
+        if(phase.phase==='published'&&run.operation?.phase==='pr_created')return;
+        spool.deliveryProgress=phase;await this.save(spool);await this.flush(spool);
+      },async()=>{const leased=await client.renew(run.id,run.generation);if(leased.status!=='running'||leased.generation!==run.generation)throw new Error('Delivery lease lost');});
+      spool.completion={};await this.save(spool);await this.flush(spool);
+    }catch{
+      // Existing Connector spool replays phase and completion; retry re-queries the fixed branch and operation marker.
+      spool.completion={error:'Draft PR publication failed; inspect delivery evidence and retry reconciliation'};await this.save(spool);await this.flush(spool).catch(()=>undefined);
+      throw new Error('Draft PR operation failed; inspect the durable delivery run');
     }
   }
 }

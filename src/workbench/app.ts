@@ -347,12 +347,84 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await store.put("run", run, tx);
         return run;
     }
+    async function requestDraftPr(user: Member, workId: string, raw: unknown, tx = sql) {
+        const b = z.object({candidateRunId:text,candidateRevision:z.string().min(1).max(200),action:z.literal('create_draft_pr'),requestId:z.string().min(1).max(200)}).strict().parse(raw);
+        const work=await store.get<Work>('work',workId,tx);
+        if(!work)fail(404,'Work missing');
+        if(!await actorCanAccess(user,work!.projectId,tx))fail(403,'Project access denied');
+        const scopedRuns=await store.list<Run>('run',work!.projectId,tx);
+        const candidate=scopedRuns.find(run=>run.id===b.candidateRunId);
+        if(!candidate||candidate.workId!==workId||candidate.kind!=='implementation'||candidate.status!=='completed'||!candidate.connectorId||candidate.sourceIds?.length)fail(409,'Candidate run is unavailable');
+        if(!await actorAuthorized({...candidate!,requestedBy:user.id},tx))fail(403,'Delivery actor authorization denied');
+        const project=await store.get<Project>('project',work!.projectId,tx);
+        if(!project?.repositoryUrl)fail(409,'Project repository is not configured');
+        const connections=(await store.list<Setting>('setting',undefined,tx)).filter(setting=>setting.projectId===work!.projectId&&setting.kind==='connection'&&setting.data.provider==='github'&&setting.data.purpose==='delivery'&&setting.data.enabled!==false);
+        const normalizeRepository=(value:string)=>value.replace(/\/$/u,'').replace(/\.git$/u,'');
+        const policy=connections.find(setting=>typeof setting.data.url==='string'&&normalizeRepository(setting.data.url)===normalizeRepository(project!.repositoryUrl)&&setting.data.allowDraftPr===true&&typeof setting.data.baseBranch==='string'&&/^[A-Za-z0-9._/-]{1,200}$/u.test(setting.data.baseBranch)&&typeof setting.data.configuredBy==='string');
+        if(!policy)fail(409,'Draft PR capability is unavailable for this repository');
+        const artifacts=await store.list<Artifact>('artifact',work!.projectId,tx);
+        const diff=artifacts.find(a=>a.workId===workId&&a.runId===candidate!.id&&a.kind==='diff'&&a.revision===b.candidateRevision);
+        if(!diff||!diff.data||typeof diff.data!=='object')fail(409,'Candidate revision does not match a recorded diff');
+        const diffData=diff!.data as Record<string,unknown>;
+        const commitSha=diffData.candidateRevision;
+        const baseRevision=diffData.baseRevision;
+        if(typeof commitSha!=='string'||!/^[a-f0-9]{40,64}$/u.test(commitSha)||typeof baseRevision!=='string'||!/^[a-f0-9]{40,64}$/u.test(baseRevision))fail(409,'Candidate diff identity is invalid');
+        const exactCommitSha=commitSha as string;const exactBaseRevision=baseRevision as string;
+        const qa=artifacts.find(a=>a.workId===workId&&a.runId===candidate!.id&&a.kind==='qa'&&a.revision===b.candidateRevision);
+        const fingerprint=qa&&qa.data&&typeof qa.data==='object'?(qa.data as Record<string,unknown>).candidateFingerprint:undefined;
+        if(typeof fingerprint!=='string'||!/^[a-f0-9]{64}$/u.test(fingerprint))fail(409,'Candidate fingerprint evidence is unavailable');
+        const candidateFingerprint=fingerprint as string;
+        const requestScope=`delivery:${user.id}:${workId}`;
+        const clientPrior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
+        if(clientPrior[0]){const prior=clientPrior[0].result as {run?:Run};if(prior.run?.operation?.candidateRunId!==candidate!.id||prior.run?.operation?.candidateRevision!==diff!.revision)fail(409,'Request ID was already used for a different candidate');}
+        const canonicalScope=`delivery-candidate:${work!.projectId}:${workId}:${candidate!.id}:${exactCommitSha}:create_draft_pr`;
+        const connector=await tx`SELECT id,project_ids,capabilities FROM wb_connectors WHERE id=${candidate!.connectorId!}`;
+        if(!connector[0]||(connector[0]!.project_ids as string[]).includes(work!.projectId)===false)fail(409,'Candidate Connector is no longer registered for this project');
+        const deliveryCapabilities=connector[0]!.capabilities?.deliveryActions;
+        if(!Array.isArray(deliveryCapabilities)||!deliveryCapabilities.includes('create_draft_pr'))fail(409,'Draft PR capability is unavailable on the candidate Connector');
+        const writable=connector[0]!.capabilities?.githubWrite===true&&connector[0]!.capabilities?.git===true;
+        if(!writable)fail(409,'Draft PR capability is unavailable for this configured repository');
+        const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        if(canonical[0]){
+            const result=canonical[0].result as {run:Run;operationId:string};
+            const existing=await store.get<Run>('run',result.run.id,tx);if(!existing)fail(409,'Canonical delivery operation is unavailable');
+            if(['failed','interrupted','cancelled'].includes(existing!.status)){
+                if(existing!.status==='interrupted'&&!existing!.stoppedAt&&existing!.kind!=='delivery')fail(409,'Connector process must be confirmed stopped before retry');
+                // Fence any unsent Connector spool from the prior delivery attempt; the new claim gets a fresh generation.
+                existing!.generation++;existing!.status='queued';existing!.stoppedAt=undefined;existing!.error=undefined;existing!.updatedAt=now();await store.put('run',existing!,tx);
+            }
+            const current={run:existing!,operationId:existing!.id};
+            await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(current as never)}) ON CONFLICT(scope,request_id) DO UPDATE SET result=EXCLUDED.result`;
+            return current;
+        }
+        const baseBranch=String(policy!.data.baseBranch);
+        const files=Array.isArray(diffData.files)?diffData.files.flatMap(file=>file&&typeof file==='object'&&typeof (file as Record<string,unknown>).path==='string'?[(file as Record<string,unknown>).path as string]:[]):[];
+        const qaData=qa!.data as Record<string,unknown>;
+        const checks=Array.isArray(qaData.checks)?qaData.checks.filter(item=>item&&typeof item==='object') as Array<Record<string,unknown>>:[];
+        const passed=checks.filter(item=>item.exitCode===0).length,failed=checks.filter(item=>typeof item.exitCode==='number'&&item.exitCode!==0).length,unknown=checks.length-passed-failed;
+        const verification=qaData.stale===true?'stale':checks.length?`QA checks: ${passed} passed, ${failed} failed, ${unknown} unknown`: 'QA status unknown; no checks recorded';
+        const operation={action:'create_draft_pr' as const,actorId:user.id,candidateRunId:candidate!.id,candidateRevision:diff!.revision,artifactRevision:diff!.revision,commitSha:exactCommitSha,candidateFingerprint,baseRevision:exactBaseRevision,baseBranch,remoteBranch:`codex/menoteam/${workId}/${exactCommitSha.slice(0,12)}`,workTitle:work!.title,changeSummary:files.length?files.slice(0,30).join(', '):'No file summary recorded',qaStatus:verification,phase:'queued' as const};
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Create a draft pull request for the recorded candidate. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:candidate!.id,targetRevision:diff!.revision,targetConnectorId:candidate!.connectorId,operation};
+        await store.put('run',run,tx);
+        const result={run,operationId:run.id};
+        await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(result as never)}),(${canonicalScope},'canonical',${tx.json(result as never)})`;
+        return result;
+    }
+    async function actorCanAccess(user:Member,projectId:string,tx:Sql):Promise<boolean>{
+        if(user.role==='owner')return !!await store.get<Project>('project',projectId,tx);
+        const rows=await tx`SELECT 1 FROM wb_memberships WHERE user_id=${user.id} AND project_id=${projectId}`;
+        return !!rows[0];
+    }
     app.post("/api/workbench/projects/:id/works", async (req) => {
         const pid = (req.params as {
             id: string;
         }).id;
         await grant(await member(req), pid);
         return makeWork(pid, req.body);
+    });
+    app.post('/api/workbench/works/:id/delivery',async req=>{
+        const user=await member(req);const workId=(req.params as {id:string}).id;
+        return store.transaction(`delivery:${workId}`,tx=>requestDraftPr(user,workId,req.body,tx));
     });
     app.get("/api/workbench/works/:id", async (req) => {
         const w = await store.get<Work>("work", (req.params as {
@@ -500,12 +572,16 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             connection: z.object({
                 provider: z.enum(["github", "slack"]),
                 url: publicMetadataUrl,
-                enabled: z.boolean().default(true)
-            }).strict()
+                enabled: z.boolean().default(true),
+                purpose:z.enum(['source','delivery']).default('source'),
+                baseBranch:z.string().regex(/^[A-Za-z0-9._/-]{1,200}$/u).optional(),
+                allowDraftPr:z.boolean().default(false),
+                configuredBy:z.string().optional()
+            }).strict().superRefine((value,context)=>{if(value.purpose==='delivery'&&(value.provider!=='github'||!value.baseBranch||!value.allowDraftPr))context.addIssue({code:'custom',message:'Draft PR delivery requires GitHub, a base branch, and explicit create permission'});})
         };
         return schemas[kind].parse(input);
     }
-    async function writeSetting(input: unknown, tx = sql) {
+    async function writeSetting(input: unknown, tx = sql, actorId?:string) {
         const b = z.object({
             kind: z.enum(["profile", "provider", "skill", "connection"]),
             projectId: z.string().optional(),
@@ -513,6 +589,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             data: z.record(z.string(), z.unknown())
         }).parse(input);
         b.data = settingData(b.kind, b.data);
+        if(b.kind==='connection'&&b.data.purpose==='delivery')b.data.configuredBy=actorId;
         if(b.kind==='provider'&&!b.projectId){const existing=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.kind==='provider'&&!s.projectId);b.data.default=existing.length===0;}
         const s: Setting = {
             id: id("setting"),
@@ -531,7 +608,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             await grant(u, b.projectId, true);
         else
             await admin(req);
-        return store.transaction('setting',async tx=>{if(b.projectId)await grant(u,b.projectId,true);else await admin(req);return writeSetting(req.body,tx);});
+        return store.transaction('setting',async tx=>{if(b.projectId)await grant(u,b.projectId,true);else await admin(req);return writeSetting(req.body,tx,u.id);});
     });
     async function patchSetting(actor: Member, sid: string, input: unknown, tx: Sql, projectBoundary?: string) {
         const change = z.object({
@@ -547,7 +624,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         else if (!['owner', 'admin'].includes(actor.role)) fail(403, 'Workspace administrator required');
         if (change.expectedUpdatedAt && change.expectedUpdatedAt !== setting!.updatedAt)
             fail(409, 'Setting changed; reload before updating');
-        if (change.data) setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data });
+        if (change.data) { setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data }); if(setting!.kind==='connection'&&setting!.data.purpose==='delivery')setting!.data.configuredBy=actor.id; }
         if (change.name !== undefined) setting!.name = change.name;
         setting!.updatedAt = new Date(Math.max(Date.now(), Date.parse(setting!.updatedAt) + 1)).toISOString();
         await store.put('setting', setting!, tx);
@@ -637,7 +714,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                     await store.put("run", r, tx);
                 }
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model)) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt))));
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&body.capabilities.deliveryActions.includes('create_draft_pr') : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'))));
             if (!r)
                 return undefined;
             r.status = "running";
@@ -754,6 +831,18 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await store.put("artifact", a, tx);
         return a;
     }));
+    app.post('/api/workbench/connector/runs/:id/delivery-progress',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const run=await leased(req,tx);if(run.kind!=='delivery'||!run.operation)fail(403,'Delivery operation required');
+        const b=z.object({generation:z.number(),phase:z.enum(['published','pr_created']),remoteHeadSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional(),pullRequestNumber:z.number().int().positive().optional(),pullRequestUrl:z.string().url().optional(),headSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional()}).strict().parse(req.body);
+        const op=run.operation!;
+        if(b.phase==='published'&&b.remoteHeadSha!==op.commitSha)fail(409,'Published branch SHA does not match candidate');
+        if(b.phase==='pr_created'&&(!b.pullRequestNumber||!b.pullRequestUrl||b.headSha!==op.commitSha||op.phase==='queued'))fail(409,'Draft PR result does not match candidate');
+        if(op.phase==='pr_created'&&b.phase!=='pr_created')fail(409,'Delivery phase cannot move backwards');
+        op.phase=b.phase;op.external={...(op.external??{}),...(b.pullRequestNumber?{pullRequestNumber:b.pullRequestNumber}:{}),...(b.pullRequestUrl?{pullRequestUrl:b.pullRequestUrl}:{}),...(b.headSha?{headSha:b.headSha}:{})};
+        run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
+        const artifact:Artifact={id:`artifact:${run.id}:delivery:${b.phase}`,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{operationId:run.id,...op,...(op.external??{})},createdAt:now()};
+        await store.put('artifact',artifact,tx);return {run,artifact};
+    }));
     app.post("/api/workbench/connector/runs/:id/complete", async (req) => store.transaction(`run:${(req.params as {
         id: string;
     }).id}`, async (tx) => {
@@ -814,7 +903,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await grant(actors[0] as unknown as Member, r.projectId);
         const b = z.object({
             generation: z.number(),
-            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "post_message", "update_settings", "create_skill"]),
+            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "post_message", "update_settings", "create_skill"]),
             input: z.record(z.string(), z.unknown()),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
@@ -825,6 +914,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             if (b.action === 'read_run' && (!r.targetRunId || b.input.runId !== r.targetRunId))
                 fail(403, 'Reviewer can read only the assigned candidate run');
         }
+        if(b.action==='request_delivery'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request delivery');
         if(b.action==='dispatch'&&r.sourceIds?.length&&!(await store.get<Project>('project',r.projectId,tx))?.feedbackIntake?.allowExecution)fail(403,'Feedback execution grant revoked');
         if(r.allowedActions&&!r.allowedActions.includes(b.action))fail(403,'This intake grant does not authorize that action');
         const scope = `tools:${r.id}`;
@@ -871,6 +961,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 overview: b.input.overview,
                 status: b.input.status
             }, r.projectId, tx);
+        else if (b.action === "request_delivery") {
+            const input=z.object({workId:text,candidateRunId:text,candidateRevision:z.string().min(1).max(200),action:z.literal('create_draft_pr'),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
+            const {workId,...request}=input;result=await requestDraftPr(actors[0] as unknown as Member,workId,request,tx);
+        }
         else if (b.action === "dispatch") {
             const input = z.object({
                 workId: text,

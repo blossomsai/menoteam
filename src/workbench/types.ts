@@ -44,7 +44,24 @@ export interface Run {
     allowedActions?: string[];
     sourceIds?: string[];
     execution?: ExecutionContext;
-    kind: 'master' | 'implementation' | 'review';
+    kind: 'master' | 'implementation' | 'review' | 'delivery';
+    operation?: {
+        action: 'create_draft_pr';
+        actorId: string;
+        candidateRunId: string;
+        candidateRevision: string;
+        artifactRevision: string;
+        commitSha: string;
+        candidateFingerprint: string;
+        baseRevision: string;
+        baseBranch: string;
+        remoteBranch: string;
+        workTitle: string;
+        changeSummary: string;
+        qaStatus: string;
+        phase: 'queued' | 'published' | 'pr_created';
+        external?: { pullRequestNumber?: number; pullRequestUrl?: string; headSha?: string };
+    };
     model: string;
     reasoning: string;
     status: 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
