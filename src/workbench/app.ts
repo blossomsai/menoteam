@@ -593,7 +593,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return {project,policy};
     }
     async function stagingConnector(projectId:string,targetId:string,action:'deploy_staging'|'rollback_staging',tx:Sql) {
-        const rows=await tx`SELECT id,project_ids,capabilities,last_seen FROM wb_connectors WHERE ${projectId}=ANY(project_ids)`;
+        const rows=await tx`SELECT id,project_ids,capabilities,last_seen FROM wb_connectors WHERE project_ids ? ${projectId}`;
         const connector=rows.find(row=>Date.now()-new Date(row.last_seen??0).getTime()<120000&&Array.isArray(row.capabilities?.deploymentTargets)&&row.capabilities.deploymentTargets.includes(targetId)&&Array.isArray(row.capabilities?.deliveryActions)&&row.capabilities.deliveryActions.includes(action));
         if(!connector)fail(409,'Staging Connector capability is unavailable');
         return String(connector.id);
