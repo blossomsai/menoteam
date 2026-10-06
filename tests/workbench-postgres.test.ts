@@ -753,7 +753,13 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const deniedRun = await revokeWhileWaiting(() => adminRequest('POST', `/projects/${projectIdForCase}/messages`, { text: 'Must not queue after revocation', workId: guardedWork.id, requestId: `revoked-${randomUUID()}` }));
             expect(deniedRun.statusCode).toBe(403);
             const me = (await user('GET', '/me')).json();
-            const claim = () => app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorTokenForCase}` }, payload: { capabilities: { models: ['gpt-6-luna'] } } });
+            const claim = async () => {
+                // Each claim replaces discovery; send the full capability contract, not just models.
+                const response = await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorTokenForCase}` }, payload: { capabilities: { ...fixtureCapabilities, runKinds: ['implementation'] } } });
+                expect(response.statusCode, response.body).toBe(200);
+                expect(response.body).not.toBe('');
+                return response.json();
+            };
             const submitWork = async (title: string, requestId: string) => {
                 const created = await user('POST', `/projects/${projectIdForCase}/works`, { title, connectionId: provider.id });
                 const work = created.json(); if (work.id) recordIds.add(work.id);
@@ -766,7 +772,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             };
             const run1 = await submitWork('Frozen original', `marketplace-${randomUUID()}`);
             expect(run1.requestedBy).toBe(me.id);
-            const claimed1 = (await claim()).json();
+            const claimed1 = await claim();
             expect(claimed1.run.id).toBe(run1.id);
             expect(claimed1.run.requestedBy).toBe(me.id);
             expect(claimed1.run.connectorId).toBe(connectorIdForCase);
@@ -781,7 +787,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(disabled.statusCode).toBe(200);
             const run2 = await submitWork('Disabled next run', `marketplace-${randomUUID()}`);
             expect(run2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
-            const claimed2 = (await claim()).json();
+            const claimed2 = await claim();
             expect(claimed2.run.id).toBe(run2.id);
             expect(claimed2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
             const enabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited and re-enabled for a new run', enabled: true } });
@@ -789,7 +795,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(enabled.json().data.contentSha256).toBe(createHash('sha256').update('Edited and re-enabled for a new run').digest('hex'));
             const run3 = await submitWork('Updated next run', `marketplace-${randomUUID()}`);
             expect(run3.execution.skills[0].content).toBe('Edited and re-enabled for a new run');
-            const claimed3 = (await claim()).json();
+            const claimed3 = await claim();
             expect(claimed3.run.id).toBe(run3.id);
             expect(claimed3.execution.skills[0]).toMatchObject({ id: copied.id, content: 'Edited and re-enabled for a new run', copiedFrom: copied.data.copiedFrom });
             const createdRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === createdCopy.id);
@@ -799,7 +805,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect((await user('PATCH', `/settings/${createdCopy.id}`, { data: { content: 'Create copy edited after run' } })).statusCode).toBe(200);
             expect((await user('PATCH', `/settings/${legacyCopy.id}`, { data: { content: 'Legacy copy edited after run' } })).statusCode).toBe(200);
             const run4 = await submitWork('Copied source edits are frozen', `marketplace-${randomUUID()}`);
-            const claimed4 = (await claim()).json();
+            const claimed4 = await claim();
             expect(claimed4.run.id).toBe(run4.id);
             expect(claimed4.execution.skills.find((skill: any) => skill.id === createdCopy.id)).toMatchObject({ content: 'Create copy edited after run', contentSha256: createHash('sha256').update('Create copy edited after run').digest('hex') });
             expect(claimed4.execution.skills.find((skill: any) => skill.id === legacyCopy.id)).toMatchObject({ content: 'Legacy copy edited after run', contentSha256: createHash('sha256').update('Legacy copy edited after run').digest('hex') });
