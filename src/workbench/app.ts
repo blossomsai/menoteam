@@ -1,4 +1,6 @@
+import { verifyBundle, editBundleMarkdown, freezeSkillBundle, verifyExecutionSkills } from './skill-bundle.js';
 import { isDeepStrictEqual } from 'node:util';
+import { createHash } from 'node:crypto';
 import Fastify, { type FastifyRequest, type FastifyInstance } from "fastify";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -9,16 +11,17 @@ import { registerSourceRoutes } from "./sources.js";
 import { WorkbenchStore } from "./store.js";
 import { requiresLocalWorktree } from "./execution-capabilities.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
-import { isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type Artifact, type Setting, type RunEvent } from "./types.js";
+import { isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 const text = z.string().trim().min(1).max(12000);
-const fail = (statusCode: number, message: string): never => {
+const serverSkillEvidence = new Set(['bundle','sourceUrl','installed','provenance','requestedRef','resolvedSha','sourcePath','contentSha256','sourceContentSha256','catalogUrl','catalogName','catalogResolvedSha','pluginName','includedReferences','unsupportedPluginComponents','copiedFrom']);
+function fail(statusCode: number, message: string): never {
     throw Object.assign(new Error(message), {
         statusCode
     });
-};
+}
 export interface WorkbenchOptions {
     sql: Sql;
     bootstrapEmail?: string;
@@ -338,7 +341,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         }).parse(input);
         if(b.profileId) {
             const profile=await store.get<Setting>('setting',b.profileId,tx);
-            if(!profile || profile.kind!=='profile' || (profile.projectId && profile.projectId!==projectId))fail(400,'Agent profile is unavailable in this project');
+            if(!profile || profile.kind!=='profile' || profile.projectId)fail(400,'Only workspace agent profiles can be assigned to Work');
         }
         const connectionId=b.connectionId??(await store.list<Setting>('setting',undefined,tx)).find(s=>s.kind==='provider'&&!s.projectId&&s.data.default===true&&typeof s.data.connectorId==='string')?.id;
         if(!connectionId)fail(409,'Select an available provider connection before creating Work');
@@ -405,11 +408,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const frozenProfile=snapshotRun?.execution?.profile;
         const profile = frozenProfile?{...frozenProfile,kind:'profile' as const,updatedAt:snapshotRun!.createdAt}:snapshotRun||firstCrossKindReview?undefined:targetWork?.profileId ? await store.get<Setting>("setting", targetWork.profileId, tx) : undefined;
         if(targetWork?.profileId && !profile && !snapshotRun && !firstCrossKindReview)fail(400,"Agent profile missing");
-        if (profile && (profile.kind !== "profile" || (profile.projectId && profile.projectId !== projectId)))
+        if (profile && (profile.kind !== "profile" || profile.projectId))
             fail(400, "Invalid agent profile");
         const skills = snapshotRun?.execution?structuredClone(snapshotRun.execution.skills):profile ? (await resolveProfileSkills(profile, tx))
             .filter(skill => skill.data.enabled !== false)
-            .map(skill => ({id: skill.id, name: skill.name, content: String(skill.data.content)})) : [];
+            .map(skill => ({...(skill.data.bundle !== undefined ? {bundle: freezeSkillBundle(skill.data.bundle, String(skill.data.content))} : {}), id: skill.id, name: skill.name, content: String(skill.data.content), ...(typeof skill.data.provenance === 'string' ? {provenance: skill.data.provenance} : {}), ...(typeof skill.data.sourceUrl === 'string' ? {sourceUrl: skill.data.sourceUrl} : {}), ...(typeof skill.data.requestedRef === 'string' ? {requestedRef: skill.data.requestedRef} : {}), ...(typeof skill.data.resolvedSha === 'string' ? {resolvedSha: skill.data.resolvedSha} : {}), ...(typeof skill.data.sourcePath === 'string' ? {sourcePath: skill.data.sourcePath} : {}), ...(typeof skill.data.contentSha256 === 'string' ? {contentSha256: skill.data.contentSha256} : {}), ...(typeof skill.data.sourceContentSha256 === 'string' ? {sourceContentSha256: skill.data.sourceContentSha256} : {}), ...(typeof skill.data.catalogUrl === 'string' ? {catalogUrl: skill.data.catalogUrl} : {}), ...(typeof skill.data.catalogResolvedSha === 'string' ? {catalogResolvedSha: skill.data.catalogResolvedSha} : {}), ...(skill.data.copiedFrom && typeof skill.data.copiedFrom === 'object' ? {copiedFrom: structuredClone(skill.data.copiedFrom) as ExecutionContext['skills'][number]['copiedFrom']} : {})})) : [];
+        verifyExecutionSkills(skills);
         if(snapshotRun&&input.model&&input.model!==snapshotRun.model)fail(409,'Frozen model cannot change');
         const model=snapshotRun?.model??input.model ?? (input.kind==='implementation'&&profile?String(profile.data.model):input.kind==='implementation'?'gpt-6-luna':'gpt-6.1-sol');
         const frozenConnectionId=historical?.execution?.connectionId??targetWork?.connectionId;
@@ -622,15 +626,21 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const b = z.object({
             revision: z.number().int(),
             overview: z.string().max(32000).optional(),
-            status: z.enum(["queued", "in_progress", "paused", "done"]).optional()
+            status: z.enum(["queued", "in_progress", "paused", "done"]).optional(),
+            profileId: z.string().max(200).optional()
         }).strict().parse(input);
         const w = await store.get<Work>("work", wid, tx);
         if (!w || w.projectId !== projectId)
             fail(404, "Work missing");
         if (w!.revision !== b.revision)
             fail(409, "Work changed; reload");
+        if (b.profileId) {
+            const profile = await store.get<Setting>('setting', b.profileId, tx);
+            if (!profile || profile.kind !== 'profile' || profile.projectId) fail(400, 'Only workspace agent profiles can be assigned to Work');
+        }
         if (b.overview !== undefined) w!.overview = b.overview;
         if (b.status !== undefined) w!.status = b.status;
+        if (b.profileId !== undefined) w!.profileId = b.profileId;
         w!.revision += 1;
         w!.updatedAt = now();
         await store.put("work", w!, tx);
@@ -644,7 +654,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (!w)
             fail(404, "Work missing");
         await grant(await member(req), w!.projectId);
-        return store.transaction(`work:${wid}`, tx => updateWork(wid, req.body, w!.projectId, tx));
+        return store.transaction(`work:${wid}`, async tx => {
+            const current = await store.get<Work>("work", wid, tx);
+            if (!current) fail(404, "Work missing");
+            await grant(await member(req, tx), current!.projectId, false, tx);
+            return updateWork(wid, req.body, current!.projectId, tx);
+        });
     });
     app.get('/api/workbench/artifacts/:id',async req=>{const a=await store.get<Artifact>('artifact',(req.params as {id:string}).id);if(!a)fail(404,'Artifact missing');await grant(await member(req),a!.projectId);return a;});
     app.post("/api/workbench/projects/:id/messages", async (req) => {
@@ -660,6 +675,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
         return store.transaction(`message:${pid}:${b.requestId}`, async (tx) => {
+            const currentActor = await member(req, tx);
+            await grant(currentActor, pid, false, tx);
             const previous = await tx `SELECT result FROM wb_requests WHERE scope=${`message:${pid}`} AND request_id=${b.requestId}`;
             if (previous[0])
                 return previous[0].result;
@@ -667,14 +684,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 workId: b.workId,
                 connectionId: b.connectionId,
                 prompt: b.text,
-                requestedBy: u.id,
+                requestedBy: currentActor.id,
                 kind: b.workId ? "implementation" : "master"
             }, tx);
             const message: Message = {
                 id: id("message"),
                 projectId: pid,
                 workId: b.workId,
-                speaker: u.name,
+                speaker: currentActor.name,
                 role: "user",
                 text: b.text,
                 runId: run.id,
@@ -747,9 +764,24 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 default: z.boolean().default(false)
             }).strict(),
             skill: z.object({
+                bundle: z.custom<import('./skill-bundle.js').SkillBundle>(value => { try { verifyBundle(value); return true; } catch { return false; } }).optional(),
                 content: z.string().min(1).max(64000),
                 sourceUrl: publicMetadataUrl.optional(),
-                enabled: z.boolean().default(true)
+                enabled: z.boolean().default(true),
+                installed: z.boolean().optional(),
+                provenance: z.string().max(2000).optional(),
+                requestedRef: z.string().max(255).optional(),
+                resolvedSha: z.string().regex(/^[a-f0-9]{40}$/u).optional(),
+                sourcePath: z.string().max(1000).optional(),
+                contentSha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+                sourceContentSha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+                catalogUrl: publicMetadataUrl.optional(),
+                catalogName: z.string().max(120).optional(),
+                catalogResolvedSha: z.string().regex(/^[a-f0-9]{40}$/u).optional(),
+                pluginName: z.string().max(120).optional(),
+                includedReferences: z.array(z.string().max(1000)).max(256).optional(),
+                unsupportedPluginComponents: z.array(z.string().max(1000)).max(500).optional(),
+                copiedFrom: z.object({ settingId: z.string().min(1).max(200), projectId: z.string().min(1).max(200), sourceUrl: publicMetadataUrl.optional(), provenance: z.string().max(2000).optional(), requestedRef: z.string().max(255).optional(), resolvedSha: z.string().regex(/^[a-f0-9]{40}$/u).optional(), sourcePath: z.string().max(1000).optional(), contentSha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(), sourceContentSha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(), catalogUrl: publicMetadataUrl.optional(), catalogResolvedSha: z.string().regex(/^[a-f0-9]{40}$/u).optional(), catalogName: z.string().max(120).optional(), pluginName: z.string().max(120).optional(), bundleSha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(), includedReferences: z.array(z.string().max(1000)).max(256).optional() }).strict().optional()
             }).strict(),
             connection: z.union([qaPolicyData,z.object({
                 provider: z.enum(["github", "slack"]),
@@ -771,12 +803,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return schemas[kind].parse(input);
     }
     async function resolveProfileSkills(profile: Pick<Setting, 'projectId' | 'data'>, tx: Sql): Promise<Setting[]> {
+        if (profile.projectId) fail(400, 'Agent profiles are workspace-scoped');
         const skills: Setting[] = [];
         for (const skillId of profile.data.skillIds as string[] ?? []) {
             const skill = await store.get<Setting>('setting', skillId, tx);
             if (!skill || skill.kind !== 'skill') fail(400, `Profile skill ${skillId} is unavailable`);
-            if (skill!.projectId && skill!.projectId !== profile.projectId)
-                fail(400, `Profile skill ${skillId} is outside the profile scope; use a reusable workspace skill`);
+            if (skill!.projectId) fail(400, `Profile skill ${skillId} is project-scoped; copy it to reusable workspace skills first`);
             skills.push(skill!);
         }
         return skills;
@@ -791,7 +823,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             name: text,
             data: z.record(z.string(), z.unknown())
         }).parse(input);
+        if (b.kind === 'skill' && Object.keys(b.data).some(key => serverSkillEvidence.has(key))) fail(400, 'Imported skill provenance is server-managed');
+        if (b.kind === 'profile' && b.projectId) fail(400, 'Agent profiles are workspace-scoped');
         b.data = settingData(b.kind, b.data);
+        if (b.kind === 'skill') b.data.contentSha256 = createHash('sha256').update(String(b.data.content)).digest('hex');
         if (b.kind === 'connection' && ['delivery','qa'].includes(String(b.data.purpose))) b.data.configuredBy = actorId;
         if(b.kind==='connection'&&b.data.purpose==='qa'&&!b.projectId)fail(400,'QA policy requires a project');
         if (b.kind === 'profile') await resolveProfileSkills(b, tx);
@@ -855,8 +890,13 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 await clearProviderDefaults(tx,sid);
             }
         }
+        if (setting!.kind === 'profile' && setting!.projectId) fail(400, 'Agent profiles are workspace-scoped');
         if (change.data) {
-            setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data });
+            if (setting!.kind === 'skill' && Object.keys(change.data).some(key => serverSkillEvidence.has(key))) fail(400, 'Imported skill provenance is server-managed');
+            const nextData = { ...setting!.data, ...change.data };
+            if (setting!.kind === 'skill' && typeof setting!.data.contentSha256 === 'string' && typeof nextData.content === 'string' && nextData.content !== setting!.data.content) nextData.contentSha256 = createHash('sha256').update(nextData.content).digest('hex');
+            if (setting!.kind === 'skill' && setting!.data.bundle !== undefined && typeof nextData.content === 'string' && nextData.content !== setting!.data.content) nextData.bundle = editBundleMarkdown(setting!.data.bundle, nextData.content);
+            setting!.data = settingData(setting!.kind, nextData);
             if (setting!.kind === 'connection' && ['delivery','qa'].includes(String(setting!.data.purpose))) setting!.data.configuredBy = actor.id;
         }
         if (setting!.kind === 'profile') await resolveProfileSkills(setting!, tx);
@@ -868,6 +908,39 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.patch("/api/workbench/settings/:id", async (req) => {
         const sid=(req.params as {id:string}).id;
         return store.transaction('setting',async tx=>patchSetting(await member(req,tx),sid,req.body,tx));
+    });
+    app.post('/api/workbench/settings/:id/copy-to-workspace', async req => {
+        const actor = await admin(req); const sid = (req.params as { id: string }).id;
+        const source = await store.get<Setting>('setting', sid);
+        if (!source || source.kind !== 'skill' || !source.projectId) fail(404, 'Project skill is unavailable');
+        try { await grant(actor, source.projectId); } catch (error) { if ((error as { statusCode?: number }).statusCode === 403) fail(404, 'Project skill is unavailable'); throw error; }
+        return store.transaction(`copy-skill:${sid}`, async tx => {
+            const currentActor = await admin(req);
+            try { await grant(currentActor, source.projectId!); } catch (error) { if ((error as { statusCode?: number }).statusCode === 403) fail(404, 'Project skill is unavailable'); throw error; }
+            const current = await store.get<Setting>('setting', sid, tx);
+            if (!current || current.kind !== 'skill' || current.projectId !== source.projectId) fail(404, 'Project skill is unavailable');
+            const content = String(current.data.content);
+            const copiedFrom = {
+                settingId: current.id, projectId: current.projectId!,
+                ...(current.data.bundle !== undefined ? { bundleSha256: freezeSkillBundle(current.data.bundle, content).sha256 } : {}),
+                ...(typeof current.data.sourceUrl === 'string' ? { sourceUrl: current.data.sourceUrl } : {}),
+                ...(typeof current.data.provenance === 'string' ? { provenance: current.data.provenance } : {}),
+                ...(typeof current.data.requestedRef === 'string' ? { requestedRef: current.data.requestedRef } : {}),
+                ...(typeof current.data.resolvedSha === 'string' ? { resolvedSha: current.data.resolvedSha } : {}),
+                ...(typeof current.data.sourcePath === 'string' ? { sourcePath: current.data.sourcePath } : {}),
+                ...(typeof current.data.contentSha256 === 'string' ? { contentSha256: current.data.contentSha256 } : {}),
+                ...(typeof current.data.sourceContentSha256 === 'string' ? { sourceContentSha256: current.data.sourceContentSha256 } : {}),
+                ...(typeof current.data.catalogUrl === 'string' ? { catalogUrl: current.data.catalogUrl } : {}),
+                ...(typeof current.data.catalogResolvedSha === 'string' ? { catalogResolvedSha: current.data.catalogResolvedSha } : {}),
+                ...(typeof current.data.catalogName === 'string' ? { catalogName: current.data.catalogName } : {}),
+                ...(typeof current.data.pluginName === 'string' ? { pluginName: current.data.pluginName } : {}),
+                ...(Array.isArray(current.data.includedReferences) ? { includedReferences: current.data.includedReferences } : {})
+            };
+            const data = settingData('skill', { content, ...(current.data.bundle !== undefined ? { bundle: freezeSkillBundle(current.data.bundle, content) } : {}), enabled: current.data.enabled !== false, installed: current.data.installed === true, contentSha256: createHash('sha256').update(content).digest('hex'), copiedFrom });
+            const copied: Setting = { id: id('setting'), kind: 'skill', name: current.name, data, updatedAt: now() };
+            await store.put('setting', copied, tx);
+            return copied;
+        });
     });
     app.post("/api/workbench/connectors", async (req) => {
         await admin(req);
@@ -1568,7 +1641,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         githubWebhookSecret: process.env.WORKBENCH_GITHUB_WEBHOOK_SECRET,
         slackSigningSecret: process.env.WORKBENCH_SLACK_SIGNING_SECRET,
         fetcher: options.sourceFetcher,
-        authorize: async (req, pid, edit) => grant(await member(req), pid, edit),
+        authorize: async (req, pid, edit) => pid ? grant(await member(req), pid, edit) : admin(req).then(() => undefined),
         onIntake:async(projectId,sourceId,tx)=>{
             const project=await store.get<Project>('project',projectId,tx);const policy=project?.feedbackIntake;if(!policy?.enabled)return;
             const users=await tx`SELECT id,email,name,role FROM wb_users WHERE id=${policy.actorId}`;if(!users[0])return;

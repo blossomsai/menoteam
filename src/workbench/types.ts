@@ -1,3 +1,4 @@
+import type { SkillBundle } from './skill-bundle-types.js';
 import type { QaPolicy } from './local-qa.js';
 export interface Member {
     id: string;
@@ -133,7 +134,7 @@ export interface ExecutionContext {
     legacy?: boolean;
     provider: 'openai';
     method: 'codex-host';
-    skills: Array<{id:string;name:string;content:string}>;
+    skills: Array<{bundle?:SkillBundle;id:string;name:string;content:string;provenance?:string;sourceUrl?:string;requestedRef?:string;resolvedSha?:string;sourcePath?:string;contentSha256?:string;sourceContentSha256?:string;catalogUrl?:string;catalogResolvedSha?:string;copiedFrom?:{settingId:string;projectId:string;sourceUrl?:string;provenance?:string;requestedRef?:string;resolvedSha?:string;sourcePath?:string;contentSha256?:string;sourceContentSha256?:string;catalogUrl?:string;catalogResolvedSha?:string;catalogName?:string;pluginName?:string;includedReferences?:string[];bundleSha256?:string}}>;
     tools: string[];
 }
 export interface RuntimeProvider {

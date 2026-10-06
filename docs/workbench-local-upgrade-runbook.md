@@ -37,7 +37,7 @@ Do not restart PostgreSQL as part of either app or Connector replacement. Never 
 - Confirm `/healthz` returns `200` and identifies `menoteam-workbench`.
 - In the existing authenticated browser session, confirm `/api/workbench/me` still resolves to the same member; do not log out or replace the session merely to make the check pass.
 - Read the same project, Work, conversation and setting recorded before the upgrade. Compare stable IDs, revisions and non-secret fields; do not copy full private records into logs or this runbook.
-- Confirm the same Connector ID remains enrolled and its `last_seen` advances after the app is healthy. The Connector is a separate process: do not restart it as part of this procedure.
+- Confirm the same Connector ID remains enrolled and its `last_seen` advances after the app is healthy. The Connector is a separate process: if its code is unchanged, no restart is needed; if its code changed, use the companion Connector upgrade steps after verified child shutdown.
 - Record exact before/after app PIDs, source SHA, migration ledger, HTTP status, same-session result, record-ID/revision comparisons, Connector identity/heartbeat, and any failure. Keep evidence private and redact cookies, credentials, message bodies and repository contents.
 - If Connector code changed, also record its before/after PID/tree, launcher working directory/SHA, unchanged connector ID/data directory, child-process shutdown proof, heartbeat/capabilities, and bounded native canary result.
 

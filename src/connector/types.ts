@@ -1,4 +1,4 @@
-import type { Artifact, Project, Run, Setting } from '../workbench/types.js';
+import type { Artifact, Project, Run, Setting, ExecutionContext } from '../workbench/types.js';
 
 export interface ConnectorConfig {
   serverUrl: string;
@@ -14,6 +14,7 @@ export interface ConnectorConfig {
 }
 
 export interface ClaimedRun {
+  execution?: ExecutionContext;
   run: Run;
   project: Project;
   messages: Array<{ id: string; role: string; speaker: string; text: string; createdAt: string }>;

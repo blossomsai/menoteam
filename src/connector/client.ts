@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+import { verifyExecutionSkills, verifyBundle, type SkillBundle } from '../workbench/skill-bundle.js';
 import type { Artifact, Run } from '../workbench/types.js';
 import type { ClaimedRun, ConnectorEvent, ConnectorConfig, UploadArtifact } from './types.js';
 import { z } from 'zod';
@@ -142,9 +144,24 @@ export class WorkbenchConnectorClient {
   }
 }
 
+const provenanceFields = { provenance:z.string().optional(), sourceUrl:z.string().optional(), requestedRef:z.string().optional(), resolvedSha:z.string().optional(), sourcePath:z.string().optional(), contentSha256:z.string().regex(/^[a-f0-9]{64}$/u).optional(), sourceContentSha256:z.string().regex(/^[a-f0-9]{64}$/u).optional(), catalogUrl:z.string().optional(), catalogResolvedSha:z.string().optional() };
+const executionSchema = z.object({
+  provider: z.literal('openai'), method: z.literal('codex-host'), profileId: z.string().optional(),
+  profile:z.object({id:z.string(),name:z.string(),data:z.record(z.string(),z.unknown())}).strict().optional(),
+  connectionId:z.string().optional(),connectorId:z.string().optional(),model:z.string().optional(),legacy:z.boolean().optional(),tools: z.array(z.string()),
+  skills: z.array(z.object({ id: z.string().min(1), name: z.string(), content: z.string().max(64000),
+    ...provenanceFields, copiedFrom:z.object({settingId:z.string(),projectId:z.string(),...provenanceFields,catalogName:z.string().optional(),pluginName:z.string().optional(),includedReferences:z.array(z.string()).optional(),bundleSha256:z.string().optional()}).strict().optional(),
+    bundle: z.custom<SkillBundle>(value => { try { verifyBundle(value); return true; } catch { return false; } }).optional()
+  }).strict()).max(40)
+}).strict();
+
 function validateResponse(path: string, value: unknown): unknown {
   if (path.endsWith('/claim')) {
-    return z.object({ run: z.object({ id: z.string(), generation: z.number(), model: z.string(), reasoning: z.string(), kind: z.enum(['master','implementation','review','delivery']), status: z.string() }).passthrough(), project: z.object({ id: z.string(), repositoryUrl: z.string().optional() }).passthrough(), messages: z.array(z.object({ id: z.string(), role: z.string(), speaker: z.string(), text: z.string(), createdAt: z.string() }).passthrough()), settings: z.array(z.object({ id: z.string(), kind: z.string(), name: z.string(), data: z.record(z.string(), z.unknown()) }).passthrough()) }).parse(value);
+    const claim = z.object({ run: z.object({ id: z.string(), generation: z.number(), model: z.string(), reasoning: z.string(), kind: z.enum(['master','implementation','review','delivery']), status: z.string(), execution: executionSchema.optional() }).passthrough(), execution: executionSchema.optional(), project: z.object({ id: z.string(), repositoryUrl: z.string().optional() }).passthrough(), messages: z.array(z.object({ id: z.string(), role: z.string(), speaker: z.string(), text: z.string(), createdAt: z.string() }).passthrough()), settings: z.array(z.object({ id: z.string(), kind: z.string(), name: z.string(), data: z.record(z.string(), z.unknown()) }).passthrough()) }).parse(value);
+    if (claim.run.execution) verifyExecutionSkills(claim.run.execution.skills);
+    if (claim.execution) verifyExecutionSkills(claim.execution.skills);
+    if (claim.run.execution && claim.execution && !isDeepStrictEqual(claim.run.execution, claim.execution)) throw new Error('Claim execution snapshot mismatch');
+    return claim;
   }
   if (path.endsWith('/bridge-token')) return z.object({ token: z.string().min(32), expiresAt: z.string() }).parse(value);
   if (path.endsWith('/events')) return z.object({ accepted: z.boolean() }).parse(value);

@@ -1,3 +1,4 @@
+import { gitBlobHash, verifyBundle, freezeSkillBundle } from '../src/workbench/skill-bundle.js';
 import { mergePullRequest } from '../src/connector/github-merge-pr.js';
 import { requiredQaFixture,qaPolicyFixture } from './helpers/local-qa-fixture.js';
 import { mergeClaim,mergeFixture,localBase,base,mergeSha } from './helpers/merge-pr-fixture.js';
@@ -10,6 +11,7 @@ import { createHmac } from "node:crypto";
 import { beforeAll, beforeEach, afterAll, describe, it, expect, vi } from "vitest";
 import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
+import { WorkbenchStore } from "../src/workbench/store.js";
 import { WorkbenchConnectorClient } from "../src/connector/client.js";
 import type { Artifact, Project, Run, Work } from "../src/workbench/types.js";
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
@@ -474,7 +476,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const submitted = (await user('POST',`/projects/${projectId}/messages`,{text:'Check effective profile',workId:work.id,requestId:'effective-profile'})).json();
         expect(submitted.run.model).toBe('gpt-6.1-sol');
         expect(submitted.run.reasoning).toBe('high');
-        expect(submitted.run.execution.skills).toEqual([{id:skill.id,name:'Evidence',content:'Record proof before claiming success'}]);
+        expect(submitted.run.execution.skills).toEqual([{id:skill.id,name:'Evidence',content:'Record proof before claiming success',contentSha256:createHash('sha256').update('Record proof before claiming success').digest('hex')}]);
         await user('PATCH',`/settings/${skill.id}`,{data:{content:'Updated later'}});
         const stored = await sql`SELECT data FROM wb_records WHERE id=${submitted.run.id}`;
         expect(stored[0]!.data.execution.skills[0].content).toBe('Record proof before claiming success');
@@ -486,51 +488,351 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(runtime.every((r:{connectorId:string}) => r.connectorId !== provider.id)).toBe(true);
         expect(runtime.some((r:{verifiedRunId?:string}) => !!r.verifiedRunId)).toBe(true);
     });
-    it("imports GitHub SKILL.md over HTTP, persists the returned text, and rejects bad upstream content", async () => {
+    it("imports a commit-bound GitHub skill directory and rejects incomplete upstream listings", async () => {
         const importProjectId = (await user("POST", "/projects", { name: "GitHub skill import fixture" })).json().id as string;
         const ref = "a".repeat(40);
-        const sourceUrl = `https://github.com/example/skills/blob/${ref}/review/SKILL.md`;
-        const skillText = "# Review skill\nCheck the changed behavior against its acceptance criteria.";
-        const githubResponse = (status: number, body: unknown) => new Response(JSON.stringify(body), {
-            status,
-            headers: { "content-type": "application/json" }
+        const sourceUrl = `https://github.com/example/skills/blob/main/review/SKILL.md`;
+        const skillText = "---\nname: review\ndescription: Review changed behavior.\n---\nCheck acceptance criteria.";
+        const bytes = Buffer.from(skillText); const blob = gitBlobHash(bytes);
+        const originalFetch = sourceFetch; let incomplete = false;
+        sourceFetch = vi.fn<typeof fetch>(async input => {
+            const path = new URL(String(input)).pathname;
+            if (path.endsWith('/commits/main')) return Response.json({sha:ref});
+            if (path.endsWith(`/git/trees/${ref}`)) return Response.json({truncated:incomplete,tree:[{path:'review/SKILL.md',type:'blob',mode:'100644',sha:blob,size:bytes.length}]});
+            if (path.endsWith(`/git/blobs/${blob}`)) return Response.json({encoding:'base64',content:bytes.toString('base64'),size:bytes.length});
+            return new Response('not found',{status:404});
         });
-        const fetchMock = vi.fn<typeof fetch>();
-        const originalFetch = sourceFetch;
-        sourceFetch = fetchMock;
         try {
-            fetchMock.mockResolvedValueOnce(githubResponse(200, {
-                type: "file",
-                encoding: "base64",
-                content: Buffer.from(skillText).toString("base64"),
-                size: Buffer.byteLength(skillText)
-            }));
             const imported = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
             expect(imported.statusCode).toBe(200);
-            expect(fetchMock.mock.calls[0]?.[0]).toBe(`https://api.github.com/repos/example/skills/contents/review/SKILL.md?ref=${ref}`);
-            expect(imported.json()).toMatchObject({
-                kind: "skill",
-                projectId: importProjectId,
-                name: "review",
-                data: { content: skillText, sourceUrl, enabled: true }
-            });
-            expect((await user("GET", "/snapshot")).json().settings).toContainEqual(imported.json());
-
-            fetchMock.mockResolvedValueOnce(githubResponse(404, { message: "Not Found" }));
-            const missing = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
-            expect(missing.statusCode).toBe(502);
-
-            fetchMock.mockResolvedValueOnce(githubResponse(200, {
-                type: "file",
-                encoding: "base64",
-                content: Buffer.from("x").toString("base64"),
-                size: 64001
-            }));
-            const oversized = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
-            expect(oversized.statusCode).toBe(400);
-            expect(fetchMock).toHaveBeenCalledTimes(3);
+            expect(imported.json()).toMatchObject({ kind:"skill",projectId:importProjectId,name:"review",data:{content:skillText,sourceUrl,enabled:true,installed:true,requestedRef:'main',resolvedSha:ref} });
+            verifyBundle(imported.json().data.bundle);
+            incomplete = true;
+            const rejected = await user("POST", `/projects/${importProjectId}/skills/import`, { url: sourceUrl });
+            expect(rejected.statusCode).toBe(400);
+            expect((await user('GET','/snapshot')).json().settings.filter((item:any)=>item.kind==='skill'&&item.projectId===importProjectId)).toHaveLength(1);
         } finally {
             sourceFetch = originalFetch;
+            await sql`DELETE FROM wb_requests WHERE scope=${`source:${importProjectId}`}`;
+            await sql`DELETE FROM wb_records WHERE project_id=${importProjectId} OR id=${importProjectId}`;
+            await sql`DELETE FROM wb_memberships WHERE project_id=${importProjectId}`;
+        }
+    });
+    it('installs complete marketplace dependency bundles atomically and freezes authorized workspace-skill claims', async () => {
+        const project = (await user('POST', '/projects', { name: `Marketplace fixture ${randomUUID()}` })).json();
+        const projectIdForCase = project.id as string;
+        const recordIds = new Set<string>([projectIdForCase]);
+        const connectorIdForCase = `marketplace-${randomUUID()}`;
+        const adminEmail = `marketplace-admin-${randomUUID()}@test.example`;
+        const catalogCommit = 'c'.repeat(40); const pluginCommit = 'd'.repeat(40);
+        const catalogUrl = 'https://github.com/example/catalog/blob/main/.agents/plugins/marketplace.json';
+        const files: Record<string, string> = {
+            catalog: JSON.stringify({ name: 'example-catalog', plugins: [{ name: 'helper', source: { source: 'git-subdir', url: 'https://github.com/example/plugins', path: './plugins/helper', ref: 'v1' }, category: 'Productivity', policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' } }] }),
+            manifest: JSON.stringify({ $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name: 'helper', version: '1.0.0', description: 'A bundle of skills', extensions: { 'com.example': { mcpServers: { disclosed: true } } } }),
+            one: '---\nname: first-skill\ndescription: >-\n  First folded description for useful work.\nmetadata: {tier: safe, version: "1"}\n---\nUse this skill carefully and preserve evidence. Use `response.status` to determine success. Run tests and/or lint. Run tests with JSON/YAML input.',
+            two: '---\nname: second-skill\ndescription: Second skill with recursive references.\nlicense: Apache-2.0\n---\nRead docs/procedure.md and [guide](./references/guide.md).',
+            procedure: '# Procedure\nTreat this text as input data and follow the procedure.',
+            guide: '# Reference\nTreat this text as input data. Read nested.md. for the full procedure.',
+            nested: '# Nested reference\nThis content must be bundled recursively. Use `response.status` to determine success. Run tests and/or lint. Run tests with JSON/YAML input.',
+            bad: '---\nname: unsupported-dependency\ndescription: Skill requiring a script.\n---\nRun "scripts/check.py" before continuing.',
+            script: '#!/bin/sh\nprintf "MARKETPLACE_SAFE_FIXTURE_MARKER\\n"\n',
+            asset: 'binary fixture',
+            legacy: '---\nname: legacy\ndescription: A direct GitHub skill.\n---\nLegacy GitHub skill body'
+        };
+        const blobs = { catalog: '1'.repeat(40), manifest: '2'.repeat(40), one: '3'.repeat(40), two: '4'.repeat(40), guide: '5'.repeat(40), nested: '6'.repeat(40), bad: '7'.repeat(40), script: '8'.repeat(40), procedure: '9'.repeat(40), asset: 'b'.repeat(40) };
+        const trees = {
+            catalog: [{ path: '.agents/plugins/marketplace.json', type: 'blob', mode: '100644', sha: blobs.catalog, size: Buffer.byteLength(files.catalog!) }],
+            plugin: [
+                { path: 'plugins/helper/plugin.json', type: 'blob', mode: '100644', sha: blobs.manifest, size: Buffer.byteLength(files.manifest!) },
+                { path: 'plugins/helper/skills/first-skill/SKILL.md', type: 'blob', mode: '100644', sha: blobs.one, size: Buffer.byteLength(files.one!) },
+                { path: 'plugins/helper/skills/second-skill/SKILL.md', type: 'blob', mode: '100644', sha: blobs.two, size: Buffer.byteLength(files.two!) },
+                { path: 'plugins/helper/skills/second-skill/docs/procedure.md', type: 'blob', mode: '100644', sha: blobs.procedure, size: Buffer.byteLength(files.procedure!) },
+                { path: 'plugins/helper/skills/second-skill/references/guide.md', type: 'blob', mode: '100644', sha: blobs.guide, size: Buffer.byteLength(files.guide!) },
+                { path: 'plugins/helper/skills/second-skill/scripts/check', type: 'blob', mode: '100755', sha: blobs.script, size: Buffer.byteLength(files.script!) },
+                { path: 'plugins/helper/skills/second-skill/assets/icon.bin', type: 'blob', mode: '100644', sha: blobs.asset, size: 6 },
+                { path: 'plugins/helper/skills/second-skill/references/nested.md', type: 'blob', mode: '100644', sha: blobs.nested, size: Buffer.byteLength(files.nested!) },
+                { path: 'plugins/helper/skills/unsupported-dependency/SKILL.md', type: 'blob', mode: '100644', sha: blobs.bad, size: Buffer.byteLength(files.bad!) },
+                { path: 'plugins/helper/skills/unsupported-dependency/scripts/check.py', type: 'blob', mode: '100755', sha: blobs.script, size: Buffer.byteLength(files.script!) },
+                { path: 'plugins/helper/mcp.json', type: 'blob', mode: '100644', sha: 'a'.repeat(40), size: 20 }
+            ]
+        };
+        let invalidDescription = false; let invalidManifest = false; let invalidRef = false; let oversizedSkill = false; let invalidUtf8 = false; let missingNested = false; let overflowCatalog = false; let streamedBodyCancelled = false; let unsafeBundle = false; let truncatedTree = false; let tamperedBlob = false;
+        const originalFetch = sourceFetch;
+        const binaryAsset = Buffer.from([0,255,128,13,10,0]);
+        const fixtureBytes = (key:string) => {
+            if (key === 'asset') return binaryAsset;
+            if (key === 'bad' && invalidDescription) return Buffer.from('---\nname: unsupported-dependency\ndescription: [not, a, string]\n---\nInvalid metadata.');
+            if (key === 'manifest' && invalidManifest) return Buffer.from(JSON.stringify({...JSON.parse(files.manifest!),mcpServers:{remote:{command:'never-run'}}}));
+            if (key === 'one' && oversizedSkill) return Buffer.alloc(64_001,65);
+            if (key === 'one' && invalidUtf8) return Buffer.from([255]);
+            return Buffer.from(files[key]!);
+        };
+        sourceFetch = vi.fn<typeof fetch>(async input => {
+            const path = new URL(String(input)).pathname;
+            if (overflowCatalog && path.endsWith('/commits/main')) return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(300_000)); }, cancel() { streamedBodyCancelled = true; } }));
+            const legacyRepo = path.includes('/example/legacy/');
+            const legacyBytes = fixtureBytes('legacy'); const legacySha = gitBlobHash(legacyBytes);
+            const currentEntries = trees.plugin.map(entry => {
+                const key = Object.entries(blobs).find(([,sha])=>sha===entry.sha)?.[0];
+                if (!key) return entry;
+                const bytes = fixtureBytes(key);
+                return {...entry,sha:gitBlobHash(bytes),size:bytes.length,...(unsafeBundle && key==='script'?{mode:'120000'}:{})};
+            });
+            let body: unknown;
+            if (path.endsWith('/commits/main')) body = {sha:legacyRepo?pluginCommit:catalogCommit};
+            else if (path.endsWith('/commits/v1')) body = {sha:invalidRef?'not-a-commit':pluginCommit};
+            else if (legacyRepo && path.endsWith(`/git/trees/${pluginCommit}`)) body = {truncated:false,tree:[{path:'SKILL.md',type:'blob',mode:'100644',sha:legacySha,size:legacyBytes.length}]};
+            else if (legacyRepo && path.endsWith(`/git/blobs/${legacySha}`)) body = {encoding:'base64',size:legacyBytes.length,content:legacyBytes.toString('base64')};
+            else if (path.endsWith(`/git/trees/${catalogCommit}`)) body = {truncated:false,tree:trees.catalog};
+            else if (path.endsWith(`/git/trees/${pluginCommit}`)) body = {truncated:truncatedTree,tree:missingNested?currentEntries.filter(item=>!item.path.endsWith('/nested.md')):currentEntries};
+            else {
+                const key = Object.keys(blobs).find(key => path.endsWith(`/git/blobs/${key==='catalog'?blobs.catalog:gitBlobHash(fixtureBytes(key))}`));
+                if (!key) return new Response('not found',{status:404});
+                const bytes = fixtureBytes(key);
+                body = {encoding:'base64',size:bytes.length,content:(tamperedBlob&&key==='one'?Buffer.alloc(bytes.length,65):bytes).toString('base64')};
+            }
+            return Response.json(body);
+        });
+        const originalPut = WorkbenchStore.prototype.put;
+        let failSecondWrite = false;
+        try {
+            const scope = { scope: 'project' as const, projectId: projectIdForCase, catalogUrl };
+            const listed = await user('POST', '/skills/catalog', scope);
+            expect(listed.statusCode).toBe(200);
+            const previewResponse = await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' });
+            expect(previewResponse.statusCode).toBe(200);
+            const preview = previewResponse.json();
+            expect(preview.plugin.commit).toBe(pluginCommit);
+            expect(preview.unsupported).toContain('plugin.json:extensions.com.example.mcpServers');
+            expect(preview.unsupported).toContain('plugins/helper/mcp.json');
+            expect(preview.skills[0].description).toContain('First folded description');
+            expect(preview.skills[0].path).toContain('first-skill/SKILL.md');
+            expect(preview.skills[0].unsupportedDependency).toBeUndefined();
+            expect(preview.skills[1].unsupportedDependency).toBeUndefined();
+            expect(preview.skills[1].bundleFiles.map((item: {path:string})=>item.path)).toEqual([
+                'SKILL.md','assets/icon.bin','docs/procedure.md','references/guide.md','references/nested.md','scripts/check'
+            ]);
+            expect(preview.skills[2].unsupportedDependency).toBeUndefined(); // Regular scripts are bundled, never executed.
+            for (const fault of ['symlink','tamper','truncated'] as const) {
+                unsafeBundle=fault==='symlink'; tamperedBlob=fault==='tamper'; truncatedTree=fault==='truncated';
+                const rejected = await user('POST','/skills/catalog/import',{...scope,pluginName:'helper',selectedPaths:[preview.skills[0].path,preview.skills[1].path],previewCommit:preview.plugin.commit,previewCatalogCommit:preview.catalog.commit});
+                expect(rejected.statusCode).toBe(400); expect(rejected.json().installed).toBeUndefined();
+                expect((await user('GET','/snapshot')).json().settings.filter((item:any)=>item.kind==='skill'&&item.projectId===projectIdForCase)).toHaveLength(0);
+            }
+            unsafeBundle=false; tamperedBlob=false; truncatedTree=false;
+            vi.spyOn(WorkbenchStore.prototype, 'put').mockImplementation(async function (this: WorkbenchStore, kind: string, data: { id: string; projectId?: string }, tx?: ReturnType<typeof postgres>) {
+                if (failSecondWrite && kind === 'setting' && (data as { name?: string }).name === 'second-skill') throw new Error('injected second catalog write failure');
+                return originalPut.call(this, kind, data, tx as never);
+            });
+            failSecondWrite = true;
+            const failedBundle = await user('POST', '/skills/catalog/import', { ...scope, pluginName: 'helper', selectedPaths: [preview.skills[0].path, preview.skills[1].path], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit });
+            expect(failedBundle.statusCode).toBe(500);
+            expect((await user('GET', '/snapshot')).json().settings.filter((item: any) => item.kind === 'skill' && item.projectId === projectIdForCase && item.data.provenance)).toHaveLength(0);
+            failSecondWrite = false;
+            vi.restoreAllMocks();
+
+            const [left, right] = await Promise.all([
+                user('POST', '/skills/catalog/import', { ...scope, pluginName: 'helper', selectedPaths: [preview.skills[0].path, preview.skills[1].path], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit }),
+                user('POST', '/skills/catalog/import', { ...scope, pluginName: 'helper', selectedPaths: [preview.skills[0].path, preview.skills[1].path], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit })
+            ]);
+            for (const response of [left, right]) if (response.statusCode === 200) for (const item of response.json().installed as Array<{ id: string }>) recordIds.add(item.id);
+            expect([left.statusCode, right.statusCode].sort()).toEqual([200, 409]);
+            const imported = (left.statusCode === 200 ? left : right).json().installed as Array<{ id: string; data: Record<string, any> }>;
+            expect(imported).toHaveLength(2);
+            expect(imported[0]!.data.content).toContain('Use `response.status` to determine success.');
+            verifyBundle(imported[1]!.data.bundle);
+            const assetFile=imported[1]!.data.bundle.files.find(file=>file.path==='assets/icon.bin');
+            const scriptFile=imported[1]!.data.bundle.files.find(file=>file.path==='scripts/check');
+            const nestedFile=imported[1]!.data.bundle.files.find(file=>file.path==='references/nested.md');
+            if (!assetFile || !scriptFile || !nestedFile) throw new Error('Imported bundle omitted fixture resources');
+            expect(Buffer.from(assetFile.data,'base64')).toEqual(binaryAsset);
+            expect(scriptFile.mode).toBe('100755');
+            expect(imported[0]!.data.content).toBe(files.one);
+            expect(imported[0]!.data.content).toContain('Run tests and/or lint. Run tests with JSON/YAML input.');
+            expect(Buffer.from(nestedFile.data,'base64').toString()).toBe(files.nested);
+            expect(imported[0]!.data).toMatchObject({ requestedRef: 'v1', resolvedSha: pluginCommit, sourceContentSha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+            expect((await user('GET', '/snapshot')).json().settings.filter((item: any) => item.kind === 'skill' && item.projectId === projectIdForCase && item.data.provenance)).toHaveLength(2);
+            expect(imported[1]!.data.bundle.commit).toBe(pluginCommit);
+            const expectedFrozenBundle = freezeSkillBundle(imported[0]!.data.bundle,files.one!);
+            expect(imported[1]!.data.sourceContentSha256).toMatch(/^[a-f0-9]{64}$/);
+            const singleScope = { scope: 'workspace' as const, catalogUrl };
+            const single = await user('POST', '/skills/catalog/import', { ...singleScope, pluginName: 'helper', selectedPaths: [preview.skills[0].path], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit });
+            const singleBody = single.json(); if (singleBody.installed) for (const item of singleBody.installed as Array<{ id: string }>) recordIds.add(item.id);
+            expect(single.statusCode).toBe(200); expect(singleBody.installed).toHaveLength(1);
+            const singleInstalled = singleBody.installed[0];
+            expect(singleInstalled.data).toMatchObject({ requestedRef: 'v1', resolvedSha: pluginCommit, installed: true });
+            const duplicateSelection = await user('POST', '/skills/catalog/import', { ...scope, pluginName: 'helper', selectedPaths: [preview.skills[0].path, preview.skills[0].path], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit });
+            expect(duplicateSelection.statusCode).toBe(400);
+
+            const invite = (await user('POST', '/invites', { email: adminEmail, projectId: projectIdForCase, role: 'admin' })).json();
+            await app.inject({ method: 'POST', url: '/api/workbench/invites/accept', payload: { token: invite.token, name: 'Project admin', password: 'project-admin-test-password' } });
+            const adminLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: adminEmail, password: 'project-admin-test-password' } });
+            const adminCookie = String(adminLogin.headers['set-cookie']).split(';')[0]!;
+            const projectAdminCopy = await app.inject({ method: 'POST', url: `/api/workbench/settings/${imported[0]!.id}/copy-to-workspace`, headers: { cookie: adminCookie } });
+            expect(projectAdminCopy.statusCode).toBe(403);
+            const projectAdminWorkspaceCatalog = await app.inject({ method: 'POST', url: '/api/workbench/skills/catalog', headers: { cookie: adminCookie }, payload: { scope: 'workspace', catalogUrl } });
+            expect(projectAdminWorkspaceCatalog.statusCode).toBe(403);
+            const copied = (await user('POST', `/settings/${imported[0]!.id}/copy-to-workspace`)).json();
+            recordIds.add(copied.id);
+            expect(copied.data).toMatchObject({ content: files.one, enabled: true, copiedFrom: { settingId: imported[0]!.id, projectId: projectIdForCase, resolvedSha: pluginCommit } });
+
+            const resourceCopyResponse = await user('POST', `/settings/${imported[1]!.id}/copy-to-workspace`);
+            const resourceCopy = resourceCopyResponse.json(); if(resourceCopy.id) recordIds.add(resourceCopy.id);
+            expect(resourceCopyResponse.statusCode).toBe(200);
+            expect(resourceCopy.data.bundle).toEqual(imported[1]!.data.bundle);
+            const createdSkillResponse = await user('POST', '/settings', { kind: 'skill', projectId: projectIdForCase, name: 'Created project skill', data: { content: 'Created project skill body' } });
+            const createdSkill = createdSkillResponse.json(); if (createdSkill.id) recordIds.add(createdSkill.id);
+            expect(createdSkillResponse.statusCode).toBe(200);
+            expect(createdSkill.data.contentSha256).toBe(createHash('sha256').update('Created project skill body').digest('hex'));
+            const legacyImportResponse = await user('POST', `/projects/${projectIdForCase}/skills/import`, { url: 'https://github.com/example/legacy/blob/main/SKILL.md' });
+            const legacySkill = legacyImportResponse.json(); if (legacySkill.id) recordIds.add(legacySkill.id);
+            expect(legacyImportResponse.statusCode).toBe(200);
+            expect(legacySkill.data.contentSha256).toBe(createHash('sha256').update(files.legacy!).digest('hex'));
+            const createdCopyResponse = await user('POST', `/settings/${createdSkill.id}/copy-to-workspace`);
+            const createdCopy = createdCopyResponse.json(); if (createdCopy.id) recordIds.add(createdCopy.id);
+            expect(createdCopyResponse.statusCode).toBe(200);
+            const legacyCopyResponse = await user('POST', `/settings/${legacySkill.id}/copy-to-workspace`);
+            const legacyCopy = legacyCopyResponse.json(); if (legacyCopy.id) recordIds.add(legacyCopy.id);
+            expect(legacyCopyResponse.statusCode).toBe(200);
+            expect(createdCopy.data.installed).toBe(false);
+            expect(legacyCopy.data.installed).toBe(true);
+            const createdEdit = await user('PATCH', `/settings/${createdCopy.id}`, { data: { content: 'Edited created skill' } });
+            const legacyEdit = await user('PATCH', `/settings/${legacyCopy.id}`, { data: { content: 'Edited legacy GitHub skill' } });
+            expect(createdEdit.statusCode).toBe(200);
+            expect(legacyEdit.statusCode).toBe(200);
+            expect(createdEdit.json().data.contentSha256).toBe(createHash('sha256').update('Edited created skill').digest('hex'));
+            expect(legacyEdit.json().data.contentSha256).toBe(createHash('sha256').update('Edited legacy GitHub skill').digest('hex'));
+            expect(createdEdit.json().data.copiedFrom).toEqual(createdCopy.data.copiedFrom);
+            expect(legacyEdit.json().data.copiedFrom).toMatchObject({ sourceUrl: legacySkill.data.sourceUrl, contentSha256: createHash('sha256').update(files.legacy!).digest('hex') });
+
+            const forgedProfile = await user('POST', '/settings', { kind: 'profile', projectId: projectIdForCase, name: 'Forbidden project profile', data: { model: 'gpt-6-luna', skillIds: [imported[0]!.id] } });
+            expect(forgedProfile.statusCode).toBe(400);
+            const profile = (await user('POST', '/settings', { kind: 'profile', name: 'Marketplace reusable', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [copied.id, resourceCopy.id, createdCopy.id, legacyCopy.id] } })).json();
+            recordIds.add(profile.id);
+            const adminUserId = String((await sql`SELECT id FROM wb_users WHERE email=${adminEmail}`)[0]!.id);
+            const guardedWorkResponse = await user('POST', `/projects/${projectIdForCase}/works`, { title: 'Authorization recheck fixture' });
+            const guardedWork = guardedWorkResponse.json(); if (guardedWork.id) recordIds.add(guardedWork.id);
+            expect(guardedWorkResponse.statusCode).toBe(200);
+            const waitForWorkbenchLock = async () => {
+                for (let attempt = 0; attempt < 10000; attempt++) {
+                    const waiting = await sql`SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%' AND query LIKE '%menoteam-workbench-state%'`;
+                    if (waiting.length) return;
+                    await new Promise<void>(resolve => setImmediate(resolve));
+                }
+                throw new Error('Timed out waiting for the request to reach the workbench transaction lock');
+            };
+            const revokeWhileWaiting = async (request: () => Promise<{ statusCode: number; body: string; json(): any }>) => {
+                let lockAcquired!: () => void; let revoke!: () => void;
+                const acquired = new Promise<void>(resolve => { lockAcquired = resolve; });
+                const release = new Promise<void>(resolve => { revoke = resolve; });
+                const holder = sql.begin(async tx => {
+                    await tx`SELECT pg_advisory_xact_lock(hashtext('menoteam-workbench-state'))`;
+                    lockAcquired(); await release;
+                    await tx`DELETE FROM wb_memberships WHERE user_id=${adminUserId} AND project_id=${projectIdForCase}`;
+                });
+                await acquired;
+                const pendingRequest = request();
+                try { await waitForWorkbenchLock(); }
+                catch (error) { revoke(); await holder; await pendingRequest.catch(() => undefined); throw error; }
+                revoke(); await holder;
+                return pendingRequest;
+            };
+            const adminRequest = (method: 'POST' | 'PATCH', path: string, payload: unknown) => app.inject({ method, url: `/api/workbench${path}`, remoteAddress: `127.0.0.${scenarioAddress}`, headers: { cookie: adminCookie }, payload: payload as never });
+            const deniedAssignment = await revokeWhileWaiting(() => adminRequest('PATCH', `/works/${guardedWork.id}`, { revision: guardedWork.revision, profileId: profile.id }));
+            expect(deniedAssignment.statusCode).toBe(403);
+            expect((await user('GET', `/works/${guardedWork.id}`)).json().work.profileId).toBe('');
+            await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES (${adminUserId},${projectIdForCase},'admin') ON CONFLICT(user_id,project_id) DO UPDATE SET role='admin'`;
+            const deniedRun = await revokeWhileWaiting(() => adminRequest('POST', `/projects/${projectIdForCase}/messages`, { text: 'Must not queue after revocation', workId: guardedWork.id, requestId: `revoked-${randomUUID()}` }));
+            expect(deniedRun.statusCode).toBe(403);
+            const me = (await user('GET', '/me')).json();
+            const connector = (await user('POST', '/connectors', { id: connectorIdForCase, projectIds: [projectIdForCase] })).json();
+            const connectorTokenForCase = connector.token as string;
+            const claim = () => app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorTokenForCase}` }, payload: { capabilities: { models: ['gpt-6-luna'] } } });
+            const submitWork = async (title: string, requestId: string) => {
+                const created = await user('POST', `/projects/${projectIdForCase}/works`, { title });
+                const work = created.json(); if (work.id) recordIds.add(work.id);
+                expect(created.statusCode).toBe(200);
+                const assigned = await user('PATCH', `/works/${work.id}`, { revision: work.revision, profileId: profile.id });
+                expect(assigned.statusCode).toBe(200);
+                const submitted = (await user('POST', `/projects/${projectIdForCase}/messages`, { text: title, workId: work.id, requestId })).json();
+                recordIds.add(submitted.run.id); recordIds.add(submitted.message.id);
+                return submitted.run;
+            };
+            const run1 = await submitWork('Frozen original', `marketplace-${randomUUID()}`);
+            expect(run1.requestedBy).toBe(me.id);
+            const claimed1 = (await claim()).json();
+            expect(claimed1.run.id).toBe(run1.id);
+            expect(claimed1.run.requestedBy).toBe(me.id);
+            expect(claimed1.run.connectorId).toBe(connectorIdForCase);
+            expect(claimed1.execution.skills).toHaveLength(4);
+            expect(run1.execution.skills[0].bundle).toEqual(expectedFrozenBundle);
+            expect(claimed1.execution.skills.find((skill:any)=>skill.id===resourceCopy.id).bundle).toEqual(imported[1]!.data.bundle);
+            verifyBundle(claimed1.execution.skills.find((skill:any)=>skill.id===resourceCopy.id).bundle);
+            expect((await user('PATCH', `/settings/${resourceCopy.id}`, {data:{bundle:{version:1}}})).statusCode).toBe(400);
+            expect(claimed1.execution.skills[0]).toMatchObject({ id: copied.id, content: files.one, contentSha256: copied.data.contentSha256, copiedFrom: { resolvedSha: pluginCommit, sourcePath: preview.skills[0].path, contentSha256: imported[0]!.data.contentSha256 } });
+
+            const disabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited after run one', enabled: false } });
+            expect(disabled.statusCode).toBe(200);
+            const run2 = await submitWork('Disabled next run', `marketplace-${randomUUID()}`);
+            expect(run2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
+            const claimed2 = (await claim()).json();
+            expect(claimed2.run.id).toBe(run2.id);
+            expect(claimed2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
+            const enabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited and re-enabled for a new run', enabled: true } });
+            expect(enabled.statusCode).toBe(200);
+            expect(enabled.json().data.contentSha256).toBe(createHash('sha256').update('Edited and re-enabled for a new run').digest('hex'));
+            const run3 = await submitWork('Updated next run', `marketplace-${randomUUID()}`);
+            expect(run3.execution.skills[0].content).toBe('Edited and re-enabled for a new run');
+            const claimed3 = (await claim()).json();
+            expect(claimed3.run.id).toBe(run3.id);
+            expect(claimed3.execution.skills[0]).toMatchObject({ id: copied.id, content: 'Edited and re-enabled for a new run', copiedFrom: copied.data.copiedFrom });
+            const createdRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === createdCopy.id);
+            const legacyRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === legacyCopy.id);
+            expect(createdRunSkill).toMatchObject({ content: 'Edited created skill', contentSha256: createHash('sha256').update('Edited created skill').digest('hex'), copiedFrom: createdEdit.json().data.copiedFrom });
+            expect(legacyRunSkill).toMatchObject({ content: 'Edited legacy GitHub skill', contentSha256: createHash('sha256').update('Edited legacy GitHub skill').digest('hex'), copiedFrom: legacyEdit.json().data.copiedFrom });
+            expect((await user('PATCH', `/settings/${createdCopy.id}`, { data: { content: 'Create copy edited after run' } })).statusCode).toBe(200);
+            expect((await user('PATCH', `/settings/${legacyCopy.id}`, { data: { content: 'Legacy copy edited after run' } })).statusCode).toBe(200);
+            const run4 = await submitWork('Copied source edits are frozen', `marketplace-${randomUUID()}`);
+            const claimed4 = (await claim()).json();
+            expect(claimed4.run.id).toBe(run4.id);
+            expect(claimed4.execution.skills.find((skill: any) => skill.id === createdCopy.id)).toMatchObject({ content: 'Create copy edited after run', contentSha256: createHash('sha256').update('Create copy edited after run').digest('hex') });
+            expect(claimed4.execution.skills.find((skill: any) => skill.id === legacyCopy.id)).toMatchObject({ content: 'Legacy copy edited after run', contentSha256: createHash('sha256').update('Legacy copy edited after run').digest('hex') });
+            const frozenCopiedRun = (await sql`SELECT data FROM wb_records WHERE id=${run3.id} AND kind='run'`)[0]!.data as Run;
+            expect(frozenCopiedRun.execution!.skills.find(skill => skill.id === createdCopy.id)).toMatchObject({ content: 'Edited created skill', contentSha256: createHash('sha256').update('Edited created skill').digest('hex') });
+            expect(frozenCopiedRun.execution!.skills.find(skill => skill.id === legacyCopy.id)).toMatchObject({ content: 'Edited legacy GitHub skill', contentSha256: createHash('sha256').update('Edited legacy GitHub skill').digest('hex') });
+            const frozenRun = (await sql`SELECT data FROM wb_records WHERE id=${run1.id} AND kind='run'`)[0]!.data as Run;
+            expect(frozenRun.execution!.skills[0]!.content).toBe(files.one);
+            expect(frozenRun.execution!.skills[0]!.bundle).toEqual(expectedFrozenBundle);
+            expect(frozenRun.execution!.skills[0]!.contentSha256).toBe(createHash('sha256').update(files.one!).digest('hex'));
+            expect(frozenRun.requestedBy).toBe(me.id);
+
+            const malformedRef = await user('POST', '/skills/catalog/import', { ...scope, pluginName: 'helper', selectedPaths: ['../escape/SKILL.md'], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit });
+            expect(malformedRef.statusCode).toBe(400);
+            missingNested = true;
+            const reducedPreview = (await user('POST','/skills/catalog/preview',{...scope,pluginName:'helper'})).json();
+            expect(reducedPreview.skills[1].bundleFiles.some((file:any)=>file.path==='references/nested.md')).toBe(false);
+            missingNested = false;
+            invalidDescription = true;
+            expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).json().skills[2].unsupportedDependency).toContain('frontmatter');
+            invalidDescription = false; invalidManifest = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).statusCode).toBe(400);
+            invalidManifest = false; invalidRef = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).statusCode).toBe(502);
+            invalidRef = false; oversizedSkill = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).json().skills[0].unsupportedDependency).toContain('too large');
+            oversizedSkill = false; invalidUtf8 = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).json().skills[0].unsupportedDependency).toContain('UTF-8');
+            invalidUtf8 = false; overflowCatalog = true;
+            expect((await user('POST', '/skills/catalog', scope)).statusCode).toBe(400);
+            expect(streamedBodyCancelled).toBe(true);
+        } finally {
+            vi.restoreAllMocks(); sourceFetch = originalFetch;
+            await app.close();
+            try {
+                await sql`DELETE FROM wb_records WHERE project_id=${projectIdForCase} OR id = ANY(${[...recordIds]})`;
+                await sql`DELETE FROM wb_requests WHERE scope=${`message:${projectIdForCase}`}`;
+                await sql`DELETE FROM wb_connectors WHERE id=${connectorIdForCase}`;
+                await sql`DELETE FROM wb_memberships WHERE project_id=${projectIdForCase}`;
+                await sql`DELETE FROM wb_invites WHERE email=${adminEmail}`;
+                await sql`DELETE FROM wb_sessions WHERE user_id IN (SELECT id FROM wb_users WHERE email=${adminEmail})`;
+                await sql`DELETE FROM wb_users WHERE email=${adminEmail}`;
+            } finally { app = await createWorkbenchApp({ sql, sourceFetcher: (...args) => sourceFetch(...args) }); }
         }
     });
     it('requires connector stop proof before browser reconciliation',async()=>{
@@ -1241,7 +1543,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const work=(await user('POST',`/projects/${project.id}/works`,{title:'Use the shared profile',profileId:profile.id})).json();
             const dispatched=await user('POST',`/projects/${project.id}/messages`,{workId:work.id,text:'Use reusable instructions',requestId:`shared-profile-${project.id}`});
             expect(dispatched.statusCode).toBe(200);
-            expect(dispatched.json().run.execution.skills).toEqual([{id:global.id,name:'Reusable instructions',content:'All authorized Projects'}]);
+            expect(dispatched.json().run.execution.skills).toEqual([{id:global.id,name:'Reusable instructions',content:'All authorized Projects',contentSha256:createHash('sha256').update('All authorized Projects').digest('hex')}]);
         }
     });
     it("survives service restart", async () => {

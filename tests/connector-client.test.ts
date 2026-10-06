@@ -1,7 +1,27 @@
 import { expect, it, vi } from 'vitest';
 import { WorkbenchConnectorClient } from '../src/connector/client.js';
+import { collectSkillBundle, gitBlobHash, bytesHash } from '../src/workbench/skill-bundle.js';
 
 const auth = { serverUrl: 'https://workbench.example.invalid', token: 'local-connector-token-'.padEnd(48, 'x') };
+
+it('claim transport retains the exact frozen bundle and rejects tampering or divergent snapshots', async () => {
+  const content='---\nname: fixture\ndescription: Fixture.\n---\nRead resources.';
+  const bytes=Buffer.from(content);
+  const bundle=await collectSkillBundle([{path:'fixture/SKILL.md',type:'blob',mode:'100644',sha:gitBlobHash(bytes),size:bytes.length}], 'fixture','a'.repeat(40),async()=>bytes);
+  const execution={provider:'openai',method:'codex-host',profileId:'profile-fixture',profile:{id:'profile-fixture',name:'Frozen profile',data:{model:'gpt-6-luna',reasoning:'medium',skillIds:['s'],tools:[]}},connectionId:'provider-fixture',connectorId:'connector-fixture',model:'gpt-6-luna',legacy:false,tools:[],skills:[{id:'s',name:'Fixture',content,contentSha256:bytesHash(bytes),bundle}]};
+  const payload={run:{id:'r',generation:1,model:'gpt-6-luna',reasoning:'medium',kind:'implementation',status:'running',execution},execution,project:{id:'p'},messages:[],settings:[]};
+  const client=new WorkbenchConnectorClient(auth,async()=>Response.json(payload));
+  const claim=await client.claim();
+  expect(claim?.run.execution?.skills[0]?.bundle).toEqual(bundle);
+  expect(claim?.execution).toEqual(execution);
+  expect(claim?.run.execution).toEqual(execution);
+  const unknown={...payload,execution:{...execution,unrecognizedIdentity:'must-not-bypass-strict'}};
+  await expect(new WorkbenchConnectorClient(auth,async()=>Response.json(unknown)).claim()).rejects.toThrow();
+  const tampered=structuredClone(payload); tampered.run.execution.skills[0]!.bundle.files[0]!.data='AA==';
+  await expect(new WorkbenchConnectorClient(auth,async()=>Response.json(tampered)).claim()).rejects.toThrow();
+  const divergent=structuredClone(payload); divergent.execution={...divergent.execution,skills:[]};
+  await expect(new WorkbenchConnectorClient(auth,async()=>Response.json(divergent)).claim()).rejects.toThrow(/mismatch/u);
+});
 
 it('validates project-scoped Master tool results without treating them as Run records', async () => {
   const fetcher = vi.fn(async (_url: URL | RequestInfo, _init?: RequestInit) => new Response(JSON.stringify({ work: { id: 'work-1' }, revision: 1 }), { status: 200 }));

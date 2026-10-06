@@ -1,9 +1,9 @@
 import type { Member, Project, Work } from '../types';
 
-export type View = 'all' | 'master' | 'work' | 'work-detail' | 'connect' | 'instructions' | 'skills' | 'members' | 'connections' | 'agent-profiles' | 'model-providers';
+export type View = 'all' | 'master' | 'work' | 'work-detail' | 'connect' | 'instructions' | 'skills' | 'workspace-skills' | 'members' | 'connections' | 'agent-profiles' | 'model-providers';
 export type Route = { view: View; projectId: string; workId: string; settingsTab: 'agent-profiles' | 'model-providers' };
 
-const views: View[] = ['all', 'master', 'work', 'work-detail', 'connect', 'instructions', 'skills', 'members', 'connections', 'agent-profiles', 'model-providers'];
+const views: View[] = ['all', 'master', 'work', 'work-detail', 'connect', 'instructions', 'skills', 'workspace-skills', 'members', 'connections', 'agent-profiles', 'model-providers'];
 
 export function readRoute(href: string): Route {
   const url = new URL(href);
