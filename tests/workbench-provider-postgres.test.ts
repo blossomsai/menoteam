@@ -131,6 +131,7 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
   const userEmails = [ownerEmail];
   const runIds: string[] = [];
   let ownerCookie = '';
+  let ownerActorId = '';
   let ownsDatabase = false;
 
   const user = (method: 'GET' | 'POST' | 'PATCH', path: string, payload?: unknown, cookie = ownerCookie) => app.inject({
@@ -183,6 +184,8 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const login = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: ownerEmail, password } });
     expect(login.statusCode).toBe(200);
     ownerCookie = String(login.headers['set-cookie']).split(';')[0]!;
+    ownerActorId = checked(await user('GET', '/me')).id;
+    expect(ownerActorId).toMatch(/^user_/u);
     await app.close();
     activeApp = undefined;
   });
@@ -507,7 +510,7 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const retry = checked(await user('POST', `/projects/${project.id}/messages`, { ...handoffPayload, requestId: successfulRequestId }));
     expect(retry.run.id).toBe(handedOff.id);
     expect(await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`).toEqual(rowsAfterSuccess);
-    expect(handedOff).toMatchObject({ workId: work.id, threadId: nativeThread, handoffFromRunId: source.id, handoffRequestedBy: ownerEmail, model: 'fixture-model', reasoning: advertisedEffort, execution: { connectionId: connection.id, connectorId: host.connectorId, provider: 'openai', method: 'codex-host', profileId: profile.id, model: 'fixture-model' } });
+    expect(handedOff).toMatchObject({ workId: work.id, threadId: nativeThread, handoffFromRunId: source.id, handoffRequestedBy: ownerActorId, requestedBy: ownerActorId, model: 'fixture-model', reasoning: advertisedEffort, execution: { connectionId: connection.id, connectorId: host.connectorId, provider: 'openai', method: 'codex-host', profileId: profile.id, model: 'fixture-model' } });
     expect(handedOff.execution.profile).toEqual(source.execution.profile);
     expect(handedOff.execution.skills).toEqual(source.execution.skills);
     expect(handedOff.execution.tools).toEqual(source.execution.tools);
