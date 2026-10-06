@@ -170,3 +170,18 @@ live. If a candidate migration is not compatible with its previous app
 revision, deployment is blocked until an isolated rollback drill demonstrates
 a safe recovery. A future user-facing cutover requires a separate explicit
 authorization and is outside this runbook.
+
+
+## Local isolated Work dependency readiness
+
+Creating a Connector Git worktree currently does not prepare its dependencies.
+Before a future authorized native run, verify the assigned checkout's pinned
+package-manager version, exact lockfile hash and required local tool links.
+The demonstrated preparation is limited to a scratch checkout: pnpm 11.19.0,
+frozen lockfile, offline cached packages and ignored install scripts, with
+copies/links confined to that checkout. Missing cached packages must be reported
+as blocked; do not substitute a mutable main `node_modules`, fetch unknown
+dependencies or enable install scripts implicitly. Preparation does not permit
+writing shared `dist`, changing runtime processes or inheriting QA database
+credentials. A scratch typecheck success is not proof that an active native
+checkout was prepared or that its source compiles.
