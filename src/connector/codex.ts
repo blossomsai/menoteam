@@ -45,10 +45,12 @@ export class CodexAppServer {
   private readonly activeRejectors = new Set<(error: Error) => void>();
   private childClosed = false;
   private closeWaiter?: () => void;
+  private stopTask?: Promise<void>;
 
   constructor(private readonly binary = 'codex') {}
 
   async start(cwd: string): Promise<string[]> {
+    if(this.stopTask){await this.stopTask;this.stopTask=undefined;}
     if (this.child) return this.models;
     const nativeEnv = modelChildEnvironment();
     const child = spawn(this.binary, ['app-server'], { cwd, env: nativeEnv, stdio: ['pipe','pipe','pipe'], shell: false, detached: process.platform !== 'win32' });
@@ -159,11 +161,15 @@ export class CodexAppServer {
     } finally { this.events.off('message', listener); this.activeRejectors.delete(fail); }
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return this.stopTask??=this.stopProcess();
+  }
+
+  private async stopProcess(): Promise<void> {
     const child = this.child; this.child = undefined;
-    if (!child || this.childClosed) return;
+    if (!child) return;
     const pid = child.pid;
-    child.stdin.end(); signalGroup(child, 'SIGTERM');
+    if(!this.childClosed){child.stdin.end();signalGroup(child,'SIGTERM');}
     if (!pid) {
       if (!this.childClosed) await new Promise<void>(resolve => { this.closeWaiter = resolve; });
       return;

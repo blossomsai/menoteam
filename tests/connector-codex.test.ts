@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { CodexAppServer } from '../src/connector/codex.js';
 import type { ClaimedRun } from '../src/connector/types.js';
 
@@ -98,4 +98,30 @@ for await (const line of createInterface({ input: process.stdin })) {
    await rm(directory, { recursive: true, force: true });
   }
  }
+});
+
+it('retains an unconfirmed native stop result across concurrent and repeated calls and refuses restart', async () => {
+ const native = new CodexAppServer(); const pid = 678901;
+ (native as unknown as { child: unknown }).child = { pid, stdin: { end: vi.fn() }, kill: vi.fn() };
+ const originalKill = process.kill.bind(process); const kill = vi.spyOn(process, 'kill').mockImplementation((target, signal) => target === -pid ? true : originalKill(target, signal));
+ vi.useFakeTimers();
+ try {
+  const first = native.stop(); const concurrent = native.stop(); expect(concurrent).toBe(first);
+  const rejected = expect(first).rejects.toThrow('stop cannot be confirmed'); await vi.runAllTimersAsync(); await rejected;
+  expect(native.stop()).toBe(first); await expect(native.stop()).rejects.toThrow('stop cannot be confirmed');
+  await expect(native.start('/unused')).rejects.toThrow('stop cannot be confirmed');
+ } finally { vi.useRealTimers(); kill.mockRestore(); }
+});
+
+it.skipIf(process.platform === 'win32')('stops real descendants after the native leader has already closed', async () => {
+ const directory = await mkdtemp(path.join(os.tmpdir(), 'menoteam-codex-closed-leader-')); const executable = path.join(directory, 'fake-codex.mjs');
+ const app = new CodexAppServer(executable); let child: import('node:child_process').ChildProcess | undefined;
+ const source = `#!${process.execPath}\nimport {createInterface} from 'node:readline';import {spawn} from 'node:child_process';
+for await(const line of createInterface({input:process.stdin})){const message=JSON.parse(line);if(message.id!==undefined){process.stdout.write(JSON.stringify({id:message.id,result:message.method==='model/list'?{data:[{id:'fixture'}]}:{}})+'\\n');if(message.method==='model/list'){spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});setTimeout(()=>process.exit(0),30);}}}`;
+ try {
+  await writeFile(executable, source, { mode: 0o700 }); await chmod(executable, 0o700); await app.start(directory);
+  child = (app as unknown as { child: import('node:child_process').ChildProcess }).child;
+  await new Promise<void>(resolve => child!.once('close', () => resolve())); expect(process.kill(-child.pid!, 0)).toBe(true);
+  await app.stop(); expect(() => process.kill(-child!.pid!, 0)).toThrowError(expect.objectContaining({ code: 'ESRCH' }));
+ } finally { if(child?.pid){try{process.kill(-child.pid,'SIGKILL');}catch{}}await app.stop().catch(()=>undefined);await rm(directory,{recursive:true,force:true}); }
 });
