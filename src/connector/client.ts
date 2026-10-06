@@ -38,8 +38,9 @@ function retryAfterSeconds(value: string | null): number | undefined {
 export class WorkbenchConnectorClient {
   private readonly baseUrl: string;
   private readonly codexModels: string[];
+  private readonly modelReasoningEfforts: Record<string, string[]>;
 
-  constructor(private readonly config: Pick<ConnectorConfig, 'serverUrl' | 'token'>, private readonly fetcher: typeof fetch = fetch, codexModels: string[] = []) {
+  constructor(private readonly config: Pick<ConnectorConfig, 'serverUrl' | 'token'>, private readonly fetcher: typeof fetch = fetch, codexModels: string[] = [], modelReasoningEfforts: Record<string, string[]> = {}) {
     const url = new URL(config.serverUrl);
     const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname);
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
@@ -48,12 +49,14 @@ export class WorkbenchConnectorClient {
     if (url.username || url.password || url.search || url.hash) throw new Error('Workbench connector URL must not contain credentials or query parameters');
     this.baseUrl = url.toString().replace(/\/$/u, '');
     this.codexModels = [...new Set(codexModels)];
+    this.modelReasoningEfforts = modelReasoningEfforts;
   }
 
   async claim(runKinds?: Run['kind'][]): Promise<ClaimedRun | undefined> {
     const capabilities = {
       codexAppServer: true,
       models: this.codexModels,
+      modelReasoningEfforts: this.modelReasoningEfforts,
       localWorktrees: true,
       ...(process.env.MENOTEAM_GITHUB_TOKEN ? { git: true, githubWrite: true, deliveryActions: ['create_draft_pr','merge_pr'] } : {}),
       ...(runKinds ? { runKinds: [...new Set(runKinds)] } : {}),

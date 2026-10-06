@@ -64,11 +64,16 @@ export class CodexAppServer {
     this.notify('initialized', {});
     const models = await this.request('model/list', { limit: 100 });
     this.models = Array.isArray(models?.data) ? models.data.map((m: any) => String(m.id)).filter(Boolean) : [];
+    this.modelReasoningEfforts = Object.fromEntries(Array.isArray(models?.data) ? models.data.flatMap((model: any) => {
+      const efforts = Array.isArray(model.supportedReasoningEfforts) ? model.supportedReasoningEfforts.map((item: any) => item?.reasoningEffort).filter((effort: unknown): effort is string => typeof effort === 'string' && effort.length > 0) : [];
+      return typeof model.id === 'string' && efforts.length ? [[model.id, efforts]] : [];
+    }) : []);
     if (!this.models.length) throw new Error('Codex app-server returned no available models');
     return this.models;
   }
 
   models: string[] = [];
+  modelReasoningEfforts: Record<string, string[]> = {};
 
   async processIdentity(): Promise<CodexProcessIdentity | undefined> {
     const pid = this.child?.pid;
@@ -80,6 +85,7 @@ export class CodexAppServer {
     bridgeContextFile?: string): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
     if (!this.child) await this.start(cwd);
     if (!this.models.includes(claim.run.model)) throw Object.assign(new Error(`Requested model is unavailable on this connector: ${claim.run.model}`), {nativeStage:'model-validation',nativeCategory:'unavailable-model'});
+    if (claim.run.handoffFromRunId && !this.modelReasoningEfforts[claim.run.model]?.includes(claim.run.reasoning)) throw Object.assign(new Error(`Requested reasoning effort is unavailable for this model on this connector: ${claim.run.reasoning}`), {nativeStage:'model-validation',nativeCategory:'unavailable-reasoning-effort'});
     if ((claim.run.kind === 'master' || claim.run.kind === 'review') && !bridgeContextFile) {
       throw new Error(`${claim.run.kind} run needs its scoped MCP context file`);
     }

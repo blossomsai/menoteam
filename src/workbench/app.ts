@@ -16,6 +16,7 @@ import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQ
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 const text = z.string().trim().min(1).max(12000);
+const handoffSchema = z.object({ fromRunId: z.string().min(1).max(200), model: z.string().min(1).max(200), reasoning: z.string().min(1).max(100) }).strict();
 const serverSkillEvidence = new Set(['bundle','sourceUrl','installed','provenance','requestedRef','resolvedSha','sourcePath','contentSha256','sourceContentSha256','catalogUrl','catalogName','catalogResolvedSha','pluginName','includedReferences','unsupportedPluginComponents','copiedFrom']);
 function fail(statusCode: number, message: string): never {
     throw Object.assign(new Error(message), {
@@ -217,6 +218,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             return {provider:'openai',method:'codex-host',connectorId:c.id,projectIds:(c.project_ids as string[]).filter(pid=>projectIds.includes(pid)),runKinds:c.capabilities?.runKinds,codexAppServer:c.capabilities?.codexAppServer,localWorktrees:c.capabilities?.localWorktrees,
                 available:!!c.last_seen && Date.now()-new Date(c.last_seen).getTime()<120000,
                 models:Array.isArray(c.capabilities?.models)?c.capabilities.models:[],
+                ...(c.capabilities?.modelReasoningEfforts&&typeof c.capabilities.modelReasoningEfforts==='object'?{modelReasoningEfforts:c.capabilities.modelReasoningEfforts as Record<string,string[]>}:{}),
                 lastSeen:c.last_seen?new Date(c.last_seen).toISOString():'',
                 ...(evidence[0]?{verifiedRunId:evidence[0].id,verifiedAt:evidence[0].verified_at}:{})};
         }));
@@ -227,10 +229,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             const endpoint=runtime.find(c=>c.connectorId===s.data.connectorId);
             const reason=!endpoint?undefined:endpoint.codexAppServer!==true?'Codex capability unavailable':endpoint.localWorktrees!==true?'Local Worktree capability unavailable':!endpoint.models.length?'Connector models have not been discovered':undefined;
             const status=s.data.enabled===false?'disabled':!s.data.connectorId?'unbound':!endpoint?'disconnected':!endpoint.available?'offline':reason?'capability_unavailable':'available';
-            return {id:s.id,name:s.name,connectorId:s.data.connectorId,default:s.data.default===true,enabled:s.data.enabled!==false,status,reason,localWorktrees:endpoint?.localWorktrees,models:endpoint?.models??[],projectIds:endpoint?.projectIds??[],runKinds:endpoint?.runKinds};
+            return {id:s.id,name:s.name,connectorId:s.data.connectorId,default:s.data.default===true,enabled:s.data.enabled!==false,status,reason,localWorktrees:endpoint?.localWorktrees,models:endpoint?.models??[],modelReasoningEfforts:endpoint?.modelReasoningEfforts??{},projectIds:endpoint?.projectIds??[],runKinds:endpoint?.runKinds};
         });
     }
-    async function validateSelection(projectId:string, connectorId:string, model:string|undefined, kind:Run['kind']|undefined, tx:Sql, connectionId?:string, legacy=false) {
+    async function validateSelection(projectId:string, connectorId:string, model:string|undefined, kind:Run['kind']|undefined, tx:Sql, connectionId?:string, legacy=false, reasoning?:string) {
         if(connectionId){
             const connection=await store.get<Setting>('setting',connectionId,tx);
             if(!connection||connection.kind!=='provider'||connection.projectId||connection.data.connectorId!==connectorId||connection.data.enabled===false)fail(409,'Selected provider connection is unavailable or disabled');
@@ -242,6 +244,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const caps=endpoint!.capabilities;
         if(caps?.codexAppServer===false||!legacy&&caps?.codexAppServer!==true)fail(409,'Selected Connector Codex capability is unavailable');
         if(model&&(!Array.isArray(caps?.models)||!caps.models.includes(model)))fail(409,'Selected Connector model is unavailable');
+        if(reasoning!==undefined&&(!Array.isArray(caps?.modelReasoningEfforts?.[model??''])||!caps.modelReasoningEfforts[model??''].includes(reasoning)))fail(409,'Selected Connector reasoning effort is unavailable for this model');
         // runKinds is current scheduler capacity (an active Master removes master), not revoked Codex capability.
         if(requiresLocalWorktree(kind)&&(caps?.localWorktrees===false||!legacy&&caps?.localWorktrees!==true))fail(409,'Selected Connector local Worktree capability is unavailable');
     }
@@ -270,7 +273,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     }
     async function validateRunSelection(run:Run,tx:Sql){
         const selected=await validateFrozenRunIdentity(run,tx);
-        await validateSelection(run.projectId,selected,run.model,run.kind,tx,run.execution?.connectionId,!run.execution?.connectionId);
+        await validateSelection(run.projectId,selected,run.model,run.kind,tx,run.execution?.connectionId,!run.execution?.connectionId,run.handoffFromRunId?run.reasoning:undefined);
     }
     app.get("/api/workbench/snapshot", async (req) => {
         const user = await member(req);
@@ -379,6 +382,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         sourceIds?: string[];
         model?: string;
         reasoning?: string;
+        handoff?: { fromRunId: string; model: string; reasoning: string };
     }, tx = sql) {
         if(!await actorAuthorized({projectId,requestedBy:input.requestedBy,sourceIds:input.sourceIds},tx))fail(403,'Run requester project authorization is unavailable');
         if (input.workId) {
@@ -388,6 +392,16 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         }
         const priorRuns = await store.list<Run>("run", projectId, tx);
         const sameKindHistory = priorRuns.filter(x => x.workId === input.workId && x.kind === input.kind && !isCausalMasterWake(x) && (x.threadId || x.execution?.connectorId || x.connectorId || x.targetConnectorId)).at(-1);
+        const handoff = input.handoff;
+        if (handoff) {
+            const source = sameKindHistory;
+            if (input.kind !== 'implementation' || !input.workId || !source || source.id !== handoff.fromRunId || source.kind !== 'implementation' || source.workId !== input.workId)
+                fail(409, 'Handoff source is no longer the latest implementation run for this Work');
+            if (!source.threadId || !source.execution || !['completed', 'failed'].includes(source.status) && !(source.status === 'cancelled' && source.stoppedAt))
+                fail(409, 'Handoff source must have a reliable stopped thread and terminal run state');
+            if (priorRuns.some(run => run.workId === input.workId && run.id !== source.id && run.kind !== 'master' && (['queued', 'running', 'paused', 'interrupted'].includes(run.status) || run.status === 'cancelled' && !run.stoppedAt)))
+                fail(409, 'Another Work run still holds an execution reservation');
+        }
         const previous = sameKindHistory?.threadId ? sameKindHistory : undefined;
         const candidate = input.kind === "review" ? (await store.list<Artifact>("artifact", projectId, tx)).filter(a => a.workId === input.workId && a.kind === "diff").at(-1) : undefined;
         if (input.kind === "review" && !candidate)
@@ -414,8 +428,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             .filter(skill => skill.data.enabled !== false)
             .map(skill => ({...(skill.data.bundle !== undefined ? {bundle: freezeSkillBundle(skill.data.bundle, String(skill.data.content))} : {}), id: skill.id, name: skill.name, content: String(skill.data.content), ...(typeof skill.data.provenance === 'string' ? {provenance: skill.data.provenance} : {}), ...(typeof skill.data.sourceUrl === 'string' ? {sourceUrl: skill.data.sourceUrl} : {}), ...(typeof skill.data.requestedRef === 'string' ? {requestedRef: skill.data.requestedRef} : {}), ...(typeof skill.data.resolvedSha === 'string' ? {resolvedSha: skill.data.resolvedSha} : {}), ...(typeof skill.data.sourcePath === 'string' ? {sourcePath: skill.data.sourcePath} : {}), ...(typeof skill.data.contentSha256 === 'string' ? {contentSha256: skill.data.contentSha256} : {}), ...(typeof skill.data.sourceContentSha256 === 'string' ? {sourceContentSha256: skill.data.sourceContentSha256} : {}), ...(typeof skill.data.catalogUrl === 'string' ? {catalogUrl: skill.data.catalogUrl} : {}), ...(typeof skill.data.catalogResolvedSha === 'string' ? {catalogResolvedSha: skill.data.catalogResolvedSha} : {}), ...(skill.data.copiedFrom && typeof skill.data.copiedFrom === 'object' ? {copiedFrom: structuredClone(skill.data.copiedFrom) as ExecutionContext['skills'][number]['copiedFrom']} : {})})) : [];
         verifyExecutionSkills(skills);
-        if(snapshotRun&&input.model&&input.model!==snapshotRun.model)fail(409,'Frozen model cannot change');
-        const model=snapshotRun?.model??input.model ?? (input.kind==='implementation'&&profile?String(profile.data.model):input.kind==='implementation'?'gpt-6-luna':'gpt-6.1-sol');
+        if(snapshotRun&&!handoff&&input.model&&input.model!==snapshotRun.model)fail(409,'Frozen model cannot change');
+        const model=handoff?.model??snapshotRun?.model??input.model ?? (input.kind==='implementation'&&profile?String(profile.data.model):input.kind==='implementation'?'gpt-6-luna':'gpt-6.1-sol');
         const frozenConnectionId=historical?.execution?.connectionId??targetWork?.connectionId;
         if(input.connectionId&&(targetWork||historical)&&input.connectionId!==frozenConnectionId)fail(409,'Existing Work or native thread provider connection cannot change');
         const connectionId=frozenConnectionId??(!targetWork&&!historical?input.connectionId??(await store.list<Setting>('setting',undefined,tx)).find(s=>s.kind==='provider'&&!s.projectId&&s.data.default===true&&s.data.connectorId)?.id:undefined);
@@ -425,7 +439,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const candidateRun=candidate?priorRuns.find(r=>r.id===candidate.runId):undefined;
         const candidateConnector=candidateRun?await validateFrozenRunIdentity(candidateRun,tx):undefined;
         if(candidateConnector&&candidateConnector!==connectorId)fail(409,'Candidate Connector is incompatible with selected connection');
-        await validateSelection(projectId,connectorId!,model,input.kind,tx,connectionId,!connectionId);
+        await validateSelection(projectId,connectorId!,model,input.kind,tx,connectionId,!connectionId,handoff?.reasoning);
+        const execution: ExecutionContext = snapshotRun?.execution ? structuredClone(snapshotRun.execution) : {provider:'openai',method:'codex-host',connectionId,connectorId,model,...(!connectionId?{legacy:true}:{}),...(profile?{profileId:profile.id,profile:{id:profile.id,name:profile.name,data:structuredClone(profile.data)}}:{}),skills,
+            tools:profile && Array.isArray(profile.data.tools)?profile.data.tools as string[]:[]};
+        if(snapshotRun?.threadId&&snapshotRun.execution){execution.connectionId=snapshotRun.execution.connectionId;execution.connectorId=snapshotRun.execution.connectorId??snapshotRun.connectorId??snapshotRun.targetConnectorId;execution.model=handoff?model:snapshotRun.execution.model??snapshotRun.model;if(!snapshotRun.execution.connectionId&&snapshotRun.execution.legacy)execution.legacy=true;}
+        if(handoff)execution.model=model;
         const run: Run = {
             ...(candidate ? {
                 targetRevision: candidate.revision,
@@ -436,15 +454,20 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 threadId: previous.threadId,
                 targetConnectorId: previous.connectorId
             } : {}),
-            execution: snapshotRun?.execution?structuredClone(snapshotRun.execution):{provider:'openai',method:'codex-host',connectionId,connectorId,model,...(!connectionId?{legacy:true}:{}),...(profile?{profileId:profile.id,profile:{id:profile.id,name:profile.name,data:structuredClone(profile.data)}}:{}),skills,
-                tools:profile && Array.isArray(profile.data.tools)?profile.data.tools as string[]:[]},
+            execution,
             id: id("run"),
             projectId,
-            ...input,
+            ...(input.workId ? {workId:input.workId} : {}),
+            ...(input.connectionId ? {connectionId:input.connectionId} : {}),
+            prompt:input.prompt,
+            kind:input.kind,
+            requestedBy:input.requestedBy,
+            allowedActions:input.allowedActions,
+            sourceIds:input.sourceIds,
             model: model,
-            ...(snapshotRun?.threadId&&snapshotRun.execution?{execution:{...structuredClone(snapshotRun.execution),connectionId: snapshotRun.execution.connectionId,connectorId: snapshotRun.execution.connectorId??snapshotRun.connectorId??snapshotRun.targetConnectorId,model:snapshotRun.execution.model??snapshotRun.model,...(!snapshotRun.execution.connectionId&&snapshotRun.execution.legacy?{legacy:true}:{})}}:{}),
             targetConnectorId: connectorId,
-            reasoning: snapshotRun?.reasoning??input.reasoning ?? (profile ? String(profile.data.reasoning) : "medium"),
+            reasoning: handoff?.reasoning??snapshotRun?.reasoning??input.reasoning ?? (profile ? String(profile.data.reasoning) : "medium"),
+            ...(handoff ? {handoffFromRunId:handoff.fromRunId,handoffRequestedBy:input.requestedBy} : {}),
             status: "queued",
             generation: 0,
             createdAt: now(),
@@ -672,6 +695,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             text,
             workId: z.string().optional(),
             connectionId: z.string().min(1).max(200).optional(),
+            handoff: handoffSchema.optional(),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
         return store.transaction(`message:${pid}:${b.requestId}`, async (tx) => {
@@ -685,7 +709,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 connectionId: b.connectionId,
                 prompt: b.text,
                 requestedBy: currentActor.id,
-                kind: b.workId ? "implementation" : "master"
+                kind: b.workId ? "implementation" : "master",
+                handoff: b.handoff
             }, tx);
             const message: Message = {
                 id: id("message"),
@@ -1401,13 +1426,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             result=await requestMergePr(actors[0] as unknown as Member,prior!.workId!,input,tx,r.projectId);
         }
         else if (b.action === "dispatch") {
-            const input = z.object({
-                workId: text,
-                prompt: text,
-                kind: z.enum(["implementation", "review"]),
-                model: z.enum(["gpt-6-luna", "gpt-6.1-sol"]),
-                reasoning: z.enum(["low", "medium", "high", "xhigh"]).default("medium")
-            }).parse(b.input);
+            const input = z.union([
+                z.object({workId:text,prompt:text,kind:z.enum(["implementation","review"]),model:z.enum(["gpt-6-luna","gpt-6.1-sol"]),reasoning:z.enum(["low","medium","high","xhigh"]).default("medium")}).strict(),
+                z.object({workId:text,prompt:text,kind:z.literal('implementation'),handoff:handoffSchema}).strict()
+            ]).parse(b.input);
             result = await makeRun(r.projectId, {
                 ...input,
                 requestedBy: r.requestedBy,allowedActions:r.allowedActions,sourceIds:r.sourceIds

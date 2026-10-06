@@ -468,6 +468,34 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     expect((await user('GET', `/works/${racedWork.id}`)).json().runs.find((item: any) => item.id === racedRun.id).execution).toEqual(racedExecution);
   });
 
+  it('requires an explicit supported same-Work model handoff and preserves the source run snapshot', async () => {
+    const project = await makeProject('Explicit model handoff');
+    const host = await enrollFixtureConnector('handoff', project.id, ['gpt-6-luna', 'fixture-model']);
+    const connection = await addConnection(host.connectorId, 'Handoff Codex');
+    const advertisedEffort = 'fixture-advertised-effort';
+    await sql`UPDATE wb_connectors SET capabilities=${sql.json({ codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'fixture-model'], modelReasoningEfforts: { 'gpt-6-luna': ['medium'], 'fixture-model': [advertisedEffort] }, runKinds: ['implementation'] })} WHERE id=${host.connectorId}`;
+    const profile = checked(await user('POST', '/settings', { kind: 'profile', name: 'Handoff profile', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [], tools: [] } }));
+    settingIds.push(profile.id);
+    const work = checked(await user('POST', `/projects/${project.id}/works`, { title: 'Same Work handoff', profileId: profile.id, connectionId: connection.id }));
+    const source = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Start original model', workId: work.id, requestId: `handoff-source-${suffix}` })).run;
+    const sourceClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'fixture-model'], modelReasoningEfforts: { 'gpt-6-luna': ['medium'], 'fixture-model': [advertisedEffort] }, runKinds: ['implementation'] } } }));
+    expect(sourceClaim.run.id).toBe(source.id);
+    const nativeThread = `handoff-thread-${suffix}`;
+    checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${source.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: sourceClaim.run.generation, threadId: nativeThread } }));
+    const sourceBefore = (await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data;
+
+    const unsupported = await user('POST', `/projects/${project.id}/messages`, { text: 'Reject an invented effort', workId: work.id, handoff: { fromRunId: source.id, model: 'fixture-model', reasoning: 'not-advertised' }, requestId: `handoff-unsupported-${suffix}` });
+    expect(unsupported.statusCode).toBe(409);
+    const handedOff = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Continue with selected model', workId: work.id, handoff: { fromRunId: source.id, model: 'fixture-model', reasoning: advertisedEffort }, requestId: `handoff-success-${suffix}` })).run;
+    expect(handedOff).toMatchObject({ workId: work.id, threadId: nativeThread, handoffFromRunId: source.id, handoffRequestedBy: ownerEmail, model: 'fixture-model', reasoning: advertisedEffort, execution: { connectionId: connection.id, connectorId: host.connectorId, provider: 'openai', method: 'codex-host', profileId: profile.id, model: 'fixture-model' } });
+    expect(handedOff.execution.profile).toEqual(source.execution.profile);
+    expect(handedOff.execution.skills).toEqual(source.execution.skills);
+    expect(handedOff.execution.tools).toEqual(source.execution.tools);
+    expect((await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data).toEqual(sourceBefore);
+    const staleSource = await user('POST', `/projects/${project.id}/messages`, { text: 'Cannot hand off from a superseded run', workId: work.id, handoff: { fromRunId: source.id, model: 'gpt-6-luna', reasoning: 'medium' }, requestId: `handoff-stale-${suffix}` });
+    expect(staleSource.statusCode).toBe(409);
+  });
+
   it('requires Worktree capability for review request, claim, lease renewal, and live reads', async () => {
     const project = await makeProject('Review Worktree capability');
     const host = await enrollFixtureConnector('review-host', project.id);

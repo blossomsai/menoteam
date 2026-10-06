@@ -38,10 +38,11 @@ it('allows only HTTPS outside literal loopback HTTP', () => {
 
 it('can constrain a claim to run kinds without changing the default capability request', async () => {
   const fetcher = vi.fn(async (_url: URL | RequestInfo, _init?: RequestInit) => new Response(null, { status: 204 }));
-  const client = new WorkbenchConnectorClient(auth, fetcher as typeof fetch);
+  const client = new WorkbenchConnectorClient(auth, fetcher as typeof fetch, ['gpt-6-luna'], { 'gpt-6-luna': ['advertised-effort'] });
   await client.claim(['master', 'implementation', 'master']);
   const body = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
   expect(body.capabilities.runKinds).toEqual(['master', 'implementation']);
+  expect(body.capabilities.modelReasoningEfforts).toEqual({ 'gpt-6-luna': ['advertised-effort'] });
 });
 
 it('surfaces only safe validation paths and codes from API errors', async () => {

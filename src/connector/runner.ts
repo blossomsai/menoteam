@@ -55,7 +55,7 @@ export class ConnectorRunner {
   private client?: WorkbenchConnectorClient;
   constructor(private readonly config: ConnectorConfig, private readonly dependencies?: {
     native: () => CodexAppServer;
-    client: (models:string[]) => WorkbenchConnectorClient;
+    client: (models:string[], modelReasoningEfforts?:Record<string,string[]>) => WorkbenchConnectorClient;
     delivery?:{fetcher?:typeof fetch;transport?:Parameters<typeof createDraftPullRequest>[5]};
   }) {}
   private native():CodexAppServer { return this.dependencies?.native() ?? new CodexAppServer(this.config.codexBinary); }
@@ -72,7 +72,7 @@ export class ConnectorRunner {
     let models:string[];
     try { models=await discovery.start(this.config.dataDir); }
     finally { await discovery.stop(); }
-    this.client = this.dependencies?.client(models) ?? new WorkbenchConnectorClient(this.config,fetch,models);
+    this.client = this.dependencies?.client(models,discovery.modelReasoningEfforts) ?? new WorkbenchConnectorClient(this.config,fetch,models,discovery.modelReasoningEfforts);
     await this.recover();
     while (!this.closing) {
       try {

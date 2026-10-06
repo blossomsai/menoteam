@@ -47,6 +47,8 @@ export interface Run {
     allowedActions?: string[];
     sourceIds?: string[];
     execution?: ExecutionContext;
+    handoffFromRunId?: string;
+    handoffRequestedBy?: string;
     causedByRunId?: string;
     kind: 'master' | 'implementation' | 'review' | 'delivery';
     operation?: {
@@ -147,6 +149,7 @@ export interface RuntimeProvider {
     codexAppServer?: boolean;
     localWorktrees?: boolean;
     models: string[];
+    modelReasoningEfforts?: Record<string,string[]>;
     lastSeen: string;
     verifiedRunId?: string;
     verifiedAt?: string;

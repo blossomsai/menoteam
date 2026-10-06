@@ -21,6 +21,7 @@ export interface ProviderConnection {
   default: boolean;
   status: 'disabled' | 'unbound' | 'disconnected' | 'offline' | 'capability_unavailable' | 'available' | string;
   models: string[];
+  modelReasoningEfforts?: Record<string,string[]>;
   projectIds: string[];
   runKinds?: string[];
   localWorktrees?: boolean;
@@ -71,7 +72,7 @@ export const workbenchApi = {
   createProject: (input: { name: string; repositoryUrl?: string }) => request<Project>('/projects', { method: 'POST', body: JSON.stringify(input) }),
   updateProject: (id: string, input: { instructions?: string; expectedInstructions?: string; deliveryAuthorization?: string; feedbackIntake?: { enabled: boolean; allowExecution: boolean } }) => request<Project>(`/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   createWork: (projectId: string, input: { title: string; overview: string; connectionId: string; profileId?: string }) => request<Work>(`/projects/${encodeURIComponent(projectId)}/works`, { method: 'POST', body: JSON.stringify(input) }),
-  sendMessage: (projectId: string, input: { text: string; workId?: string; connectionId?: string; requestId: string }) => request<{ message: Message; run: Run }>(`/projects/${encodeURIComponent(projectId)}/messages`, { method: 'POST', body: JSON.stringify(input) }),
+  sendMessage: (projectId: string, input: { text: string; workId?: string; connectionId?: string; handoff?: { fromRunId: string; model: string; reasoning: string }; requestId: string }) => request<{ message: Message; run: Run }>(`/projects/${encodeURIComponent(projectId)}/messages`, { method: 'POST', body: JSON.stringify(input) }),
   updateWork: (workId: string, input: { revision: number; overview?: string; status?: Work['status']; profileId?: string }) => request<Work>(`/works/${encodeURIComponent(workId)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   requestDraftPr: (workId: string, input: { candidateRunId: string; candidateRevision: string; action: 'create_draft_pr'; requestId: string }) => request<{ run: Run; operationId: string }>(`/works/${encodeURIComponent(workId)}/delivery`, { method: 'POST', body: JSON.stringify(input) }),
   requestMergePr: (workId: string, input: { priorDeliveryRunId: string; reviewRunId: string; requestId: string }) => request<{ run: Run; operationId: string }>(`/works/${encodeURIComponent(workId)}/merge`, { method: 'POST', body: JSON.stringify(input) }),

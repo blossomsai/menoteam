@@ -32,6 +32,26 @@ it('resumes the same persisted native thread without hydrating its growing histo
  expect(events).toEqual([{type:'thread_started',text:'Native Codex thread durable-native-thread is active.',threadId:'durable-native-thread'}]);
 });
 
+it('applies an explicit handoff model to the resumed thread and its advertised effort to the new turn',async()=>{
+ const native=new CodexAppServer();const calls:{method:string;params:any}[]=[];
+ const internals=native as unknown as {child:unknown;events:EventEmitter;request:(method:string,params:any)=>Promise<any>};
+ internals.child={};native.models=['target-model'];native.modelReasoningEfforts={'target-model':['advertised-effort']};
+ internals.request=async(method,params)=>{calls.push({method,params});if(method==='thread/resume')return{thread:{id:params.threadId}};if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{turn:{id:'handoff-turn',status:'completed'}}}),0);return{turn:{id:'handoff-turn'}};}throw Error('Unexpected RPC');};
+ const claim={run:{kind:'implementation',model:'target-model',reasoning:'advertised-effort',handoffFromRunId:'source-run'}} as ClaimedRun;
+ const result=await native.run(claim,'/same-work-checkout','Continue with the explicit handoff','same-native-thread',()=>undefined);
+ expect(calls[0]?.method).toBe('thread/resume');expect(calls[0]?.params).toMatchObject({threadId:'same-native-thread',model:'target-model'});
+ expect(calls[0]?.params).not.toHaveProperty('effort');
+ expect(calls[1]?.method).toBe('turn/start');expect(calls[1]?.params).toMatchObject({threadId:'same-native-thread',model:'target-model',effort:'advertised-effort'});
+ expect(result.threadId).toBe('same-native-thread');
+});
+
+it('rejects an unadvertised handoff effort before resuming a native thread',async()=>{
+ const native=new CodexAppServer();const methods:string[]=[];const internals=native as unknown as {child:unknown;request:(method:string,params:any)=>Promise<any>};
+ internals.child={};native.models=['target-model'];native.modelReasoningEfforts={'target-model':['advertised-effort']};internals.request=async(method)=>{methods.push(method);return{};};
+ await expect(native.run({run:{kind:'implementation',model:'target-model',reasoning:'unsupported-effort',handoffFromRunId:'source-run'}} as ClaimedRun,'/same-work-checkout','Continue','same-native-thread',()=>undefined)).rejects.toThrow(/reasoning effort is unavailable/u);
+ expect(methods).toEqual([]);
+});
+
 it.skipIf(process.platform === 'win32')('keeps Connector delivery credentials out of the real Codex app-server child environment', async () => {
  const directory = await mkdtemp(path.join(os.tmpdir(), 'menoteam-codex-env-'));
  const executable = path.join(directory, 'fake-codex-app-server.mjs');
@@ -50,7 +70,7 @@ await writeFile(process.env.MENOTEAM_TEST_CAPTURE, JSON.stringify({ githubToken:
 for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line);
   if (message.id !== undefined) {
-    process.stdout.write(JSON.stringify({ id: message.id, result: message.method === 'model/list' ? { data: [{ id: 'gpt-6-luna' }] } : {} }) + '\\n');
+    process.stdout.write(JSON.stringify({ id: message.id, result: message.method === 'model/list' ? { data: [{ id: 'gpt-6-luna', supportedReasoningEfforts: [{ reasoningEffort: 'catalog-effort', description: 'Fixture advertised effort' }] }] } : {} }) + '\\n');
     if (message.method === 'model/list') setTimeout(() => process.exit(0), 25);
   }
 }
@@ -64,6 +84,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   await writeFile(executable, source, { mode: 0o700 });
   await chmod(executable, 0o700);
   expect(await appServer.start(directory)).toEqual(['gpt-6-luna']);
+  expect(appServer.modelReasoningEfforts).toEqual({ 'gpt-6-luna': ['catalog-effort'] });
   const child = (appServer as unknown as { child: import('node:child_process').ChildProcess }).child;
   await new Promise<void>(resolve => child.once('close', () => resolve()));
   const childEnvironment = JSON.parse(await readFile(capture, 'utf8')) as Record<string, string | undefined>;
