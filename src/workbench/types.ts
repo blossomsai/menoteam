@@ -118,6 +118,7 @@ export interface Run {
             previousImageDigest?: string;
             checkedAt: string;
         };
+        stagingRetired?: { at: string; by: string; generation: number };
 
     };
     qaPolicySnapshot?: QaPolicy;

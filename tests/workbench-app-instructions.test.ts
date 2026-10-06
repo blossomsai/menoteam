@@ -21,6 +21,9 @@ function healthyStagingRun(id = 'stage-run', workId = 'work'): Snapshot['runs'][
 function mergedRun(id: string, workId: string, commitSha: string, createdAt: string): Snapshot['runs'][number] {
   return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt, updatedAt: createdAt, operation: { action: 'merge_pr', phase: 'merged', commitSha, external: { mergeSha: commitSha } } } as Snapshot['runs'][number];
 }
+function stoppedBuildRun(overrides: Partial<Snapshot['runs'][number]> = {}): Snapshot['runs'][number] {
+  return { id: 'stopped-build', projectId: 'project', workId: 'work', prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'failed', generation: 3, stoppedAt: '2026-10-07T00:02:00.000Z', createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:02:00.000Z', operation: { ...stagingSnapshot().runs[0]!.operation!, action: 'deploy_staging', phase: 'build_discovery', targetId: 'stage-safe', sourceMergeRunId: 'merge-current', buildStatus: 'failed' } , ...overrides } as Snapshot['runs'][number];
+}
 function stagingSnapshot(): Snapshot {
   const value=snapshot('A'); value.member={...member,role:'admin'}; value.projects[0]!.repositoryUrl='https://github.com/org/repo'; value.projectRoles={project:'admin'};
   value.works=[{id:'work',projectId:'project',title:'Staging candidate',overview:'',status:'in_progress',revision:1,profileId:'',connectionId:'provider',sources:[],createdAt:'2026-10-07T00:00:00.000Z',updatedAt:'2026-10-07T00:00:00.000Z'}];
@@ -255,6 +258,86 @@ it('keeps staging unknown and reserved without presenting rollback as a successf
   expect(host.textContent).toContain('Outcome unknown');expect(host.textContent).toContain('target remains reserved');expect(host.textContent).not.toContain('Health check passed');expect(host.querySelector('button')?.textContent).not.toContain('Roll back');expect(rollback).not.toHaveBeenCalled();
 });
 
+it('releases only a stopped pre-effect build and keeps the retired run in history', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = stagingSnapshot(); value.member = { ...member, role: 'owner' }; delete value.projectRoles;
+  const stopped = stoppedBuildRun(); value.runs.push(stopped);
+  const after = structuredClone(value); const retired = after.runs.at(-1)!;
+  retired.operation!.stagingRetired = { at: '2026-10-07T00:03:00.000Z', by: 'owner', generation: 3 };
+  retired.generation = 4; retired.leaseUntil = undefined;
+  responses = [Promise.resolve(value), Promise.resolve(after)];
+  const release = vi.spyOn(workbenchApi, 'retireStagingDeployment').mockResolvedValue({ operationId: 'retire-op', run: retired });
+  const deploy = vi.spyOn(workbenchApi, 'requestStagingDeployment');
+  await mount();
+  expect(host.textContent).toContain('Build failed');
+  expect(host.textContent).toContain('Release target');
+  await flush(() => { const target = host.querySelector<HTMLSelectElement>('#staging-target-work')!; target.value = 'stage-safe'; target.dispatchEvent(new Event('change', { bubbles: true })); });
+  await click('Release target');
+  expect(release).toHaveBeenCalledWith('stopped-build', 3);
+  expect(host.textContent).toContain('Stopped · Target released');
+  expect(host.textContent).not.toContain('Health check passed');
+  expect(host.querySelector<HTMLOptionElement>('#staging-target-work option[value="stage-safe"]')?.disabled).toBe(false);
+  expect(button('Deploy to staging').disabled).toBe(true);
+  expect(host.textContent).toContain('Merge a new source before trying again');
+  expect(deploy).not.toHaveBeenCalled();
+});
+
+it.each(['cancelled', 'interrupted'] as const)('allows release after the Connector stopped a %s build', async status => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = stagingSnapshot(); value.runs.push(stoppedBuildRun({ status })); responses = [Promise.resolve(value)];
+  await mount();
+  expect(host.textContent).toContain('Release target');
+});
+
+it.each([
+  { workspaceRole: 'owner' as const, projectRole: undefined, allowed: true },
+  { workspaceRole: 'admin' as const, projectRole: 'admin' as const, allowed: true },
+  { workspaceRole: 'admin' as const, projectRole: 'member' as const, allowed: false },
+  { workspaceRole: 'member' as const, projectRole: 'owner' as const, allowed: false },
+])('applies staging release permissions for workspace $workspaceRole and project $projectRole', async ({ workspaceRole, projectRole, allowed }) => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = stagingSnapshot(); value.member = { ...member, role: workspaceRole };
+  value.projectRoles = projectRole ? { project: projectRole } : {};
+  value.runs.push(stoppedBuildRun()); responses = [Promise.resolve(value)];
+  await mount();
+  expect(host.textContent.includes('Release target')).toBe(allowed);
+});
+
+it('makes a released target available to a different Work without reviving the old merge', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-b');
+  const value = stagingSnapshot();
+  value.works.push({ ...value.works[0]!, id: 'work-b', title: 'New source' });
+  value.runs.push(mergedRun('merge-b', 'work-b', 'f'.repeat(40), '2026-10-07T00:01:00.000Z'));
+  const retired = stoppedBuildRun({ workId: 'work', generation: 4, operation: { ...stoppedBuildRun().operation!, stagingRetired: { at: '2026-10-07T00:03:00.000Z', by: 'owner', generation: 3 } } });
+  value.runs.push(retired); responses = [Promise.resolve(value), Promise.resolve(value)];
+  const deploy = vi.spyOn(workbenchApi, 'requestStagingDeployment').mockResolvedValue({ operationId: 'new-build', run: retired });
+  await mount();
+  const option = host.querySelector<HTMLOptionElement>('#staging-target-work-b option[value="stage-safe"]');
+  expect(option?.disabled).toBe(false);
+  await flush(() => { const target = host.querySelector<HTMLSelectElement>('#staging-target-work-b')!; target.value = 'stage-safe'; target.dispatchEvent(new Event('change', { bubbles: true })); });
+  await click('Deploy to staging');
+  expect(deploy).toHaveBeenCalledWith('work-b', { sourceMergeRunId: 'merge-b', targetId: 'stage-safe', requestId: expect.any(String) });
+});
+
+it.each([
+  { label: 'missing stop acknowledgement', status: 'interrupted' as const, stoppedAt: undefined, extra: {} },
+  { label: 'remote effect intent', status: 'failed' as const, stoppedAt: '2026-10-07T00:02:00.000Z', extra: { effectIntentGeneration: 0 } },
+  { label: 'transport started', status: 'failed' as const, stoppedAt: '2026-10-07T00:02:00.000Z', extra: { stagingEffectStage: 'transport_intent' as const } },
+  { label: 'deployment receipt', status: 'failed' as const, stoppedAt: '2026-10-07T00:02:00.000Z', extra: { stagingReceipt: { operationId: 'o', targetId: 'stage-safe', phase: 'unknown' as const, commitSha: 'a'.repeat(40), imageDigest: `sha256:${'d'.repeat(64)}`, checkedAt: '2026-10-07T00:01:00.000Z' } } },
+  { label: 'paused build', status: 'paused' as const, stoppedAt: '2026-10-07T00:02:00.000Z', extra: {} },
+])('does not release a staging target with $label', async ({ status, stoppedAt, extra }) => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = stagingSnapshot();
+  value.runs.push(stoppedBuildRun({ status, stoppedAt, operation: { ...stoppedBuildRun().operation!, ...extra } }));
+  responses = [Promise.resolve(value)];
+  const release = vi.spyOn(workbenchApi, 'retireStagingDeployment');
+  await mount();
+  expect(host.textContent).not.toContain('Release target');
+  expect(release).not.toHaveBeenCalled();
+  if (!stoppedAt) expect(host.textContent).toContain('Waiting for the Connector to confirm it has stopped');
+  expect(host.querySelector<HTMLOptionElement>('#staging-target-work option[value="stage-safe"]')?.disabled).toBe(true);
+});
+
 it('starts build discovery for the current merged Work without accepting a digest', async () => {
   window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
   const value=stagingSnapshot(); responses=[Promise.resolve(value),Promise.resolve(value)];
@@ -375,6 +458,15 @@ it('sends only the source merge, selected target, and request id to staging', as
   const init=fetchMock.mock.calls[0]?.[1] as RequestInit|undefined;
   expect(JSON.parse(String(init?.body))).toEqual({sourceMergeRunId:'merge-current',targetId:'stage-safe',requestId:'request-1'});
   expect(JSON.stringify(init?.body)).not.toContain('imageDigest');
+});
+
+it('sends the current run generation to the staging retirement endpoint', async () => {
+  const response = { run: stoppedBuildRun(), operationId: 'retire-op' };
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => new Response(JSON.stringify(response), { status: 200, headers: { 'content-type': 'application/json' } }));
+  vi.stubGlobal('fetch', fetchMock);
+  await workbenchApi.retireStagingDeployment('run/with slash', 7);
+  expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/workbench/runs/run%2Fwith%20slash/staging/retire');
+  expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toEqual({ generation: 7 });
 });
 async function login() {
   await type(member.email, '#login-email');
