@@ -1,5 +1,7 @@
 # Menoteam Agent Gateway
 
+> Scope: existing V1 implementation contract, not the current workbench product/UI specification. See [current product direction](../../PRODUCT.md). Preserve these API/runtime semantics until an explicit implementation migration; do not restore V1 UI or domain restrictions into V3 from this document.
+
 Menoteam Agent Gateway is the team's real-time, opt-in transport between one Slack app and explicitly connected local agent sessions. It exists to route bounded human-visible requests without turning Work Map into a runner or copying private agent memory into a central service.
 
 ## Language

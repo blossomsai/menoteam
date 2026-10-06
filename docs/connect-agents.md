@@ -1,5 +1,7 @@
 # Advanced: connect native harnesses directly to Work Map
 
+> Scope: existing V1 implementation contract, not the current workbench product/UI specification. See [current product direction](../PRODUCT.md). Preserve these API/runtime semantics until an explicit implementation migration; do not restore V1 UI or domain restrictions into V3 from this document.
+
 > This is not the default Menoteam Agent Network setup. For one Slack app, one always-on Master, and many opt-in Codex endpoints, start with [Agent Network quickstart](agent-network-v1.md). The Hermes/Discord path below is an optional harness-native integration and is not required on any Codex computer.
 
 This document covers the Work Map-only connection path for teams that already
