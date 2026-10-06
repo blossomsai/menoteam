@@ -1292,8 +1292,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('reserves staging by target, authorizes effects against the merged receipt, and keeps revoked intents read-only',async()=>{
         const p=checkedJson(await user('POST','/projects',{name:'Staging authorization proof',repositoryUrl:'https://github.com/example/staging-proof'})) as Project;
-        const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Exact staging candidate'})) as Work;
         const enrolled=await enrollProvider('staging-proof-connector',[p.id]);
+        const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Exact staging candidate'})) as Work;
         const caps={runKinds:[],git:true,githubWrite:true,deliveryActions:['deploy_staging','rollback_staging'],deploymentTargets:['staging']};
         expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps}}})).statusCode).toBe(204);
         const policy=checkedJson(await user('POST','/settings',{projectId:p.id,kind:'connection',name:'Staging delivery policy',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',baseBranch:'main',allowDraftPr:true,allowStagingDeploy:true,stagingTargets:['staging'],configuredBy:(await user('GET','/me')).json().id}}));
