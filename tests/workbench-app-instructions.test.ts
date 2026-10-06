@@ -19,7 +19,15 @@ function healthyStagingRun(id = 'stage-run', workId = 'work'): Snapshot['runs'][
   return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z', operation: { action: 'deploy_staging', actorId: 'owner', candidateRunId: 'candidate', candidateRevision: 'revision', artifactRevision: 'revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/org/repo', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/test', workTitle: 'Review delivery', changeSummary: 'staging change', qaStatus: 'current', phase: 'health_passed', targetId: 'stage-safe', imageDigest: `sha256:${'d'.repeat(64)}`, stagingReceipt: { operationId: id, targetId: 'stage-safe', phase: 'health_passed', deploymentId: 'deploy-2', commitSha: 'a'.repeat(40), imageDigest: `sha256:${'d'.repeat(64)}`, activeCommitSha: 'a'.repeat(40), activeImageDigest: `sha256:${'d'.repeat(64)}`, previousDeploymentId: 'deploy-1', previousImageDigest: `sha256:${'e'.repeat(64)}`, checkedAt: '2026-10-07T00:00:00.000Z' } } } as Snapshot['runs'][number];
 }
 function mergedRun(id: string, workId: string, commitSha: string, createdAt: string): Snapshot['runs'][number] {
-  return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt, updatedAt: createdAt, operation: { action: 'merge_pr', phase: 'merged', commitSha } } as Snapshot['runs'][number];
+  return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt, updatedAt: createdAt, operation: { action: 'merge_pr', phase: 'merged', commitSha, external: { mergeSha: commitSha } } } as Snapshot['runs'][number];
+}
+function stagingSnapshot(): Snapshot {
+  const value=snapshot('A'); value.member={...member,role:'admin'}; value.projects[0]!.repositoryUrl='https://github.com/org/repo'; value.projectRoles={project:'admin'};
+  value.works=[{id:'work',projectId:'project',title:'Staging candidate',overview:'',status:'in_progress',revision:1,profileId:'',connectionId:'provider',sources:[],createdAt:'2026-10-07T00:00:00.000Z',updatedAt:'2026-10-07T00:00:00.000Z'}];
+  value.runtimeProviders=[{provider:'openai',method:'codex-host',connectorId:'staging-connector',available:true,projectIds:['project'],deploymentTargets:['stage-safe'],deliveryActions:['deploy_staging','rollback_staging'],models:[],lastSeen:'2026-10-07T00:00:00.000Z'}];
+  value.settings=[{id:'delivery',kind:'connection',projectId:'project',name:'GitHub delivery',data:{provider:'github',purpose:'delivery',url:'https://github.com/org/repo',enabled:true,allowStagingDeploy:true,stagingTargets:['stage-safe']},updatedAt:'2026-10-07T00:00:00.000Z'}];
+  value.runs=[mergedRun('merge-current','work','a'.repeat(40),'2026-10-07T00:00:00.000Z')];
+  return value;
 }
 let root: Root;
 let host: HTMLDivElement;
@@ -245,6 +253,128 @@ it('keeps staging unknown and reserved without presenting rollback as a successf
   const rollback=vi.spyOn(workbenchApi,'requestStagingRollback');
   await mount();
   expect(host.textContent).toContain('Outcome unknown');expect(host.textContent).toContain('target remains reserved');expect(host.textContent).not.toContain('Health check passed');expect(host.querySelector('button')?.textContent).not.toContain('Roll back');expect(rollback).not.toHaveBeenCalled();
+});
+
+it('starts build discovery for the current merged Work without accepting a digest', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot(); responses=[Promise.resolve(value),Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment').mockResolvedValue({operationId:'build-operation',run:value.runs[0]!});
+  await mount();
+  expect(host.textContent).toContain('Merged source');
+  const target=host.querySelector<HTMLSelectElement>('#staging-target-work')!;
+  await flush(()=>{target.value='stage-safe';target.dispatchEvent(new Event('change',{bubbles:true}));});
+  await click('Deploy to staging');
+  expect(deploy).toHaveBeenCalledWith('work',{sourceMergeRunId:'merge-current',targetId:'stage-safe',requestId:expect.any(String)});
+  expect(host.textContent).not.toContain('imageDigest');
+});
+
+it('does not expose staging mutation to a project member', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();value.member={...member,role:'member'};value.projectRoles={project:'member'};responses=[Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment');
+  await mount();
+  expect(host.textContent).toContain('An authorized administrator can deploy this merged source to staging');
+  expect(host.textContent).not.toContain('Deploy to staging');
+  expect(deploy).not.toHaveBeenCalled();
+});
+
+it('does not offer a target reserved by another Work in the same project', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const active={...healthyStagingRun('other-work-stage','other-work'),status:'running' as const,operation:{...healthyStagingRun('other-work-stage','other-work').operation!,targetId:'stage-safe',phase:'deploy_intent'}} as Snapshot['runs'][number];
+  value.runs=[...value.runs,active];responses=[Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment');
+  await mount();
+  const option=host.querySelector<HTMLOptionElement>('#staging-target-work option[value="stage-safe"]');
+  expect(option?.disabled).toBe(true);
+  expect(button('Deploy to staging').disabled).toBe(true);
+  expect(deploy).not.toHaveBeenCalled();
+});
+
+it('offers retry only for the failed build-discovery operation for this merge', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const failed={...value.runs[0]!,id:'build-failed',status:'failed' as const,operation:{...value.runs[0]!.operation!,action:'deploy_staging' as const,phase:'build_discovery' as const,targetId:'stage-safe',sourceMergeRunId:'merge-current',buildStatus:'receipt_missing' as const}} as Snapshot['runs'][number];
+  value.runs.push(failed);responses=[Promise.resolve(value),Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment').mockResolvedValue({operationId:'build-retry',run:failed});
+  await mount();
+  expect(host.textContent).toContain('Build receipt missing');
+  await flush(()=>{const target=host.querySelector<HTMLSelectElement>('#staging-target-work')!;target.value='stage-safe';target.dispatchEvent(new Event('change',{bubbles:true}));});
+  await click('Retry build');
+  expect(deploy).toHaveBeenCalledWith('work',{sourceMergeRunId:'merge-current',targetId:'stage-safe',requestId:expect.any(String)});
+});
+
+it('keeps paused build discovery paused and does not expose a retry shortcut', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const paused={...value.runs[0]!,id:'build-paused',status:'paused' as const,operation:{...value.runs[0]!.operation!,action:'deploy_staging' as const,phase:'build_discovery' as const,targetId:'stage-safe',sourceMergeRunId:'merge-current',buildStatus:'failed' as const}} as Snapshot['runs'][number];
+  value.runs.push(paused);responses=[Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment');
+  await mount();
+  expect(host.textContent).toContain('Paused');
+  expect(button('Deploy to staging').disabled).toBe(true);
+  expect(host.textContent).not.toContain('Retry build');
+  expect(deploy).not.toHaveBeenCalled();
+});
+
+it('does not reuse a failed build reservation for a different merged source', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const failed={...value.runs[0]!,id:'old-build-failed',status:'failed' as const,operation:{...value.runs[0]!.operation!,action:'deploy_staging' as const,phase:'build_discovery' as const,targetId:'stage-safe',sourceMergeRunId:'merge-current',buildStatus:'failed' as const}} as Snapshot['runs'][number];
+  value.runs.push(failed,mergedRun('merge-new','work','f'.repeat(40),'2026-10-07T00:01:00.000Z'));responses=[Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment');
+  await mount();
+  expect(host.textContent).toContain('f'.repeat(40));
+  expect(host.querySelector<HTMLOptionElement>('#staging-target-work option[value="stage-safe"]')?.disabled).toBe(true);
+  expect(host.textContent).not.toContain('Retry build');
+  expect(deploy).not.toHaveBeenCalled();
+});
+
+it('keeps a target reserved after an uncertain delivery outcome', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const unknown={...healthyStagingRun('unknown-stage','other-work'),status:'failed' as const,operation:{...healthyStagingRun('unknown-stage','other-work').operation!,phase:'deploy_unknown',targetId:'stage-safe',stagingReceipt:{...healthyStagingRun('unknown-stage','other-work').operation!.stagingReceipt!,phase:'unknown'}}} as Snapshot['runs'][number];
+  value.runs.push(unknown);responses=[Promise.resolve(value)];
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment');
+  await mount();
+  expect(host.querySelector<HTMLOptionElement>('#staging-target-work option[value="stage-safe"]')?.disabled).toBe(true);
+  expect(button('Deploy to staging').disabled).toBe(true);
+  expect(host.textContent).toContain('stage-safe · in use');
+  expect(deploy).not.toHaveBeenCalled();
+});
+
+it('shows build provenance as build-only status, never deployment success', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const buildRun={...value.runs[0]!,id:'build-run',status:'running' as const,operation:{...value.runs[0]!.operation!,action:'deploy_staging' as const,phase:'build_discovery' as const,targetId:'stage-safe',sourceMergeRunId:'merge-current',buildStatus:'verified' as const,imageDigest:`sha256:${'d'.repeat(64)}`,buildReceipt:{schemaVersion:1 as const,repository:'blossomsai/menoteam' as const,repositoryId:'repo-id',workflowPath:'.github/workflows/build-workbench-image.yml' as const,runId:101,runAttempt:1,artifactId:202,archiveDigest:'sha256:archive',artifactExpiresAt:'2026-10-08T00:00:00.000Z',sourceSha:'a'.repeat(40),imageRepository:'ghcr.io/blossomsai/menoteam-work-map' as const,imageDigest:`sha256:${'d'.repeat(64)}`,runUrl:'https://github.com/blossomsai/menoteam/actions/runs/101',verifiedAt:'2026-10-07T00:00:00.000Z',verifiedGeneration:1}}} as Snapshot['runs'][number];
+  value.runs.push(buildRun);responses=[Promise.resolve(value)];
+  await mount();
+  expect(host.textContent).toContain('Build verified');
+  expect(host.textContent).toContain('Build verification does not mean the application is deployed');
+  expect(host.textContent).not.toContain('Health check passed');
+  expect(host.textContent).toContain('Build archive digest');
+});
+
+it('keeps the verified build receipt visible after deployment begins', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot();
+  const deploying={...value.runs[0]!,id:'deploying-run',status:'running' as const,operation:{...value.runs[0]!.operation!,action:'deploy_staging' as const,phase:'deploy_intent' as const,targetId:'stage-safe',sourceMergeRunId:'merge-current',buildStatus:'verified' as const,imageDigest:`sha256:${'d'.repeat(64)}`,buildReceipt:{schemaVersion:1 as const,repository:'blossomsai/menoteam' as const,repositoryId:'repo-id',workflowPath:'.github/workflows/build-workbench-image.yml' as const,runId:101,runAttempt:1,artifactId:202,archiveDigest:'sha256:archive',artifactExpiresAt:'2026-10-08T00:00:00.000Z',sourceSha:'a'.repeat(40),imageRepository:'ghcr.io/blossomsai/menoteam-work-map' as const,imageDigest:`sha256:${'d'.repeat(64)}`,runUrl:'https://github.com/blossomsai/menoteam/actions/runs/101',verifiedAt:'2026-10-07T00:00:00.000Z',verifiedGeneration:1}}} as Snapshot['runs'][number];
+  value.runs.push(deploying);responses=[Promise.resolve(value)];
+  await mount();
+  expect(host.textContent).toContain('In progress');
+  expect(host.textContent).toContain('Build verified for this source');
+  expect(host.textContent).toContain('Build archive digest');
+  expect(host.textContent).not.toContain('Health check passed');
+});
+
+it('sends only the source merge, selected target, and request id to staging', async () => {
+  const response={run:stagingSnapshot().runs[0]!,operationId:'operation'};
+  const fetchMock=vi.fn(async (_input:RequestInfo|URL,init?:RequestInit)=>new Response(JSON.stringify(response),{status:200,headers:{'content-type':'application/json'}}));
+  vi.stubGlobal('fetch',fetchMock);
+  await workbenchApi.requestStagingDeployment('work',{sourceMergeRunId:'merge-current',targetId:'stage-safe',requestId:'request-1'});
+  const init=fetchMock.mock.calls[0]?.[1] as RequestInit|undefined;
+  expect(JSON.parse(String(init?.body))).toEqual({sourceMergeRunId:'merge-current',targetId:'stage-safe',requestId:'request-1'});
+  expect(JSON.stringify(init?.body)).not.toContain('imageDigest');
 });
 async function login() {
   await type(member.email, '#login-email');
