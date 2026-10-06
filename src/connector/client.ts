@@ -19,7 +19,7 @@ export class ConnectorHttpError extends Error {
 
 function routeCategory(path: string): string {
   if (path === '/api/workbench/connector/claim') return 'connector.claim';
-  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|delivery-authorize|delivery-progress)$/u)?.[1];
+  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress)$/u)?.[1];
   if (route) return `connector.runs.${route}`;
   if (/^\/api\/workbench\/connector\/runs\/[^/]+$/u.test(path)) return 'connector.runs.read';
   return 'unknown';
@@ -53,7 +53,7 @@ export class WorkbenchConnectorClient {
       codexAppServer: true,
       models: this.codexModels,
       localWorktrees: true,
-      ...(process.env.MENOTEAM_GITHUB_TOKEN ? { git: true, githubWrite: true, deliveryActions: ['create_draft_pr'] } : {}),
+      ...(process.env.MENOTEAM_GITHUB_TOKEN ? { git: true, githubWrite: true, deliveryActions: ['create_draft_pr','merge_pr'] } : {}),
       ...(runKinds ? { runKinds: [...new Set(runKinds)] } : {}),
     };
     const result = await this.request<ClaimedRun | undefined>('/api/workbench/connector/claim', {
@@ -66,6 +66,7 @@ export class WorkbenchConnectorClient {
   renew(runId: string, generation: number): Promise<Run> {
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/renew`, { method: 'POST', body: { generation } });
   }
+  authorizeQaEffect(runId:string,generation:number):Promise<{authorized:true}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/qa-authorize`,{method:'POST',body:{generation}});}
   authorizeDeliveryEffect(runId:string,generation:number):Promise<{authorized:true;repositoryUrl:string}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-authorize`,{method:'POST',body:{generation}});}
 
   readRun(runId: string): Promise<Run> {
@@ -81,7 +82,7 @@ export class WorkbenchConnectorClient {
       method: 'POST', body: { generation, ...artifact },
     });
   }
-  deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string}):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
+  deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string}):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
 
   pauseState(runId: string): Promise<Run> { return this.readRun(runId); }
 
@@ -149,6 +150,7 @@ function validateResponse(path: string, value: unknown): unknown {
   if (path.endsWith('/events')) return z.object({ accepted: z.boolean() }).parse(value);
   if (path.endsWith('/tools')) return z.record(z.string(), z.unknown()).parse(value);
   if (path.includes('/artifacts')) return z.object({ id: z.string(), kind: z.enum(['diff','qa','delivery','source']), revision: z.string(), data: z.unknown() }).passthrough().parse(value);
+  if (path.endsWith('/qa-authorize')) return z.object({authorized:z.literal(true)}).strict().parse(value);
   if (path.endsWith('/delivery-authorize')) return z.object({ authorized: z.literal(true), repositoryUrl: z.string().url() }).parse(value);
   if (path.endsWith('/delivery-progress')) return z.object({
     run: z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough(),

@@ -6,6 +6,7 @@ export interface ConnectorConfig {
   connectorId: string;
   dataDir: string;
   projects: Record<string, string>;
+  qaResources?: Record<string, {url:string}>;
   codexBinary?: string;
   models?: string[];
   pollIntervalMs?: number;

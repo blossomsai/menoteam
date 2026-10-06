@@ -22,11 +22,11 @@ afterEach(async()=>{if(priorToken===undefined)delete process.env.MENOTEAM_GITHUB
 
 describe('fixed Draft PR publication adapter',()=>{
   it('publishes only the saved SHA locally and reconciles retry to the same mock PR',async()=>{
-    const f=await fixture();const baseHead=(await git(f.root,'rev-parse','HEAD')).stdout.trim();let createCount=0;let pr:{number:number;html_url:string;head:{sha:string};base:{ref:string};body:string;draft:boolean}|undefined;
-    const mock=async(_url:string,init?:RequestInit)=>{if(init?.method==='POST'){createCount++;const input=JSON.parse(String(init.body));pr={number:17,html_url:'https://github.com/example/project/pull/17',head:{sha:f.commitSha},base:{ref:input.base},body:input.body,draft:true};return new Response(JSON.stringify(pr),{status:201});}return new Response(JSON.stringify(pr?[pr]:[]),{status:200});};
+    const f=await fixture();const baseHead=(await git(f.root,'rev-parse','HEAD')).stdout.trim();let createCount=0;let pr:{number:number;html_url:string;head:{sha:string};base:{ref:string;sha:string};node_id:string;body:string;draft:boolean}|undefined;
+    const mock=async(_url:string,init?:RequestInit)=>{if(init?.method==='POST'){createCount++;const input=JSON.parse(String(init.body));pr={number:17,html_url:'https://github.com/example/project/pull/17',head:{sha:f.commitSha},base:{ref:input.base,sha:'b'.repeat(40)},node_id:'PR_fixture',body:input.body,draft:true};return new Response(JSON.stringify(pr),{status:201});}return new Response(JSON.stringify(pr?[pr]:[]),{status:200});};
     const first=await create(f,mock as typeof fetch);
     const second=await create(f,mock as typeof fetch);
-    expect(first).toEqual({number:17,url:'https://github.com/example/project/pull/17',headSha:f.commitSha});expect(second).toEqual(first);expect(createCount).toBe(1);
+    expect(first).toMatchObject({number:17,url:'https://github.com/example/project/pull/17',headSha:f.commitSha});expect(second).toEqual(first);expect(createCount).toBe(1);
     expect((await git(f.bare,'rev-parse',`refs/heads/${f.claim.run.operation!.remoteBranch}`)).stdout.trim()).toBe(f.commitSha);
     expect((await git(f.root,'rev-parse','HEAD')).stdout.trim()).toBe(baseHead);
     expect(pr?.draft).toBe(true);expect(pr?.body).toContain('1 passed, 1 failed');
@@ -46,7 +46,7 @@ describe('fixed Draft PR publication adapter',()=>{
   it('accepts a concurrent creator only when the ref is the exact candidate SHA',async()=>{
     const f=await fixture();const ref=`refs/heads/${f.claim.run.operation!.remoteBranch}`;
     const transport=async(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>{if(args[0]==='push')await git(f.checkout,'push',f.bare,`${f.commitSha}:${ref}`);return f.transport(cwd,env,...args);};
-    const mock=(async(_url:string,init?:RequestInit)=>new Response(JSON.stringify(init?.method==='POST'?{number:31,html_url:'https://github.com/example/project/pull/31',head:{sha:f.commitSha},draft:true}:[]))) as typeof fetch;
+    const mock=(async(_url:string,init?:RequestInit)=>new Response(JSON.stringify(init?.method==='POST'?{number:31,html_url:'https://github.com/example/project/pull/31',head:{sha:f.commitSha},base:{ref:'main',sha:'b'.repeat(40)},node_id:'PR_fixture',draft:true}:[]))) as typeof fetch;
     expect((await createDraftPullRequest(f.config,f.claim,mock,undefined,undefined,transport)).headSha).toBe(f.commitSha);
   });
   it('rejects a changed HEAD before any remote publication or HTTP call',async()=>{
@@ -55,10 +55,10 @@ describe('fixed Draft PR publication adapter',()=>{
     const branches=(await git(f.bare,'for-each-ref','--format=%(refname)','refs/heads')).stdout.trim();expect(branches).toBe('');
   });
   it('reconciles a create response lost after the mock PR already exists',async()=>{
-    const f=await fixture();let createCount=0;let pr:{number:number;html_url:string;head:{sha:string};base:{ref:string};body:string;draft:boolean}|undefined;
-    const mock=async(_url:string,init?:RequestInit)=>{if(init?.method==='POST'){createCount++;const input=JSON.parse(String(init.body));pr={number:29,html_url:'https://github.com/example/project/pull/29',head:{sha:f.commitSha},base:{ref:input.base},body:input.body,draft:true};throw new Error('mocked lost response after creation');}return new Response(JSON.stringify(pr?[pr]:[]),{status:200});};
+    const f=await fixture();let createCount=0;let pr:{number:number;html_url:string;head:{sha:string};base:{ref:string;sha:string};node_id:string;body:string;draft:boolean}|undefined;
+    const mock=async(_url:string,init?:RequestInit)=>{if(init?.method==='POST'){createCount++;const input=JSON.parse(String(init.body));pr={number:29,html_url:'https://github.com/example/project/pull/29',head:{sha:f.commitSha},base:{ref:input.base,sha:'b'.repeat(40)},node_id:'PR_fixture',body:input.body,draft:true};throw new Error('mocked lost response after creation');}return new Response(JSON.stringify(pr?[pr]:[]),{status:200});};
     await expect(create(f,mock as typeof fetch)).rejects.toThrow('mocked lost response');
-    expect(await create(f,mock as typeof fetch)).toEqual({number:29,url:'https://github.com/example/project/pull/29',headSha:f.commitSha});expect(createCount).toBe(1);
+    expect(await create(f,mock as typeof fetch)).toMatchObject({number:29,url:'https://github.com/example/project/pull/29',headSha:f.commitSha});expect(createCount).toBe(1);
   });
   it('rejects dirty, altered fingerprint, and a mismatched remote before pushing',async()=>{
     const dirty=await fixture();await writeFile(path.join(dirty.checkout,'untracked.txt'),'dirty');

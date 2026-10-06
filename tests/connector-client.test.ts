@@ -31,7 +31,7 @@ it('surfaces only safe validation paths and codes from API errors', async () => 
   }), { status: 400 }));
   const client = new WorkbenchConnectorClient(auth, fetcher as typeof fetch);
   const result = client.tool('run-1', 3, 'dispatch', { prompt: 'x' }, 'req-1');
-  const error = await result.catch(value => value as Error & { status?: number; issues?: unknown[] });
+  const error = await result.then(()=>{throw Error('Expected API rejection');}).catch(value => value as Error & { status?: number; issues?: unknown[] });
   expect(error).toMatchObject({ status: 400, issues: [{ path: 'prompt', code: 'too_big' }] });
   expect(error.message).toContain('prompt:too_big');
   expect(error.message).not.toContain('MUST NOT BE EXPOSED');
@@ -43,7 +43,7 @@ it('reports only the static route category, method, status, and bounded Retry-Af
     token: 'secret-token',
   }), { status: 429, headers: { 'retry-after': '37' } }));
   const client = new WorkbenchConnectorClient(auth, fetcher as typeof fetch);
-  const error = await client.createBridgeToken('private-run-id', 4).catch(value => value as Error & {
+  const error = await client.createBridgeToken('private-run-id', 4).then(()=>{throw Error('Expected API rejection');}).catch(value => value as Error & {
     status?: number; method?: string; routeCategory?: string; retryAfterSeconds?: number; safeSummary?: string;
   });
   expect(error).toMatchObject({ status: 429, method: 'POST', routeCategory: 'connector.runs.bridge-token', retryAfterSeconds: 37 });
@@ -52,4 +52,15 @@ it('reports only the static route category, method, status, and bounded Retry-Af
   expect(error.safeSummary).not.toContain('secret-token');
   expect(error.safeSummary).not.toContain('body and credential values');
   expect(error.routeCategory).not.toContain('private-run-id');
+});
+
+it('validates QA authorization envelopes and keeps rejection scoped to the fixed parent',async()=>{
+  const fetcher=vi.fn(async(_url:URL|RequestInfo,_init?:RequestInit)=>Response.json({authorized:true}));
+  const client=new WorkbenchConnectorClient(auth,fetcher as typeof fetch);
+  await expect(client.authorizeQaEffect('assigned-run',2)).resolves.toEqual({authorized:true});
+  expect(String(fetcher.mock.calls[0]?.[0])).toContain('/qa-authorize');
+  const denied=new WorkbenchConnectorClient(auth,async()=>Response.json({message:'Assigned QA policy is unavailable, revoked or changed'},{status:409}));
+  await expect(denied.authorizeQaEffect('assigned-run',2)).rejects.toMatchObject({status:409,routeCategory:'connector.runs.qa-authorize'});
+  const forged=new WorkbenchConnectorClient(auth,async()=>Response.json({authorized:true,command:'model-selected'}));
+  await expect(forged.authorizeQaEffect('assigned-run',2)).rejects.toThrow();
 });

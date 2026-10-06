@@ -1,3 +1,6 @@
+import { mergePullRequest } from '../src/connector/github-merge-pr.js';
+import { requiredQaFixture,qaPolicyFixture } from './helpers/local-qa-fixture.js';
+import { mergeClaim,mergeFixture,localBase,base,mergeSha } from './helpers/merge-pr-fixture.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { digest } from '../src/workbench/auth.js';
 import { rateLimitKey } from '../src/workbench/rate-limit.js';
@@ -58,7 +61,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await app?.close();
         await sql?.end();
     });
-    const user = (method: "GET" | "POST" | "PATCH", path: string, payload?: unknown) => app.inject({
+    const user = (method: "GET" | "POST" | "PATCH" | "DELETE", path: string, payload?: unknown) => app.inject({
         method,
         url: "/api/workbench" + path,
         remoteAddress: `127.0.0.${scenarioAddress}`,
@@ -674,7 +677,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(await assertMemberEffect(200)).toMatchObject({authorized:true});
         const published=await deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'published',remoteHeadSha:secondSha});
         expect(published).toMatchObject({run:{id:memberDelivery.id,generation:memberDelivery.generation},artifact:{kind:'delivery',revision:secondRevision,data:{phase:'published'}}});
-        const prCreated=await deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'pr_created',pullRequestNumber:42,pullRequestUrl:`${p.repositoryUrl}/pull/42`,headSha:secondSha});
+        const prCreated=await deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'pr_created',pullRequestNumber:42,pullRequestUrl:`${p.repositoryUrl}/pull/42`,headSha:secondSha,baseSha:'b'.repeat(40),pullRequestNodeId:'PR_fixture42'});
         expect(prCreated).toMatchObject({run:{id:memberDelivery.id,generation:memberDelivery.generation,operation:{phase:'pr_created'}},artifact:{kind:'delivery',revision:secondRevision,data:{phase:'pr_created',pullRequestNumber:42}}});
         await expect(deliveryClient.deliveryProgress(memberDelivery.id,memberDelivery.generation,{phase:'pr_created',pullRequestNumber:43,pullRequestUrl:`${p.repositoryUrl}/pull/43`,headSha:'f'.repeat(40)})).rejects.toMatchObject({status:409,routeCategory:'connector.runs.delivery-progress'});
         // Reauthorize before each subsequent effect, including reconciliation after publication.
@@ -703,8 +706,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const send=(path:string,payload:unknown,bearer=credential)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${bearer}`},payload:payload as never});
         await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Implement candidate',requestId:'review-bridge-implementation'});
         const candidate=(await send('/claim',{})).json().run;
-        const diff=await send(`/runs/${candidate.id}/artifacts`,{generation:candidate.generation,kind:'diff',revision:'exact-candidate-revision',data:{files:[{path:'src/example.ts',added:1,removed:0,lines:['+ actual evidence']}],candidateFingerprint:'candidate-bytes'},requestId:'candidate-diff'});
+        const diff=await send(`/runs/${candidate.id}/artifacts`,{generation:candidate.generation,kind:'diff',revision:'exact-candidate-revision',data:{files:[{path:'src/example.ts',added:1,removed:0,lines:['+ actual evidence']}],candidateFingerprint:'candidate-bytes',candidateRevision:'a'.repeat(40)},requestId:'candidate-diff'});
         expect(diff.statusCode).toBe(200);
+        await send(`/runs/${candidate.id}/artifacts`,{generation:candidate.generation,kind:'qa',revision:'exact-candidate-revision',data:{candidateFingerprint:'c'.repeat(64),checks:[],stale:false},requestId:'review-bridge-qa'});
         await send(`/runs/${candidate.id}/complete`,{generation:candidate.generation,threadId:'candidate-thread'});
         const master=(await send('/claim',{})).json().run;
         const invalid=await send(`/runs/${master.id}/tools`,{generation:master.generation,action:'dispatch',input:{workId:work.id,kind:'review',model:'gpt-6.1-sol',prompt:'x'.repeat(12001)},requestId:'oversized-review'});
@@ -727,6 +731,179 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await tool('create_skill',{name:'Escalate',data:{content:'No'}})).statusCode).toBe(403);
         expect((await send('/claim',{},bridge)).statusCode).toBe(401);
     });
+    it('real HTTP client -> Fastify -> PostgreSQL freezes explicit generic QA policy and denies changed, forged and revoked captures',async()=>{
+        const serverUrl=await app.listen({port:0,host:'127.0.0.1'});
+        const browser=async(method:string,path:string,body?:unknown,status=200)=>{const response=await fetch(`${serverUrl}/api/workbench${path}`,{method,headers:{cookie,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const value=await response.json();expect(response.status).toBe(status);return value as any;};
+        const p=await browser('POST','/projects',{name:'Explicit generic QA contract',repositoryUrl:'https://github.com/example/generic'}),w=await browser('POST',`/projects/${p.id}/works`,{title:'Capture authorized project QA'});
+        const owner=await browser('GET','/me'),enrolled=await browser('POST','/connectors',{id:`qa-http-${randomUUID()}`,projectIds:[p.id]});
+        const client=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},fetch,['gpt-6-luna','gpt-6.1-sol']);
+        const reference=qaPolicyFixture(p.id,p.repositoryUrl);reference.coverage='project/v1';reference.resource=undefined;reference.requirements=[{id:'generic-tests',category:'tests',commands:[{executable:'node',args:['test.cjs','{reportFile}'],timeoutMs:10_000}],report:'vitest-json'}];
+        const policy=await browser('POST','/settings',{projectId:p.id,kind:'connection',name:'Generic QA',data:{provider:'qa',purpose:'qa',url:p.repositoryUrl,coverage:reference.coverage,requirements:reference.requirements}});
+        const requested=await browser('POST',`/projects/${p.id}/messages`,{workId:w.id,text:'Bounded implementation',requestId:randomUUID()});
+        const claim=(await client.claim(['implementation']))!,r=claim.run;
+        expect(r.id).toBe(requested.run.id);expect(r.qaPolicySnapshot).toMatchObject({id:policy.id,version:policy.updatedAt,configuredBy:owner.id,requirements:reference.requirements});
+        await expect(client.authorizeQaEffect(r.id,r.generation)).resolves.toEqual({authorized:true});
+        const qa={...requiredQaFixture('d'.repeat(64),r.qaPolicySnapshot!),revision:'generic-diff'};
+        const upload={kind:'qa' as const,revision:'generic-diff',data:qa,requestId:`required-qa:${r.id}:${r.generation}`};
+        await expect(client.addArtifact(r.id,r.generation,{...upload,data:{...qa,policy:{...qa.policy,id:'forged'}}})).rejects.toMatchObject({status:403});
+        const accepted=await client.addArtifact(r.id,r.generation,upload);expect(accepted.data).toMatchObject({policy:{id:policy.id}});
+        expect((await client.addArtifact(r.id,r.generation,upload)).id).toBe(accepted.id);
+        await expect(client.addArtifact(r.id,r.generation,{...upload,data:{...qa,capturedAt:new Date(Date.now()+1000).toISOString()}})).rejects.toMatchObject({status:409});
+        await browser('PATCH',`/settings/${policy.id}`,{expectedUpdatedAt:policy.updatedAt,data:{enabled:false}});
+        await expect(client.authorizeQaEffect(r.id,r.generation)).rejects.toMatchObject({status:409});
+        await browser('POST',`/runs/${r.id}/cancel`,{});await expect(client.authorizeQaEffect(r.id,r.generation)).rejects.toMatchObject({status:409});await client.stopped(r.id,r.generation);
+        const seededMaster=await browser('POST',`/projects/${p.id}/messages`,{text:'Verify QA policy authorization',requestId:randomUUID()});
+        expect(seededMaster.run.kind).toBe('master');
+        const masterClaim=await client.claim(['master']);
+        expect(masterClaim).toBeDefined();
+        expect(masterClaim!.run.id).toBe(seededMaster.run.id);
+        const master=masterClaim!.run;
+        await expect(client.tool(master.id,master.generation,'update_settings',{settingId:policy.id,expectedUpdatedAt:policy.updatedAt,data:{enabled:true}},randomUUID())).rejects.toMatchObject({status:403});
+        await client.complete(master.id,master.generation,{});
+    });
+    it('real HTTP client -> Fastify -> PostgreSQL binds review, merge, immutable receipt and response-loss recovery',async()=>{
+        const serverUrl=await app.listen({port:0,host:'127.0.0.1'});
+        const browser=async(method:string,path:string,body?:unknown,status=200)=>{const response=await fetch(`${serverUrl}/api/workbench${path}`,{method,headers:{cookie,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const value=await response.json();expect(response.status,JSON.stringify(value)).toBe(status);return value as any;};
+        const p=await browser('POST','/projects',{name:'Real HTTP merge proof',repositoryUrl:'https://github.com/org/repo'});
+        const w=await browser('POST',`/projects/${p.id}/works`,{title:'HTTP typed review merge'});
+        const owner=await browser('GET','/me');
+        const enrolled=await browser('POST','/connectors',{id:`merge-http-${randomUUID()}`,projectIds:[p.id]});
+        const client=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},fetch,['gpt-6.1-sol']);
+        const template=mergeClaim(),op=template.run.operation!,stamp=new Date().toISOString();
+        const candidate:Run={...template.run,id:randomUUID(),projectId:p.id,workId:w.id,requestedBy:owner.id,kind:'implementation',operation:undefined,status:'completed',connectorId:enrolled.id,createdAt:stamp,updatedAt:stamp};
+        const diff:Artifact={id:randomUUID(),projectId:p.id,workId:w.id,runId:candidate.id,kind:'diff',revision:op.artifactRevision,data:{candidateRevision:op.commitSha,baseRevision:op.baseRevision},createdAt:stamp};
+        const savedQa=qaPolicyFixture(p.id,p.repositoryUrl);
+        const qaSetting=await browser('POST','/settings',{projectId:p.id,kind:'connection',name:'Explicit project QA policy',data:{provider:'qa',purpose:'qa',url:p.repositoryUrl,coverage:savedQa.coverage,requirements:savedQa.requirements,resource:savedQa.resource}});
+        savedQa.id=qaSetting.id;savedQa.version=qaSetting.updatedAt;savedQa.configuredBy=owner.id;candidate.qaPolicySnapshot=savedQa;
+        const qa:Artifact={...diff,id:randomUUID(),kind:'qa',data:requiredQaFixture(op.candidateFingerprint,savedQa)};
+        const prior:Run={...template.run,id:randomUUID(),projectId:p.id,workId:w.id,requestedBy:owner.id,status:'completed',targetConnectorId:enrolled.id,connectorId:enrolled.id,createdAt:stamp,updatedAt:stamp,operation:{...op,action:'create_draft_pr',actorId:owner.id,candidateRunId:candidate.id,phase:'pr_created',integrationBaseSha:undefined,policySnapshot:undefined,mergeMethod:undefined,external:{...op.external}}};
+        for(const [kind,item] of [['run',candidate],['artifact',diff],['artifact',qa],['run',prior]] as const)await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${item.id},${kind},${p.id},${sql.json(item as never)})`;
+        const policy=await browser('POST','/settings',{projectId:p.id,kind:'connection',name:'Fixed merge policy',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',enabled:true,allowDraftPr:true,allowMergePr:true,baseBranch:'main',mergeMethod:'merge',requiredChecks:['Menoteam CI']}});
+        await browser('POST',`/projects/${p.id}/messages`,{text:'Assign typed review',requestId:randomUUID()});
+        const master=(await client.claim(['master']))!.run;
+        const review=await client.tool(master.id,master.generation,'dispatch',{workId:w.id,prompt:'Review frozen candidate',kind:'review',model:'gpt-6.1-sol'},randomUUID()) as Run;
+        expect(review.reviewBinding).toMatchObject({candidateRunId:candidate.id,diffArtifactId:diff.id,qaArtifactIds:[qa.id]});
+        await expect(client.tool(master.id,master.generation,'submit_review_result',{disposition:'approved',findings:[],evidenceArtifactIds:[qa.id]},randomUUID())).rejects.toMatchObject({status:403,message:'Assigned review run required'});
+        await client.complete(master.id,master.generation,{});
+        const assigned=(await client.claim(['review']))!.run;
+        const reviewToken=await client.createBridgeToken(assigned.id,assigned.generation);
+        const reviewer=new WorkbenchConnectorClient({serverUrl,token:reviewToken.token});
+        const result={disposition:'approved',findings:[],evidenceArtifactIds:[qa.id]};
+        await expect(reviewer.tool(assigned.id,assigned.generation,'submit_review_result',{...result,evidenceArtifactIds:['forged']},randomUUID())).rejects.toMatchObject({status:403,message:'Review evidence is outside the assigned candidate'});
+        expect((await reviewer.tool(assigned.id,assigned.generation,'submit_review_result',result,randomUUID()) as Artifact).kind).toBe('qa');
+        await expect(reviewer.tool(assigned.id,assigned.generation,'submit_review_result',{...result,disposition:'changes_requested'},randomUUID())).rejects.toMatchObject({status:409});
+        await client.complete(assigned.id,assigned.generation,{});
+        const request={priorDeliveryRunId:prior.id,reviewRunId:assigned.id,requestId:randomUUID()};
+        await browser('POST',`/works/${w.id}/merge`,{...request,headSha:op.commitSha},400);
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{data,stale}','true') WHERE id=${qa.id}`;
+        await browser('POST',`/works/${w.id}/merge`,request,409);
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{data,stale}','false') WHERE id=${qa.id}`;
+        const originalQa=qa.data as ReturnType<typeof requiredQaFixture>;
+        const invalidQa=[...originalQa.checks.map(check=>({...originalQa,checks:originalQa.checks.filter(c=>c.category!==check.category)})),
+          {...originalQa,checks:[{name:'cat passing.log',command:'cat passing.log',exitCode:0,testedRevision:op.candidateFingerprint}]},
+          {...originalQa,verification:'unknown'}, {...originalQa,stale:true}, {...originalQa,capturedAt:'invalid'}, {...originalQa,checks:originalQa.checks.map((c,index)=>index===0?{...c,exitCode:1}:c)}, {...originalQa,candidateFingerprint:'f'.repeat(64)}, {...originalQa,checks:originalQa.checks.map(c=>c.category==='postgres'?{...c,metrics:{total:2,passed:1,failed:0,skipped:1}}:c)}];
+        for(const invalid of invalidQa){await sql`UPDATE wb_records SET data=jsonb_set(data,'{data}',${sql.json(invalid as never)}) WHERE id=${qa.id}`;await browser('POST',`/works/${w.id}/merge`,request,409);}
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{data}',${sql.json(originalQa as never)}) WHERE id=${qa.id}`;
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{updatedAt}','"2099-01-01T00:00:00.000Z"') WHERE id=${qaSetting.id}`;
+        await browser('POST',`/works/${w.id}/merge`,request,409);
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{updatedAt}',${sql.json(savedQa.version)}) WHERE id=${qaSetting.id}`;
+        const queued=await browser('POST',`/works/${w.id}/merge`,request);
+        expect((await browser('POST',`/works/${w.id}/merge`,{...request,requestId:randomUUID()})).run.id).toBe(queued.run.id);
+        const oldToken=process.env.MENOTEAM_GITHUB_TOKEN;process.env.MENOTEAM_GITHUB_TOKEN='fixture-only';
+        try {
+            let claimed=(await client.claim(['delivery']))!;
+            expect(claimed.run.operation).toMatchObject({baseRevision:localBase,integrationBaseSha:base,policySnapshot:{id:policy.id,version:policy.updatedAt,requiredChecks:['Menoteam CI']}});
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{data,resource,database}','"changed_test"') WHERE id=${qaSetting.id}`;
+            await expect(client.authorizeDeliveryEffect(claimed.run.id,claimed.run.generation)).rejects.toMatchObject({status:409});
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{data,resource,database}',${sql.json(savedQa.resource!.database)}) WHERE id=${qaSetting.id}`;
+            for(const invalid of invalidQa){await sql`UPDATE wb_records SET data=jsonb_set(data,'{data}',${sql.json(invalid as never)}) WHERE id=${qa.id}`;await expect(client.authorizeDeliveryEffect(claimed.run.id,claimed.run.generation)).rejects.toMatchObject({status:409});}
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{data}',${sql.json(originalQa as never)}) WHERE id=${qa.id}`;
+            await expect(client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'ready_intent',pullRequestNumber:99,pullRequestUrl:'https://github.com/org/repo/pull/99'})).rejects.toMatchObject({status:400});
+            await expect(client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'merge_intent',baseSha:'f'.repeat(40)})).rejects.toMatchObject({status:400});
+            // Persist ready intent then simulate a stopped parent and fresh generation; no repeated ready mutation.
+            await client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'ready_intent'});
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"') WHERE id=${claimed.run.id}`;
+            await client.stopped(claimed.run.id,claimed.run.generation);
+            await browser('POST',`/works/${w.id}/merge`,{...request,requestId:randomUUID()});
+            claimed=(await client.claim(['delivery']))!;
+            const github=mergeFixture({draft:false,loseMergeResponse:true});
+            const proof=await mergePullRequest(claimed,async()=>{await client.authorizeDeliveryEffect(claimed.run.id,claimed.run.generation);},github.fetcher,async phase=>{await client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase});});
+            expect(github.readyCalls).toBe(0);expect(github.mergeCalls).toBe(1);
+            await expect(client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'merged',...proof,pullRequestNumber:99})).rejects.toMatchObject({status:409});
+            // Authorization revoked after HTTP completed: recording is narrowly allowed for saved intent,
+            // same original connector/generation even when lease expired. A fresh effect is forbidden.
+            await sql`UPDATE wb_users SET role='member' WHERE id=${owner.id}`;
+            await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(data,'{status}','"interrupted"'),'{leaseUntil}','"2000-01-01T00:00:00Z"') WHERE id=${claimed.run.id}`;
+            await expect(client.authorizeDeliveryEffect(claimed.run.id,claimed.run.generation)).rejects.toMatchObject({status:409});
+            let lost=false;const lossyClient=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},async(...args)=>{const response=await fetch(...args);if(!lost&&String(args[0]).endsWith('/delivery-progress')&&response.ok){lost=true;throw Error('Fixture response loss after PostgreSQL receipt commit');}return response;});
+            await expect(lossyClient.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'merged',...proof})).rejects.toThrow('response loss');
+            const recorded=await client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'merged',...proof});
+            expect(recorded.artifact.kind).toBe('delivery');expect(recorded.run.operation?.external?.mergeSha).toBe(mergeSha);
+            await expect(client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'merged',...proof,mergeSha:'f'.repeat(40)})).rejects.toMatchObject({status:409});
+            expect((await client.deliveryProgress(claimed.run.id,claimed.run.generation,{phase:'merged',...proof})).run.operation?.external?.mergeSha).toBe(mergeSha);
+            await client.complete(claimed.run.id,claimed.run.generation,{});
+            expect((await client.readRun(claimed.run.id)).status).toBe('completed');
+            await sql`UPDATE wb_users SET role='owner' WHERE id=${owner.id}`;
+            // Legitimate refresh is a new candidate + QA + assigned review + immutable receipt;
+            // changing only a review or the old saved remote base cannot repair the old operation.
+            const identity={head:'7'.repeat(40),base:'8'.repeat(40),number:5,mergeSha:'6'.repeat(40)},freshFingerprint='9'.repeat(64),freshStamp=new Date().toISOString();
+            const freshCandidate:Run={...candidate,id:randomUUID(),createdAt:freshStamp,updatedAt:freshStamp};
+            const freshDiff:Artifact={...diff,id:randomUUID(),runId:freshCandidate.id,revision:'fresh-diff',data:{candidateRevision:identity.head,baseRevision:localBase},createdAt:freshStamp};
+            const freshQa:Artifact={...freshDiff,id:randomUUID(),kind:'qa',data:requiredQaFixture(freshFingerprint,savedQa)};
+            const freshPrior:Run={...prior,id:randomUUID(),createdAt:freshStamp,updatedAt:freshStamp,operation:{...prior.operation!,candidateRunId:freshCandidate.id,commitSha:identity.head,candidateFingerprint:freshFingerprint,candidateRevision:'fresh-diff',artifactRevision:'fresh-diff',external:{pullRequestNumber:5,pullRequestUrl:'https://github.com/org/repo/pull/5',pullRequestNodeId:'PR_fixture5',headSha:identity.head,baseSha:identity.base}}};
+            for(const [kind,item] of [['run',freshCandidate],['artifact',freshDiff],['artifact',freshQa],['run',freshPrior]] as const)await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${item.id},${kind},${p.id},${sql.json(item as never)})`;
+            await browser('POST',`/works/${w.id}/merge`,{...request,requestId:randomUUID()},409);
+            const nextMaster=(await client.claim(['master']))!.run;
+            const newReview=await client.tool(nextMaster.id,nextMaster.generation,'dispatch',{workId:w.id,prompt:'Review refreshed exact candidate',kind:'review',model:'gpt-6.1-sol'},randomUUID()) as Run;
+            expect(newReview.reviewBinding).toMatchObject({candidateRunId:freshCandidate.id,commitSha:identity.head,candidateFingerprint:freshFingerprint,diffArtifactId:freshDiff.id,qaArtifactIds:[freshQa.id]});
+            await client.complete(nextMaster.id,nextMaster.generation,{});
+            const nextReview=(await client.claim(['review']))!.run;
+            await client.tool(nextReview.id,nextReview.generation,'submit_review_result',{disposition:'approved',findings:[],evidenceArtifactIds:[freshQa.id]},randomUUID());
+            await client.complete(nextReview.id,nextReview.generation,{});
+            const refreshed=await browser('POST',`/works/${w.id}/merge`,{priorDeliveryRunId:freshPrior.id,reviewRunId:nextReview.id,requestId:randomUUID()});
+            expect(refreshed.run.id).not.toBe(claimed.run.id);
+            const nextClaim=(await client.claim(['delivery']))!,remote=mergeFixture({identity});
+            const nextProof=await mergePullRequest(nextClaim,async()=>{await client.authorizeDeliveryEffect(nextClaim.run.id,nextClaim.run.generation);},remote.fetcher,async phase=>{await client.deliveryProgress(nextClaim.run.id,nextClaim.run.generation,{phase});});
+            await client.deliveryProgress(nextClaim.run.id,nextClaim.run.generation,{phase:'merged',...nextProof});await client.complete(nextClaim.run.id,nextClaim.run.generation,{});
+            expect((await client.readRun(claimed.run.id)).operation?.external).toMatchObject({headSha:op.commitSha,baseSha:base,mergeSha});
+            expect(nextProof).toMatchObject({headSha:identity.head,baseSha:identity.base,mergeSha:identity.mergeSha});
+
+        } finally { await sql`UPDATE wb_users SET role='owner' WHERE id=${owner.id}`;if(oldToken===undefined)delete process.env.MENOTEAM_GITHUB_TOKEN;else process.env.MENOTEAM_GITHUB_TOKEN=oldToken; }
+    });
+ it('freezes a candidate review binding and accepts only one typed review over scoped grants and PostgreSQL',async()=>{
+  const p=checkedJson(await user('POST','/projects',{name:'Typed review PG proof',repositoryUrl:'https://github.com/example/typed-review'})) as Project;
+  const w=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Review exact candidate'})) as Work;
+  const owner=checkedJson(await user('GET','/me'));
+  const enrolled=checkedJson(await user('POST','/connectors',{id:`typed-review-${randomUUID()}`,projectIds:[p.id]}));
+  const connectorAuth={authorization:`Bearer ${enrolled.token}`};
+  const connectorRequest=(path:string,payload:unknown)=>app.inject({method:'POST',url:`/api/workbench/connector${path}`,headers:connectorAuth,payload:payload as never});
+  const candidateId=randomUUID(),commit='a'.repeat(40),base='b'.repeat(40),revision='diff-typed-review',fingerprint='c'.repeat(64);
+  const candidate:Run={id:candidateId,projectId:p.id,workId:w.id,prompt:'candidate',requestedBy:owner.id,kind:'implementation',model:'gpt-6-luna',reasoning:'medium',status:'completed',connectorId:enrolled.id,generation:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+  const diff:Artifact={id:'typed-diff',projectId:p.id,workId:w.id,runId:candidateId,kind:'diff',revision,data:{candidateRevision:commit,baseRevision:base},createdAt:new Date().toISOString()};
+  const qa:Artifact={id:'typed-qa',projectId:p.id,workId:w.id,runId:candidateId,kind:'qa',revision,data:{candidateFingerprint:fingerprint,checks:[{name:'unit',exitCode:0,testedRevision:fingerprint}],stale:false},createdAt:new Date().toISOString()};
+  await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${candidate.id},'run',${p.id},${sql.json(candidate as never)}),(${diff.id},'artifact',${p.id},${sql.json(diff as never)}),(${qa.id},'artifact',${p.id},${sql.json(qa as never)})`;
+  await user('POST',`/projects/${p.id}/messages`,{text:'Assign exact review',requestId:'typed-review-pg-master'});
+  const master=checkedJson(await connectorRequest('/claim',{capabilities:{runKinds:['master']}})).run as Run;
+  const masterGrant=checkedJson(await connectorRequest(`/runs/${master.id}/bridge-token`,{generation:master.generation})).token;
+  const masterTool=(action:string,input:unknown,requestId:string)=>app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${masterGrant}`},payload:{generation:master.generation,action,input,requestId} as never});
+  expect((await masterTool('request_merge',{priorDeliveryRunId:'delivery-placeholder',reviewRunId:'review-placeholder',requestId:'merge-forged-scope',workId:w.id},'merge-forged-scope-tool')).statusCode).toBe(400);
+  const dispatched=checkedJson(await masterTool('dispatch',{workId:w.id,prompt:'Review candidate',kind:'review',model:'gpt-6.1-sol'},'dispatch-typed-review')) as Run;
+  expect(dispatched.reviewBinding).toMatchObject({candidateRunId:candidateId,commitSha:commit,candidateFingerprint:fingerprint,diffRevision:revision,qaArtifactIds:['typed-qa']});
+  expect((await masterTool('submit_review_result',{disposition:'approved',findings:[],evidenceArtifactIds:['typed-qa']},'master-forged-review')).statusCode).toBe(403);
+  const review=checkedJson(await connectorRequest('/claim',{capabilities:{runKinds:['review']}})).run as Run;
+  const reviewGrant=checkedJson(await connectorRequest(`/runs/${review.id}/bridge-token`,{generation:review.generation})).token;
+  const reviewTool=(input:unknown,requestId:string)=>app.inject({method:'POST',url:`/api/workbench/connector/runs/${review.id}/tools`,headers:{authorization:`Bearer ${reviewGrant}`},payload:{generation:review.generation,action:'submit_review_result',input,requestId} as never});
+  const submission={disposition:'approved',findings:[],evidenceArtifactIds:['typed-qa']};
+  expect(checkedJson(await reviewTool(submission,'review-first')).kind).toBe('qa');
+  expect(checkedJson(await reviewTool(submission,'review-retry')).kind).toBe('qa');
+  expect((await reviewTool({...submission,disposition:'changes_requested'},'review-conflict')).statusCode).toBe(409);
+  expect((await reviewTool({...submission,evidenceArtifactIds:['forged-other-project-artifact']},'review-evidence-mismatch')).statusCode).toBe(403);
+  expect((await connectorRequest(`/runs/${review.id}/artifacts`,{generation:review.generation,kind:'qa',revision,data:{reviewDisposition:'approved'},requestId:'forged-generic'})).statusCode).toBe(403);
+  expect((await connectorRequest(`/runs/${review.id}/artifacts`,{generation:review.generation,kind:'qa',revision,data:{typedReview:{disposition:'approved',reviewerRunId:review.id}},requestId:'forged-nested-review'})).statusCode).toBe(403);
+  expect((await connectorRequest(`/runs/${review.id}/complete`,{generation:review.generation})).statusCode).toBe(200);
+  const saved=await sql`SELECT count(*)::int AS count FROM wb_records WHERE kind='artifact' AND data->>'runId'=${review.id} AND data->'data' ? 'typedReview'`;
+  expect(saved[0]!.count).toBe(1);
+ });
     it('Master partial Work updates preserve omitted overview/status and allow explicit clearing',async()=>{
         const p=checkedJson((await user('POST','/projects',{name:'Partial Work update proof'})));
         const work=checkedJson((await user('POST',`/projects/${p.id}/works`,{title:'Preserve definition',overview:'Original task definition',sources:['source:original']})));

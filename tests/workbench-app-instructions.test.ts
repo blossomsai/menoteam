@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import App from '../src/workbench/web/App';
 import { ApiError, workbenchApi, type Snapshot } from '../src/workbench/web/api';
 
@@ -18,7 +18,7 @@ function snapshot(instructions: string, name = 'Project'): Snapshot {
 let root: Root;
 let host: HTMLDivElement;
 let responses: Array<Promise<Snapshot>>;
-let snapshotSpy: ReturnType<typeof vi.spyOn<typeof workbenchApi, 'snapshot'>>;
+let snapshotSpy: MockInstance<typeof workbenchApi.snapshot>;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
 function button(text: string) {
   const found = [...host.querySelectorAll('button')].find(item => item.textContent?.trim() === text);
@@ -41,6 +41,22 @@ async function logout() {
   const control = host.querySelector<HTMLButtonElement>('aside > button')!;
   await flush(() => control.click());
 }
+
+it('delivery settings render only the supported merge method and save merge by default', async()=>{
+  window.history.replaceState(null,'','/workbench/?view=connections&project=project');
+  const value=snapshot('A');value.projects[0]!.repositoryUrl='https://github.com/org/repo';
+  responses=[Promise.resolve(value)];
+  const save=vi.spyOn(workbenchApi,'saveSetting').mockResolvedValue({id:'delivery',kind:'connection',projectId:'project',name:'GitHub delivery',data:{},updatedAt:''});
+  await mount();
+  const form=host.querySelector<HTMLInputElement>('#delivery-base-branch')!.closest('form')!;
+  await flush(()=>form.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+  const method=host.querySelector<HTMLSelectElement>('#delivery-merge-method')!;
+  expect(method.disabled).toBe(true);expect(method.value).toBe('merge');
+  expect([...method.options].map(option=>option.value)).toEqual(['merge']);
+  await type('Menoteam CI','#delivery-required-checks');responses.push(Promise.resolve(value));
+  await flush(()=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  expect(save).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({allowMergePr:true,mergeMethod:'merge',requiredChecks:['Menoteam CI']})}));
+});
 async function login() {
   await type(member.email, '#login-email');
   await type('password', '#login-password');

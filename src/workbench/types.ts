@@ -1,3 +1,4 @@
+import type { QaPolicy } from './local-qa.js';
 export interface Member {
     id: string;
     email: string;
@@ -46,7 +47,7 @@ export interface Run {
     execution?: ExecutionContext;
     kind: 'master' | 'implementation' | 'review' | 'delivery';
     operation?: {
-        action: 'create_draft_pr';
+        action: 'create_draft_pr' | 'merge_pr';
         actorId: string;
         candidateRunId: string;
         candidateRevision: string;
@@ -60,9 +61,20 @@ export interface Run {
         workTitle: string;
         changeSummary: string;
         qaStatus: string;
-        phase: 'queued' | 'published' | 'pr_created';
-        external?: { pullRequestNumber?: number; pullRequestUrl?: string; headSha?: string };
+        phase: 'queued' | 'published' | 'pr_created' | 'ready_intent' | 'merge_intent' | 'merged';
+        effectIntentGeneration?: number;
+        external?: { pullRequestNumber?: number; pullRequestUrl?: string; headSha?: string; baseSha?: string; mergeSha?: string; pullRequestNodeId?: string };
+        priorDeliveryRunId?: string;
+        reviewRunId?: string;
+        originalActorId?: string;
+        mergeMethod?: 'merge' | 'squash' | 'rebase';
+        integrationBaseSha?: string;
+        qaPolicySnapshot?: QaPolicy;
+        policySnapshot?: { id: string; version: string; requiredChecks: string[] };
+
     };
+    qaPolicySnapshot?: QaPolicy;
+    reviewBinding?: { candidateRunId: string; commitSha: string; candidateFingerprint: string; diffArtifactId: string; diffRevision: string; qaArtifactIds: string[] };
     model: string;
     reasoning: string;
     status: 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'interrupted';

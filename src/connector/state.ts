@@ -7,6 +7,7 @@ import type { ConnectorConfig } from './types.js';
 const configSchema = z.object({
   serverUrl: z.string().url(), token: z.string().min(32), connectorId: z.string().min(1),
   dataDir: z.string().min(1), projects: z.record(z.string(), z.string()),
+  qaResources: z.record(z.string(),z.object({url:z.string().url()}).strict()).optional(),
   codexBinary: z.string().optional(), pollIntervalMs: z.number().int().min(1000).max(30_000).optional(),
   leaseRenewIntervalMs: z.number().int().min(5_000).max(60_000).optional(),
 }).strict();

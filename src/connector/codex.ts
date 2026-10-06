@@ -12,8 +12,8 @@ const execFile = promisify(execFileCb);
 type RpcMessage = { id?: number | string; method?: string; params?: any; result?: any; error?: { message?: string; code?: number } };
 type ToolHandler = (name: string, input: Record<string, unknown>, requestId: string) => Promise<unknown>;
 
-const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','post_message','update_settings','create_skill'];
-const REVIEW_BRIDGE_TOOLS = ['read_work','read_run'];
+const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','request_merge','post_message','update_settings','create_skill'];
+const REVIEW_BRIDGE_TOOLS = ['read_work','read_run','submit_review_result'];
 
 function scopedBridgeConfig(contextFile: string, tools: string[]) {
   const compiledPath = fileURLToPath(new URL('./mcp-bridge.js', import.meta.url));
@@ -32,6 +32,10 @@ function scopedBridgeConfig(contextFile: string, tools: string[]) {
   } } };
 }
 
+export function modelChildEnvironment():NodeJS.ProcessEnv {
+  const env={...process.env};for(const key of ['MENOTEAM_GITHUB_TOKEN','WORKBENCH_GITHUB_TOKEN','GITHUB_TOKEN','GH_TOKEN','MENOTEAM_CONNECTOR_CONFIG'])delete env[key];return env;
+}
+
 export class CodexAppServer {
   private child?: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<number, { resolve(value: any): void; reject(error: Error): void }>();
@@ -46,9 +50,7 @@ export class CodexAppServer {
 
   async start(cwd: string): Promise<string[]> {
     if (this.child) return this.models;
-    const nativeEnv = { ...process.env };
-    delete nativeEnv.MENOTEAM_GITHUB_TOKEN;
-    delete nativeEnv.MENOTEAM_CONNECTOR_CONFIG;
+    const nativeEnv = modelChildEnvironment();
     const child = spawn(this.binary, ['app-server'], { cwd, env: nativeEnv, stdio: ['pipe','pipe','pipe'], shell: false, detached: process.platform !== 'win32' });
     this.child = child;
     this.childClosed = false;
@@ -215,7 +217,7 @@ export async function terminateProcessGroup(pid: number, graceMs = 1500): Promis
 export interface CodexProcessIdentity { pid: number; processGroupId: number; startedAt: string; command: string; }
 
 /** Capture a PID-reuse-resistant identity before persisting a live app-server handle. */
-export async function readCodexProcessIdentity(pid: number): Promise<CodexProcessIdentity | undefined> {
+export async function readProcessIdentity(pid: number): Promise<CodexProcessIdentity | undefined> {
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   try {
     if (process.platform === 'linux') {
@@ -229,17 +231,19 @@ export async function readCodexProcessIdentity(pid: number): Promise<CodexProces
       const bootId = (await readFileCb('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
       if (!bootId) return undefined;
       const command = (await readFileCb(`/proc/${pid}/cmdline`)).toString('utf8').replaceAll('\0', ' ').trim();
-      if (!command.includes('codex') || !command.includes('app-server')) return undefined;
+      if (!command) return undefined;
       return { pid, processGroupId, startedAt: `linux:${bootId}:${startTicks}`, command };
     }
     const [group, started, command] = await Promise.all(['pgid=', 'lstart=', 'command='].map(async field =>
       (await execFile('ps', ['-o', field, '-p', String(pid)], { encoding: 'utf8', maxBuffer: 16_384 })).stdout.trim()));
     const processGroupId = Number(group);
     const startedText = started ?? ''; const commandText = command ?? '';
-    if (!startedText || !commandText || !Number.isSafeInteger(processGroupId) || !commandText.includes('codex') || !commandText.includes('app-server')) return undefined;
+    if (!startedText || !commandText || !Number.isSafeInteger(processGroupId)) return undefined;
     return { pid, processGroupId, startedAt: `ps:${startedText}`, command: commandText };
   } catch { return undefined; }
 }
+
+export async function readCodexProcessIdentity(pid:number):Promise<CodexProcessIdentity|undefined> { const identity=await readProcessIdentity(pid);return identity?.command.includes('codex')&&identity.command.includes('app-server')?identity:undefined; }
 
 /** Never kill a recycled PID: require the saved process identity to still match. */
 export async function terminateVerifiedProcessGroup(identity: CodexProcessIdentity, graceMs = 1500): Promise<boolean> {

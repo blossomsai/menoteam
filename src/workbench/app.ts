@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import Fastify, { type FastifyRequest, type FastifyInstance } from "fastify";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
@@ -8,6 +9,7 @@ import { registerSourceRoutes } from "./sources.js";
 import { WorkbenchStore } from "./store.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
 import type { Member, Project, Work, Message, Run, Artifact, Setting, RunEvent } from "./types.js";
+import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 const text = z.string().trim().min(1).max(12000);
@@ -317,6 +319,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const candidate = input.kind === "review" ? (await store.list<Artifact>("artifact", projectId, tx)).filter(a => a.workId === input.workId && a.kind === "diff").at(-1) : undefined;
         if (input.kind === "review" && !candidate)
             fail(409, "Review requires recorded candidate diff");
+        if(candidate){const assigned=(await store.list<Run>('run',projectId,tx)).find(item=>item.id===candidate.runId);if(!assigned||assigned.kind!=='implementation'||assigned.status!=='completed'||assigned.workId!==input.workId)fail(409,'Review candidate is not a completed implementation run');}
         const targetWork = input.workId ? await store.get<Work>("work", input.workId, tx) : undefined;
         const profile = targetWork?.profileId ? await store.get<Setting>("setting", targetWork.profileId, tx) : undefined;
         if(targetWork?.profileId && !profile)fail(400,"Agent profile missing");
@@ -347,6 +350,17 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             createdAt: now(),
             updatedAt: now()
         };
+        if (candidate && input.kind === 'review') {
+            const artifacts = await store.list<Artifact>('artifact', projectId, tx);
+            const diffData = candidate.data && typeof candidate.data === 'object' ? candidate.data as Record<string, unknown> : {};
+            const commitSha = diffData.candidateRevision;
+            const qa = artifacts.filter(a => a.workId === input.workId && a.runId === candidate.runId && a.kind === 'qa' && a.revision === candidate.revision);
+            const candidateQa = qa.find(a => a.data && typeof a.data === 'object' && /^[a-f0-9]{64}$/u.test(String((a.data as Record<string, unknown>).candidateFingerprint ?? '')));
+            if (typeof commitSha !== 'string' || !/^[a-f0-9]{40,64}$/u.test(commitSha) || !candidateQa)
+                fail(409, 'Review requires current candidate and fingerprint evidence');
+            run.reviewBinding = { candidateRunId: candidate.runId, commitSha: commitSha as string, candidateFingerprint: String((candidateQa!.data as Record<string, unknown>).candidateFingerprint), diffArtifactId: candidate.id, diffRevision: candidate.revision, qaArtifactIds: qa.map(a => a.id) };
+        }
+        if(run.kind==='implementation'){const project=await store.get<Project>('project',projectId,tx);run.qaPolicySnapshot=project?savedQaPolicy(await store.list<Setting>('setting',undefined,tx),projectId,project.repositoryUrl):undefined;}
         await store.put("run", run, tx);
         return run;
     }
@@ -415,12 +429,67 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(result as never)}),(${canonicalScope},'canonical',${tx.json(result as never)})`;
         return result;
     }
+    async function requestMergePr(user: Member, workId: string, raw: unknown, tx = sql, projectBoundary?:string) {
+        const b=z.object({priorDeliveryRunId:text,reviewRunId:text,requestId:z.string().min(1).max(200)}).strict().parse(raw);
+        const work=await store.get<Work>('work',workId,tx);if(!work||projectBoundary&&work.projectId!==projectBoundary)fail(404,'Work missing');
+        await grant(user,work!.projectId,true);
+        const runs=await store.list<Run>('run',work!.projectId,tx);const prior=runs.find(r=>r.id===b.priorDeliveryRunId);
+        if(!prior||prior.workId!==workId||prior.kind!=='delivery'||prior.status!=='completed'||prior!.operation!?.action!=='create_draft_pr'||prior!.operation!.phase!=='pr_created'||!prior!.operation!.external?.pullRequestNumber||prior!.operation!.external.headSha!==prior!.operation!.commitSha)fail(409,'Completed draft delivery receipt is unavailable');
+        if(!prior!.requestedBy||!await actorAuthorized({...prior!,requestedBy:prior!.requestedBy},tx))fail(403,'Original delivery actor authorization was revoked');
+        const actorRows=await tx`SELECT role FROM wb_users WHERE id=${prior!.requestedBy!}`;if(!actorRows[0]||!['owner','admin'].includes(String(actorRows[0].role)))fail(403,'Original delivery actor must be project owner or admin');
+        const repo=await store.get<Project>('project',work!.projectId,tx);if(!repo?.repositoryUrl||repo!.repositoryUrl!==prior!.operation!.repositoryUrl)fail(409,'Delivery repository changed');
+        const policy=(await store.list<Setting>('setting',undefined,tx)).find(s=>s.projectId===work!.projectId&&s.kind==='connection'&&s.data.provider==='github'&&s.data.purpose==='delivery'&&s.data.enabled!==false&&s.data.url===repo!.repositoryUrl&&s.data.configuredBy&&s.data.allowMergePr===true&&s.data.baseBranch===prior!.operation!.baseBranch);
+        if(!policy||policy.data.mergeMethod!=='merge'||!Array.isArray(policy.data.requiredChecks)||!policy.data.requiredChecks.length)fail(403,'Explicit merge policy is unavailable');
+        const review=runs.find(r=>r.id===b.reviewRunId);if(!review||review.workId!==workId||review.kind!=='review'||review.status!=='completed'||review!.reviewBinding!?.candidateRunId!==prior!.operation!.candidateRunId||review!.reviewBinding!.commitSha!==prior!.operation!.commitSha||review!.reviewBinding!.candidateFingerprint!==prior!.operation!.candidateFingerprint||review!.reviewBinding!.diffRevision!==prior!.operation!.artifactRevision)fail(409,'Completed exact-candidate review is unavailable');
+        const artifacts=await store.list<Artifact>('artifact',work!.projectId,tx);
+        const latest=artifacts.filter(a=>a.kind==='diff'&&a.workId===workId).at(-1);if(latest?.id!==review!.reviewBinding!.diffArtifactId||latest.runId!==prior!.operation!.candidateRunId||latest.revision!==prior!.operation!.artifactRevision||(latest.data as {candidateRevision?:string;baseRevision?:string})?.candidateRevision!==prior!.operation!.commitSha||(latest.data as {baseRevision?:string})?.baseRevision!==prior!.operation!.baseRevision)fail(409,'Frozen candidate diff is no longer current');
+        const typed=artifacts.filter(a=>a.runId===review!.id&&a.kind==='qa'&&a.data&&typeof a.data==='object'&&(a.data as Record<string,unknown>).typedReview).at(-1);
+        const reviewData=typed?.data&&typeof typed.data==='object'?(typed.data as Record<string,unknown>).typedReview as Record<string,unknown>:undefined;
+        const findings=Array.isArray(reviewData?.findings)?reviewData.findings as Array<{blocking?:unknown}>:[];
+        if(!reviewData||reviewData.candidateRunId!==prior!.operation!.candidateRunId||reviewData.commitSha!==prior!.operation!.commitSha||reviewData.candidateFingerprint!==prior!.operation!.candidateFingerprint||reviewData.diffRevision!==prior!.operation!.artifactRevision||reviewData.reviewerRunId!==review!.id||reviewData.disposition!=='approved'||findings.some(f=>f.blocking===true)||!Array.isArray(reviewData.evidenceArtifactIds)||!reviewData.evidenceArtifactIds.length)fail(409,'Review does not approve this candidate');
+        const qaPolicy=savedQaPolicy(await store.list<Setting>('setting',undefined,tx),work!.projectId,repo!.repositoryUrl);
+        const qa=artifacts.find(a=>(reviewData!.evidenceArtifactIds as string[]).includes(a.id)&&review!.reviewBinding!.qaArtifactIds.includes(a.id)&&a.runId===prior!.operation!.candidateRunId&&a.kind==='qa'&&a.revision===prior!.operation!.artifactRevision&&a.data&&typeof a.data==='object'&&(a.data as Record<string,unknown>).candidateFingerprint===prior!.operation!.candidateFingerprint&&hasRequiredLocalQa(a.data,prior!.operation!.candidateFingerprint,qaPolicy));
+        const candidateRun=await store.get<Run>('run',prior!.operation!.candidateRunId,tx);
+        if(!sameQaPolicy(candidateRun?.qaPolicySnapshot,qaPolicy)||!hasRequiredLocalQa(qa?.data,prior!.operation!.candidateFingerprint,qaPolicy))fail(409,'Required local QA coverage is missing, failed, unknown, stale or changed');
+        if(!prior!.operation!.external?.baseSha||!prior!.operation!.external.pullRequestNodeId)fail(409,'Verified remote integration receipt is missing; publish a refreshed candidate receipt');
+        const canonicalScope=`delivery-merge:${work!.projectId}:${prior!.operation!.external!.pullRequestNumber}:${prior!.operation!.commitSha}`;
+        const requestScope=`delivery-merge-request:${workId}:${user.id}`;const requestPrior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
+        const reconcile=async(saved:{run?:Run;operationId?:string})=>{if(saved.run?.operation?.priorDeliveryRunId!==prior!.id||saved.run.operation.reviewRunId!==review!.id)fail(409,'Canonical merge operation is already bound to another review');const current=await store.get<Run>('run',saved.run!.id,tx);if(!current)fail(409,'Canonical merge operation is unavailable');if(['failed','interrupted','cancelled'].includes(current!.status)){if(['interrupted','cancelled'].includes(current!.status)&&!current!.stoppedAt)fail(409,'Connector process must be confirmed stopped before merge reconciliation');current!.generation++;current!.status='queued';current!.stoppedAt=undefined;current!.error=undefined;current!.updatedAt=now();await store.put('run',current!,tx);saved={run:current!,operationId:current!.id};}return saved;};
+        if(requestPrior[0]){const saved=requestPrior[0].result as {run?:Run;operationId?:string};return reconcile(saved);}
+        const existing=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        if(existing[0])return reconcile(existing[0].result as {run?:Run;operationId?:string});
+        const op={...prior!.operation!,action:'merge_pr' as const,actorId:user.id,phase:'queued' as const,priorDeliveryRunId:prior!.id,reviewRunId:review!.id,originalActorId:prior!.requestedBy,mergeMethod:'merge' as const,integrationBaseSha:prior!.operation!.external!.baseSha,qaPolicySnapshot:qaPolicy,policySnapshot:{id:policy!.id,version:policy!.updatedAt,requiredChecks:[...(policy!.data.requiredChecks as string[])]}};
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Merge the verified pull request using the fixed executor. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:prior!.targetRunId,targetRevision:prior!.targetRevision,targetConnectorId:prior!.targetConnectorId,operation:op};
+        await store.put('run',run,tx);const result={run,operationId:run.id};await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(result as never)}),(${canonicalScope},'canonical',${tx.json(result as never)})`;return result;
+    }
     async function draftPrPolicy(projectId:string,repositoryUrl:string,baseBranch:string,tx:Sql):Promise<void>{
         const project=await store.get<Project>('project',projectId,tx);
         if(!project?.repositoryUrl||project.repositoryUrl!==repositoryUrl)fail(409,'Draft PR repository policy changed');
         const normalizeRepository=(value:string)=>value.replace(/\/$/u,'').replace(/\.git$/u,'');
         const settings=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.projectId===projectId&&s.kind==='connection'&&s.data.provider==='github'&&s.data.purpose==='delivery'&&s.data.enabled!==false);
         if(!settings.some(s=>typeof s.data.url==='string'&&normalizeRepository(s.data.url)===normalizeRepository(repositoryUrl)&&s.data.allowDraftPr===true&&s.data.baseBranch===baseBranch&&typeof s.data.configuredBy==='string'))fail(403,'Draft PR action policy is unavailable');
+    }
+    async function mergePrPolicy(run:Run,tx:Sql):Promise<void>{
+        const op=run.operation!;if(!op||op.action!=='merge_pr')fail(403,'Merge operation unavailable');
+        await draftPrPolicy(run.projectId,op.repositoryUrl,op.baseBranch,tx);
+        const runs=await store.list<Run>('run',run.projectId,tx);
+        const review=runs.find(r=>r.id===op.reviewRunId), candidate=runs.find(r=>r.id===op.candidateRunId);
+        const artifacts=await store.list<Artifact>('artifact',run.projectId,tx);
+        const latest=artifacts.filter(a=>a.kind==='diff'&&a.workId===run.workId).at(-1);
+        if(candidate?.status!=='completed'||review?.status!=='completed'||review.kind!=='review'||review.reviewBinding?.commitSha!==op.commitSha||review.reviewBinding.candidateFingerprint!==op.candidateFingerprint||latest?.id!==review.reviewBinding.diffArtifactId||latest.revision!==op.artifactRevision||latest.runId!==op.candidateRunId||(latest.data as {candidateRevision?:string;baseRevision?:string})?.candidateRevision!==op.commitSha||(latest.data as {baseRevision?:string})?.baseRevision!==op.baseRevision)fail(409,'Reviewed candidate or frozen diff changed');
+        const typed=artifacts.find(a=>a.runId===review!.id&&a.kind==='qa'&&a.data&&typeof a.data==='object'&&(a.data as Record<string,unknown>).typedReview)?.data as {typedReview?:{disposition?:string;findings?:Array<{blocking:boolean}>;evidenceArtifactIds?:string[]}}|undefined;
+        if(typed?.typedReview?.disposition!=='approved'||!Array.isArray(typed.typedReview.findings)||typed.typedReview.findings.some(f=>f.blocking)||!typed.typedReview.evidenceArtifactIds?.length)fail(409,'Approved typed review evidence is unavailable');
+        const evidence=artifacts.filter(a=>typed!.typedReview!.evidenceArtifactIds!.includes(a.id)&&review!.reviewBinding!.qaArtifactIds.includes(a.id)&&a.runId===op.candidateRunId&&a.workId===run.workId&&a.kind==='qa'&&a.revision===op.artifactRevision);
+        const currentQaPolicy=savedQaPolicy(await store.list<Setting>('setting',undefined,tx),run.projectId,op.repositoryUrl);
+        const qaCandidate=await store.get<Run>('run',op.candidateRunId,tx);
+        if(!sameQaPolicy(op.qaPolicySnapshot,currentQaPolicy)||!sameQaPolicy(qaCandidate?.qaPolicySnapshot,currentQaPolicy)||evidence.length!==typed!.typedReview!.evidenceArtifactIds!.length||!evidence.some(a=>hasRequiredLocalQa(a.data,op.candidateFingerprint,currentQaPolicy)))fail(409,'Required local QA coverage is missing, failed, unknown, stale or changed');
+
+        const policy=(await store.list<Setting>('setting',undefined,tx)).find(s=>s.projectId===run.projectId&&s.kind==='connection'&&s.data.provider==='github'&&s.data.purpose==='delivery'&&s.data.enabled!==false&&s.data.url===op.repositoryUrl&&s.data.baseBranch===op.baseBranch&&s.data.allowMergePr===true&&s.data.mergeMethod===op.mergeMethod&&Array.isArray(s.data.requiredChecks)&&s.data.requiredChecks.length>0);
+        if(!policy||policy.id!==op.policySnapshot?.id||policy.updatedAt!==op.policySnapshot.version||JSON.stringify(policy.data.requiredChecks)!==JSON.stringify(op.policySnapshot.requiredChecks))fail(403,'Merge policy was revoked or changed');
+        const users=await tx`SELECT role FROM wb_users WHERE id=${run.requestedBy??''}`;if(!users[0]||!['owner','admin'].includes(String(users[0]!.role)))fail(403,'Merge actor must remain an owner or admin');
+        const memberships=await tx`SELECT role FROM wb_memberships WHERE user_id=${run.requestedBy??''} AND project_id=${run.projectId}`;if(users[0]!.role!=='owner'&&(!memberships[0]||!['owner','admin'].includes(String(memberships[0].role))))fail(403,'Merge project authorization was revoked');
+        const original=await tx`SELECT role FROM wb_users WHERE id=${op.originalActorId??''}`;if(!original[0]||!['owner','admin'].includes(String(original[0]!.role)))fail(403,'Original delivery actor is no longer an owner or admin');
+        const originalMembership=await tx`SELECT role FROM wb_memberships WHERE user_id=${op.originalActorId??''} AND project_id=${run.projectId}`;if(original[0]!.role!=='owner'&&(!originalMembership[0]||!['owner','admin'].includes(String(originalMembership[0].role))))fail(403,'Original delivery actor project authorization was revoked');
     }
     async function actorCanAccess(user:Member,projectId:string,tx:Sql):Promise<boolean>{
         if(user.role==='owner')return !!await store.get<Project>('project',projectId,tx);
@@ -438,6 +507,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const user=await member(req);const workId=(req.params as {id:string}).id;
         return store.transaction(`delivery:${workId}`,tx=>requestDraftPr(user,workId,req.body,tx));
     });
+    app.post('/api/workbench/works/:id/merge',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`delivery:${workId}`,tx=>requestMergePr(user,workId,req.body,tx));});
     app.get("/api/workbench/works/:id", async (req) => {
         const w = await store.get<Work>("work", (req.params as {
             id: string;
@@ -581,18 +651,22 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 sourceUrl: publicMetadataUrl.optional(),
                 enabled: z.boolean().default(true)
             }).strict(),
-            connection: z.object({
+            connection: z.union([qaPolicyData,z.object({
                 provider: z.enum(["github", "slack"]),
                 url: publicMetadataUrl,
                 enabled: z.boolean().default(true),
                 purpose: z.enum(['source', 'delivery']).default('source'),
                 baseBranch: z.string().regex(/^[A-Za-z0-9._/-]{1,200}$/u).optional(),
                 allowDraftPr: z.boolean().default(false),
+                allowMergePr: z.boolean().default(false),
+                mergeMethod: z.enum(['merge','squash','rebase']).optional(),
+                requiredChecks: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
                 configuredBy: z.string().optional()
             }).strict().superRefine((value, context) => {
                 if (value.purpose === 'delivery' && (value.provider !== 'github' || !value.baseBranch || !value.allowDraftPr))
                     context.addIssue({ code: 'custom', message: 'Draft PR delivery requires GitHub, a base branch, and explicit create permission' });
-            })
+                if (value.allowMergePr && (value.mergeMethod!=='merge' || !value.requiredChecks?.length || new Set(value.requiredChecks).size!==value.requiredChecks.length)) context.addIssue({code:'custom',message:'Merge requires a fixed method and required checks'});
+            })])
         };
         return schemas[kind].parse(input);
     }
@@ -615,7 +689,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             data: z.record(z.string(), z.unknown())
         }).parse(input);
         b.data = settingData(b.kind, b.data);
-        if (b.kind === 'connection' && b.data.purpose === 'delivery') b.data.configuredBy = actorId;
+        if (b.kind === 'connection' && ['delivery','qa'].includes(String(b.data.purpose))) b.data.configuredBy = actorId;
+        if(b.kind==='connection'&&b.data.purpose==='qa'&&!b.projectId)fail(400,'QA policy requires a project');
         if (b.kind === 'profile') await resolveProfileSkills(b, tx);
         if(b.kind==='provider'&&!b.projectId){const existing=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.kind==='provider'&&!s.projectId);b.data.default=existing.length===0;}
         const s: Setting = {
@@ -653,7 +728,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(409, 'Setting changed; reload before updating');
         if (change.data) {
             setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data });
-            if (setting!.kind === 'connection' && setting!.data.purpose === 'delivery') setting!.data.configuredBy = actor.id;
+            if (setting!.kind === 'connection' && ['delivery','qa'].includes(String(setting!.data.purpose))) setting!.data.configuredBy = actor.id;
         }
         if (setting!.kind === 'profile') await resolveProfileSkills(setting!, tx);
         if (change.name !== undefined) setting!.name = change.name;
@@ -697,11 +772,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     async function actorAuthorized(run:Run,tx=sql):Promise<boolean>{
         const users=await tx`SELECT role FROM wb_users WHERE id=${run.requestedBy??''}`;
         if(!users[0])return false;
-        if(users[0].role!=='owner'){const memberships=await tx`SELECT role FROM wb_memberships WHERE user_id=${run.requestedBy!} AND project_id=${run.projectId}`;if(!memberships[0])return false;}
+        if(users[0]!.role!=='owner'){const memberships=await tx`SELECT role FROM wb_memberships WHERE user_id=${run.requestedBy!} AND project_id=${run.projectId}`;if(!memberships[0])return false;}
         if(run.sourceIds?.length){const p=await store.get<Project>('project',run.projectId,tx);if(!p?.feedbackIntake?.enabled||p.feedbackIntake.actorId!==run.requestedBy)return false;}
         return true;
     }
-    async function leased(req: FastifyRequest, tx: Sql, allowBridge=false) {
+    async function leased(req: FastifyRequest, tx: Sql, allowBridge=false, reconciliation=false) {
         let c: {id:string;projectIds:string[]};
         if(allowBridge){
             const raw=req.headers.authorization?.replace(/^Bearer /,'')??'';
@@ -723,21 +798,29 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         };
         if (!r || !c.projectIds.includes(r.projectId))
             fail(403, "Run denied");
-        if (r!.connectorId !== c.id || r!.generation !== b.generation || r!.status !== "running" || Date.parse(r!.leaseUntil ?? "") < Date.now())
+        if (r!.connectorId !== c.id || r!.generation !== b.generation || (!reconciliation && (r!.status !== "running" || Date.parse(r!.leaseUntil ?? "") < Date.now())))
             fail(409, "Lease lost; stop and reconcile execution");
-        if(!await actorAuthorized(r!,tx))fail(403,'Run authorization revoked; stop execution');
+        if(reconciliation&&(r!.kind!=='delivery'||r!.operation?.action!=='merge_pr'||!['merge_intent','merged'].includes(r!.operation.phase)))fail(403,'Only saved merge intent permits read-only effect recording');
+        if(!reconciliation&&!await actorAuthorized(r!,tx))fail(403,'Run authorization revoked; stop execution');
         return r!;
     }
+    app.post('/api/workbench/connector/runs/:id/qa-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const r=await leased(req,tx);if(r.kind!=='implementation')fail(403,'Assigned implementation QA required');
+        const project=await store.get<Project>('project',r.projectId,tx);
+        const policy=project?savedQaPolicy(await store.list<Setting>('setting',undefined,tx),r.projectId,project.repositoryUrl):undefined;
+        if(!sameQaPolicy(r.qaPolicySnapshot,policy))fail(409,'Assigned QA policy is unavailable, revoked or changed');
+        return {authorized:true};
+    }));
     app.post('/api/workbench/connector/runs/:id/delivery-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
         const run=await leased(req,tx);
         const body=z.object({generation:z.number()}).strict().parse(req.body);
-        const operation=run.operation;
-        if(run.kind!=='delivery'||!operation||operation.action!=='create_draft_pr')fail(403,'Draft PR operation unavailable');
+        const operation=run.operation!;
+        if(run.kind!=='delivery'||!operation||!['create_draft_pr','merge_pr'].includes(operation.action))fail(403,'Delivery operation unavailable');
         const rows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${run.connectorId!}`;
         const caps=rows[0]?.capabilities as Record<string,unknown>|undefined;
-        if(!caps||caps.git!==true||caps.githubWrite!==true||!Array.isArray(caps.deliveryActions)||!caps.deliveryActions.includes('create_draft_pr'))fail(403,'Draft PR Connector capability revoked');
+        if(!caps||caps.git!==true||caps.githubWrite!==true||!Array.isArray(caps.deliveryActions)||!caps.deliveryActions.includes(operation.action))fail(403,'Delivery Connector capability revoked');
         const project=await store.get<Project>('project',run.projectId,tx);
-        await draftPrPolicy(run.projectId,operation!.repositoryUrl,operation!.baseBranch,tx);
+        if(operation.action==='merge_pr')await mergePrPolicy(run,tx);else await draftPrPolicy(run.projectId,operation.repositoryUrl,operation.baseBranch,tx);
         if(operation!.actorId!==run.requestedBy||body.generation!==run.generation)fail(409,'Draft PR authorization changed');
         return {authorized:true,repositoryUrl:project!.repositoryUrl};
     }));
@@ -750,7 +833,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const claimed = await store.transaction("workbench:claim", async (tx) => {
             const runs = await store.list<Run>("run", undefined, tx);
             for (const r of runs) {
-                if(r.status==='queued'&&!await actorAuthorized(r,tx)){r.status='cancelled';r.stoppedAt=now();r.error='Run authorization revoked';await store.put('run',r,tx);}
+                if(r.status==='queued'&&!(r.kind==='delivery'&&r.operation?.action==='merge_pr'&&r.operation.phase==='merge_intent')&&!await actorAuthorized(r,tx)){r.status='cancelled';r.stoppedAt=now();r.error='Run authorization revoked';await store.put('run',r,tx);}
                 if (r.status === "running" && Date.parse(r.leaseUntil ?? "") < Date.now()) {
                     r.status = "interrupted";
                     r.error = "Connector lease expired; reconciliation required";
@@ -758,7 +841,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                     await store.put("run", r, tx);
                 }
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&body.capabilities.deliveryActions.includes('create_draft_pr') : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(active.createdAt===r.createdAt&&active.id<r.id))))));
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&!!r.operation&&body.capabilities.deliveryActions.includes(r.operation.action) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(Date.parse(active.createdAt)===Date.parse(r.createdAt)&&active.id<r.id))))));
             if (!r)
                 return undefined;
             r.status = "running";
@@ -858,10 +941,18 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             data: z.unknown(),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
+        if (b.data && typeof b.data === 'object' && ('reviewDisposition' in b.data || 'reviewResult' in b.data || 'typedReview' in b.data))
+            fail(403, 'Typed review results must use the assigned review endpoint');
+        if(b.kind==='delivery')fail(403,'Delivery receipts require the fixed delivery-progress endpoint');
+        if(b.data&&typeof b.data==='object'&&'localQaContract' in b.data){
+            if(r.kind!=='implementation'||b.kind!=='qa'||b.requestId!==`required-qa:${r.id}:${r.generation}`)fail(403,'Fixed QA snapshots require the implementation parent capture');
+            const snapshot=fixedQaSnapshot.parse(b.data);
+            if(snapshot.revision!==b.revision)fail(400,'QA revision mismatch');
+            if(snapshot.policy&&!sameQaPolicy(snapshot.policy,r.qaPolicySnapshot))fail(403,'QA policy is outside the assigned implementation');
+        }
         const aid = `artifact:${r.id}:${b.requestId}`;
         const prior = await store.get<Artifact>("artifact", aid, tx);
-        if (prior)
-            return prior;
+        if(prior){if(b.data&&typeof b.data==='object'&&'localQaContract' in b.data&&(prior.revision!==b.revision||!isDeepStrictEqual(prior.data,b.data)))fail(409,'Fixed QA snapshot is immutable');return prior;}
         const a: Artifact = {
             id: aid,
             projectId: r.projectId,
@@ -875,14 +966,46 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await store.put("artifact", a, tx);
         return a;
     }));
+    app.post('/api/workbench/connector/runs/:id/review-result', async req => store.transaction(`run:${(req.params as {id:string}).id}`, async tx => {
+        const run = await leased(req, tx);
+        if (run.kind !== 'review' || !run.reviewBinding) fail(403, 'Assigned review run required');
+        const body = z.object({ generation: z.number(), disposition: z.enum(['approved','changes_requested','insufficient_evidence']), findings: z.array(z.object({ id: z.string().min(1).max(120), blocking: z.boolean(), summary: z.string().trim().min(1).max(2000) }).strict()).max(100), evidenceArtifactIds: z.array(z.string().min(1).max(200)).max(100), requestId: z.string().min(1).max(200) }).strict().parse(req.body);
+        if (body.generation !== run.generation || new Set(body.findings.map(item => item.id)).size !== body.findings.length) fail(400, 'Invalid review result');
+        if (body.evidenceArtifactIds.some(aid => !run.reviewBinding!.qaArtifactIds.includes(aid))) fail(403, 'Review evidence is outside the assigned candidate');
+        const artifacts = await store.list<Artifact>('artifact', run.projectId, tx);
+        const validEvidence = artifacts.filter(a => body.evidenceArtifactIds.includes(a.id) && a.workId === run.workId && a.runId === run.reviewBinding!.candidateRunId && a.kind === 'qa' && a.revision === run.reviewBinding!.diffRevision);
+        if (validEvidence.length !== body.evidenceArtifactIds.length) fail(409, 'Review evidence is unavailable or stale');
+        const artifactId = `artifact:${run.id}:typed-review:${body.requestId}`;
+        const savedResults=(await store.list<Artifact>('artifact',run.projectId,tx)).filter(a=>a.runId===run.id&&a.kind==='qa'&&a.data&&typeof a.data==='object'&&(a.data as Record<string,unknown>).typedReview);
+        const prior=savedResults[0]??await store.get<Artifact>('artifact',artifactId,tx);
+        if (prior) { const saved=(prior.data as {typedReview?:Record<string,unknown>}).typedReview;if(saved?.disposition!==body.disposition||JSON.stringify(saved.findings)!==JSON.stringify(body.findings)||JSON.stringify(saved.evidenceArtifactIds)!==JSON.stringify(body.evidenceArtifactIds))fail(409,'Review result is immutable; changed content requires a new assigned review run');return prior; }
+        const artifact: Artifact = { id: artifactId, projectId: run.projectId, workId: run.workId, runId: run.id, kind: 'qa', revision: run.reviewBinding!.diffRevision, data: { typedReview: { ...run.reviewBinding, disposition: body.disposition, findings: body.findings, evidenceArtifactIds: body.evidenceArtifactIds, reviewerRunId: run.id, submittedAt: now() } }, createdAt: now() };
+        await store.put('artifact', artifact, tx);
+        return artifact;
+    }));
     app.post('/api/workbench/connector/runs/:id/delivery-progress',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
-        const run=await leased(req,tx);if(run.kind!=='delivery'||!run.operation)fail(403,'Delivery operation required');
-        const b=z.object({generation:z.number(),phase:z.enum(['published','pr_created']),remoteHeadSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional(),pullRequestNumber:z.number().int().positive().optional(),pullRequestUrl:z.string().url().optional(),headSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional()}).strict().parse(req.body);
+        const reconciliation=(req.body as {phase?:string})?.phase==='merged';
+        const run=await leased(req,tx,false,reconciliation);if(run.kind!=='delivery'||!run.operation)fail(403,'Delivery operation required');
+        const b=z.object({generation:z.number(),phase:z.enum(['published','pr_created','ready_intent','merge_intent','merged']),remoteHeadSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional(),pullRequestNumber:z.number().int().positive().optional(),pullRequestUrl:z.string().url().optional(),headSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional(),baseSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional(),mergeSha:z.string().regex(/^[a-f0-9]{40,64}$/u).optional(),pullRequestNodeId:z.string().min(1).max(200).optional()}).strict().parse(req.body);
         const op=run.operation!;
-        if(b.phase==='published'&&b.remoteHeadSha!==op.commitSha)fail(409,'Published branch SHA does not match candidate');
-        if(b.phase==='pr_created'&&(!b.pullRequestNumber||!b.pullRequestUrl||b.headSha!==op.commitSha||op.phase==='queued'))fail(409,'Draft PR result does not match candidate');
+        const phaseFields:Record<typeof b.phase,string[]>={published:['remoteHeadSha'],pr_created:['pullRequestNumber','pullRequestUrl','pullRequestNodeId','headSha','baseSha'],ready_intent:[],merge_intent:[],merged:['pullRequestNumber','pullRequestUrl','pullRequestNodeId','headSha','baseSha','mergeSha']};
+        if(Object.keys(b).some(key=>!['generation','phase',...phaseFields[b.phase]].includes(key)))fail(400,'Delivery phase contains inapplicable fields');
+        if(b.phase==='published'&&(op.action!=='create_draft_pr'||b.remoteHeadSha!==op.commitSha))fail(409,'Published branch SHA does not match candidate');
+        if(b.phase==='pr_created'&&(op.action!=='create_draft_pr'||!b.pullRequestNumber||!b.pullRequestUrl||!b.baseSha||!b.pullRequestNodeId||b.headSha!==op.commitSha||op.phase==='queued'))fail(409,'Draft PR result does not match candidate');
+        if(b.phase==='merged'&&(op.action!=='merge_pr'||!b.pullRequestNumber||b.headSha!==op.commitSha||!b.baseSha||!b.mergeSha||!['merge_intent','merged'].includes(op.phase)))fail(409,'Merge receipt does not match the authorized operation');
+        if(['ready_intent','merge_intent'].includes(b.phase)&&op.action!=='merge_pr')fail(409,'Merge intent requires a merge operation');
         if(op.phase==='pr_created'&&b.phase!=='pr_created')fail(409,'Delivery phase cannot move backwards');
-        op.phase=b.phase;op.external={...(op.external??{}),...(b.pullRequestNumber?{pullRequestNumber:b.pullRequestNumber}:{}),...(b.pullRequestUrl?{pullRequestUrl:b.pullRequestUrl}:{}),...(b.headSha?{headSha:b.headSha}:{})};
+        if(op.phase==='merged'&&b.phase!=='merged')fail(409,'Merged delivery receipt is immutable');
+        const order=['queued','published','pr_created','ready_intent','merge_intent','merged'];
+        if(order.indexOf(b.phase)<order.indexOf(op.phase))fail(409,'Delivery phase cannot move backwards');
+        if(op.phase==='ready_intent'&&b.phase!=='ready_intent'&&b.phase!=='merge_intent'&&b.phase!=='merged')fail(409,'Unresolved external effect intent is immutable');
+        if(['ready_intent','merge_intent'].includes(b.phase))await mergePrPolicy(run,tx);
+        if(op.phase==='merge_intent'&&b.phase!=='merge_intent'&&b.phase!=='merged')fail(409,'Unresolved external effect intent is immutable');
+        if(op.phase==='merge_intent'&&b.phase==='merged'&&(!b.mergeSha||!b.headSha||b.headSha!==op.commitSha))fail(409,'Merge result must reconcile to the exact candidate');
+        if(b.phase==='merged'&&(b.pullRequestNumber!==op.external?.pullRequestNumber||b.pullRequestUrl!==op.external!.pullRequestUrl||b.pullRequestNodeId!==op.external!.pullRequestNodeId||b.baseSha!==op.integrationBaseSha||b.headSha!==op.external!.headSha||op.external!.mergeSha&&b.mergeSha!==op.external!.mergeSha))fail(409,'Merge receipt frozen identity or immutable SHA mismatch');
+        if(b.phase==='pr_created'&&op.external?.pullRequestNumber&&(b.pullRequestNumber!==op.external!.pullRequestNumber||b.pullRequestUrl!==op.external!.pullRequestUrl||b.baseSha!==op.external.baseSha||b.pullRequestNodeId!==op.external!.pullRequestNodeId))fail(409,'Draft receipt is immutable');
+        if(op.phase===b.phase&&['merged','pr_created'].includes(b.phase)){const artifact=await store.get<Artifact>('artifact',`artifact:${run.id}:delivery:${b.phase}`,tx);if(!artifact)fail(409,'Immutable receipt artifact is missing');return {run,artifact};}
+        op.phase=b.phase;if(b.phase==='ready_intent'||b.phase==='merge_intent')op.effectIntentGeneration=run.generation;op.external={...(op.external??{}),...(b.pullRequestNumber?{pullRequestNumber:b.pullRequestNumber}:{}),...(b.pullRequestUrl?{pullRequestUrl:b.pullRequestUrl}:{}),...(b.headSha?{headSha:b.headSha}:{}),...(b.baseSha?{baseSha:b.baseSha}:{}),...(b.mergeSha?{mergeSha:b.mergeSha}:{}),...(b.pullRequestNodeId?{pullRequestNodeId:b.pullRequestNodeId}:{})};
         run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
         const artifact:Artifact={id:`artifact:${run.id}:delivery:${b.phase}`,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{operationId:run.id,...op,...(op.external??{})},createdAt:now()};
         await store.put('artifact',artifact,tx);return {run,artifact};
@@ -902,7 +1025,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(403, "Run denied");
         if (["completed", "failed"].includes(existing!.status))
             return existing;
-        const r = await leased(req, tx);
+        const r = await leased(req, tx, false, existing!.kind==='delivery'&&existing!.operation?.phase==='merged');
         const b = z.object({
             generation: z.number(),
             threadId: z.string().optional(),
@@ -947,24 +1070,27 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await grant(actors[0] as unknown as Member, r.projectId);
         const b = z.object({
             generation: z.number(),
-            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "post_message", "update_settings", "create_skill"]),
+            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "submit_review_result", "post_message", "update_settings", "create_skill"]),
             input: z.record(z.string(), z.unknown()),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
         if (r.kind === 'review') {
-            if (!['read_work', 'read_run'].includes(b.action)) fail(403, 'Reviewer grant is read-only');
+            if (!['read_work', 'read_run', 'submit_review_result'].includes(b.action)) fail(403, 'Reviewer grant is read-only except for its typed result');
             if (b.action === 'read_work' && (!r.workId || b.input.workId !== r.workId))
                 fail(403, 'Reviewer can read only the assigned Work');
             if (b.action === 'read_run' && (!r.targetRunId || b.input.runId !== r.targetRunId))
                 fail(403, 'Reviewer can read only the assigned candidate run');
         }
         if(b.action==='request_delivery'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request delivery');
+        if(b.action==='request_merge'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request merge');
         if(b.action==='dispatch'&&r.sourceIds?.length&&!(await store.get<Project>('project',r.projectId,tx))?.feedbackIntake?.allowExecution)fail(403,'Feedback execution grant revoked');
         if(r.allowedActions&&!r.allowedActions.includes(b.action))fail(403,'This intake grant does not authorize that action');
         const scope = `tools:${r.id}`;
         const prior = await tx `SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${b.requestId}`;
-        if (prior[0])
+        if (prior[0]) {
+            if(b.action==='submit_review_result'){const input=z.object({disposition:z.enum(['approved','changes_requested','insufficient_evidence']),findings:z.array(z.object({id:z.string().min(1).max(120),blocking:z.boolean(),summary:z.string().min(1).max(2000)}).strict()).max(100),evidenceArtifactIds:z.array(z.string().min(1).max(200)).max(100)}).strict().parse(b.input);const saved=((prior[0].result as Artifact).data as {typedReview?:Record<string,unknown>}).typedReview;if(saved?.disposition!==input.disposition||JSON.stringify(saved.findings)!==JSON.stringify(input.findings)||JSON.stringify(saved.evidenceArtifactIds)!==JSON.stringify(input.evidenceArtifactIds))fail(409,'Review request ID was reused with different content');}
             return prior[0].result;
+        }
         let result: unknown;
         if (b.action === "read_context")
             result = {
@@ -997,6 +1123,17 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 artifacts: (await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${r.projectId} AND data->>'runId'=${target!.id} ORDER BY updated_at,id LIMIT 100`).map(row=>row.data as Artifact)
             };
         }
+        else if (b.action === 'submit_review_result') {
+            if (r.kind !== 'review' || !r.reviewBinding) fail(403, 'Assigned review run required');
+            const input = z.object({ disposition: z.enum(['approved','changes_requested','insufficient_evidence']), findings: z.array(z.object({ id: z.string().min(1).max(120), blocking: z.boolean(), summary: z.string().trim().min(1).max(2000) }).strict()).max(100), evidenceArtifactIds: z.array(z.string().min(1).max(200)).max(100) }).strict().parse(b.input);
+            if (new Set(input.findings.map(item => item.id)).size !== input.findings.length) fail(400, 'Duplicate review finding IDs');
+            if(input.evidenceArtifactIds.some(aid => !r.reviewBinding!.qaArtifactIds.includes(aid)))fail(403,'Review evidence is outside the assigned candidate');
+            const evidence = (await store.list<Artifact>('artifact',r.projectId,tx)).filter(a=>input.evidenceArtifactIds.includes(a.id)&&a.workId===r.workId&&a.runId===r.reviewBinding!.candidateRunId&&a.kind==='qa'&&a.revision===r.reviewBinding!.diffRevision);
+            if(evidence.length!==input.evidenceArtifactIds.length)fail(409,'Review evidence is stale or unavailable');
+            const priorReview=(await store.list<Artifact>('artifact',r.projectId,tx)).find(a=>a.runId===r.id&&a.kind==='qa'&&a.data&&typeof a.data==='object'&&(a.data as Record<string,unknown>).typedReview);
+            if(priorReview){const saved=(priorReview.data as {typedReview:Record<string,unknown>}).typedReview;if(saved.disposition!==input.disposition||JSON.stringify(saved.findings)!==JSON.stringify(input.findings)||JSON.stringify(saved.evidenceArtifactIds)!==JSON.stringify(input.evidenceArtifactIds))fail(409,'Review result is immutable; changed content requires a new assigned review run');result=priorReview;}
+            else{result={id:`artifact:${r.id}:typed-review:${b.requestId}`,projectId:r.projectId,workId:r.workId,runId:r.id,kind:'qa',revision:r.reviewBinding!.diffRevision,data:{typedReview:{...r.reviewBinding,...input,reviewerRunId:r.id,submittedAt:now()}},createdAt:now()} satisfies Artifact;await store.put('artifact',result as Artifact,tx);}
+        }
         else if (b.action === "create_work")
             result = await makeWork(r.projectId, b.input, tx);
         else if (b.action === "update_work")
@@ -1006,8 +1143,13 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 status: b.input.status
             }, r.projectId, tx);
         else if (b.action === "request_delivery") {
-            const input=z.object({workId:text,candidateRunId:text,candidateRevision:z.string().min(1).max(200),action:z.literal('create_draft_pr'),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
-            const {workId,...request}=input;result=await requestDraftPr(actors[0] as unknown as Member,workId,request,tx,r.projectId);
+            const create=z.object({workId:text,candidateRunId:text,candidateRevision:z.string().min(1).max(200),action:z.literal('create_draft_pr'),requestId:z.string().min(1).max(200)}).strict();
+            const input=create.parse(b.input);const {workId,...request}=input;result=await requestDraftPr(actors[0] as unknown as Member,workId,request,tx,r.projectId);
+        }
+        else if (b.action === 'request_merge') {
+            const input=z.object({priorDeliveryRunId:text,reviewRunId:text,requestId:z.string().min(1).max(200)}).strict().parse(b.input);
+            const prior=await store.get<Run>('run',input.priorDeliveryRunId,tx);if(!prior?.workId||prior.projectId!==r.projectId)fail(404,'Prior delivery receipt is unavailable');
+            result=await requestMergePr(actors[0] as unknown as Member,prior!.workId!,input,tx,r.projectId);
         }
         else if (b.action === "dispatch") {
             const input = z.object({
@@ -1055,7 +1197,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const input=z.object({settingId:text,expectedUpdatedAt:z.string().min(1),name:text.optional(),data:z.record(z.string(),z.unknown()).optional()}).strict().parse(b.input);
                 const {settingId,...change}=input;
                 const setting=await store.get<Setting>('setting',settingId,tx);
-                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','baseBranch','configuredBy'];
+                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','allowMergePr','mergeMethod','requiredChecks','baseBranch','configuredBy','coverage','requirements','resource'];
                 if(setting?.kind==='connection'&&change.data&&protectedConnectionKeys.some(key=>Object.hasOwn(change.data!,key)))fail(403,'Master cannot change connection or delivery authorization policy');
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);
             } else {

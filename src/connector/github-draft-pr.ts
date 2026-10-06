@@ -5,7 +5,7 @@ import type { ConnectorConfig } from './types.js';
 import type { ClaimedRun } from './types.js';
 
 type DeliveryRun = ClaimedRun['run'] & { operation: NonNullable<ClaimedRun['run']['operation']> };
-export interface DraftPullRequest { number:number; url:string; headSha:string; }
+export interface DraftPullRequest { number:number; url:string; headSha:string; baseSha:string; pullRequestNodeId:string; }
 
 const repoIdentity=(value:string)=>{
   const match=/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/u.exec(value);
@@ -14,7 +14,7 @@ const repoIdentity=(value:string)=>{
 };
 
 /** Publishes only an immutable saved candidate; all remote effects are explicit and retry-reconciled. */
-export async function createDraftPullRequest(config:ConnectorConfig,claim:ClaimedRun,fetcher:typeof fetch=fetch,onPhase?:(value:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string})=>Promise<void>,beforeEffect?:()=>Promise<string|void>,transport?:(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>Promise<string>,processTracking?:{starting?:()=>Promise<void>;started:(pid:number)=>Promise<void>;stopped:()=>Promise<void>}):Promise<DraftPullRequest>{
+export async function createDraftPullRequest(config:ConnectorConfig,claim:ClaimedRun,fetcher:typeof fetch=fetch,onPhase?:(value:{phase:'published'|'pr_created';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;pullRequestNodeId?:string})=>Promise<void>,beforeEffect?:()=>Promise<string|void>,transport?:(cwd:string,env:NodeJS.ProcessEnv,...args:string[])=>Promise<string>,processTracking?:{starting?:()=>Promise<void>;started:(pid:number)=>Promise<void>;stopped:()=>Promise<void>}):Promise<DraftPullRequest>{
   const run=claim.run as DeliveryRun;const op=run.operation;
   if(run.kind!=='delivery'||!op||op.action!=='create_draft_pr')throw new Error('Draft PR operation is unavailable');
   const token=process.env.MENOTEAM_GITHUB_TOKEN;if(!token)throw new Error('GitHub write capability is unavailable');
@@ -70,12 +70,12 @@ export async function createDraftPullRequest(config:ConnectorConfig,claim:Claime
   const headers={accept:'application/vnd.github+json','content-type':'application/json','user-agent':'menoteam-workbench','x-github-api-version':'2022-11-28',authorization:`Bearer ${token}`};
   const request=async(url:string,init?:RequestInit)=>{await authorize();const response=await fetcher(url,{...init,headers,redirect:'error',signal:AbortSignal.timeout(20000)});if(!response.ok)throw new Error(`GitHub request failed (${response.status})`);return response;};
   const marker=`<!-- menoteam-operation:${run.id} -->`;
-  const find=async()=>{const url=new URL(`${api}/pulls`);url.searchParams.set('state','all');url.searchParams.set('head',`${owner}:${expectedBranch}`);url.searchParams.set('base',op.baseBranch);const rows=await (await request(url.toString())).json() as Array<{number:number;html_url:string;head:{sha:string};base:{ref:string};body:string|null;draft:boolean}>;return rows.find(pr=>(pr.body??'').includes(marker));};
+  const find=async()=>{const url=new URL(`${api}/pulls`);url.searchParams.set('state','all');url.searchParams.set('head',`${owner}:${expectedBranch}`);url.searchParams.set('base',op.baseBranch);const rows=await (await request(url.toString())).json() as Array<{number:number;html_url:string;node_id:string;head:{sha:string};base:{ref:string;sha:string};body:string|null;draft:boolean}>;return rows.find(pr=>(pr.body??'').includes(marker));};
   const existing=await find();
-  if(existing){if(!existing.draft||existing.head.sha!==op.commitSha||existing.base.ref!==op.baseBranch)throw new Error('Existing operation PR no longer matches the draft candidate');const result={number:existing.number,url:existing.html_url,headSha:existing.head.sha};await onPhase?.({phase:'pr_created',pullRequestNumber:result.number,pullRequestUrl:result.url,headSha:result.headSha});return result;}
+  if(existing){if(!existing.draft||existing.head.sha!==op.commitSha||existing.base.ref!==op.baseBranch)throw new Error('Existing operation PR no longer matches the draft candidate');if(!existing.node_id||!/^[a-f0-9]{40}$/u.test(existing.base.sha))throw new Error('PR integration identity is missing');const result={number:existing.number,url:existing.html_url,headSha:existing.head.sha,baseSha:existing.base.sha,pullRequestNodeId:existing.node_id};await onPhase?.({phase:'pr_created',pullRequestNumber:result.number,pullRequestUrl:result.url,headSha:result.headSha,baseSha:result.baseSha,pullRequestNodeId:result.pullRequestNodeId});return result;}
   const body=`## Change\n${op.workTitle}\n\n${op.changeSummary}\n\n## Verification\nQA status: ${op.qaStatus}\nCandidate SHA: ${op.commitSha}\nBase: ${op.baseBranch}\n\n${marker}`;
-  const created=await (await request(`${api}/pulls`,{method:'POST',body:JSON.stringify({title:`[Draft] ${op.workTitle}`.slice(0,240),head:expectedBranch,base:op.baseBranch,body,draft:true})})).json() as {number:number;html_url:string;head:{sha:string};draft:boolean};
-  if(!created.draft||created.head.sha!==op.commitSha)throw new Error('GitHub returned a PR that does not match the draft candidate');
-  await onPhase?.({phase:'pr_created',pullRequestNumber:created.number,pullRequestUrl:created.html_url,headSha:created.head.sha});
-  return {number:created.number,url:created.html_url,headSha:created.head.sha};
+  const created=await (await request(`${api}/pulls`,{method:'POST',body:JSON.stringify({title:`[Draft] ${op.workTitle}`.slice(0,240),head:expectedBranch,base:op.baseBranch,body,draft:true})})).json() as {number:number;html_url:string;node_id:string;head:{sha:string};base:{ref:string;sha:string};draft:boolean};
+  if(!created.draft||created.head.sha!==op.commitSha||created.base.ref!==op.baseBranch||!created.node_id||!/^[a-f0-9]{40}$/u.test(created.base.sha))throw new Error('GitHub returned a PR that does not match the draft candidate');
+  await onPhase?.({phase:'pr_created',pullRequestNumber:created.number,pullRequestUrl:created.html_url,headSha:created.head.sha,baseSha:created.base.sha,pullRequestNodeId:created.node_id});
+  return {number:created.number,url:created.html_url,headSha:created.head.sha,baseSha:created.base.sha,pullRequestNodeId:created.node_id};
 }
