@@ -1,9 +1,9 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { checkpoint, createDiff, ensureWorktree, git, gitWithEnv, waitForGit } from '../src/connector/git.js';
+import { checkpoint, createDiff, ensureWorktree, fingerprint, git, gitWithEnv, waitForGit, type GitOptions } from '../src/connector/git.js';
 import { ConnectorRunner } from '../src/connector/runner.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
 import type { WorkbenchConnectorClient } from '../src/connector/client.js';
@@ -127,4 +127,65 @@ it('retains an unconfirmed Git reservation during recovery even when old native 
   const acknowledge = vi.fn(); const client = { claim: async () => { await runner.stop(); return undefined; }, readRun: async () => { throw new Error('Unconfirmed Git cannot be released through native proof'); }, stopped: acknowledge } as unknown as WorkbenchConnectorClient;
   runner = new ConnectorRunner(f.config, { native: () => native, client: () => client }); await runner.run();
   expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(spool); expect(acknowledge).not.toHaveBeenCalled();
+});
+
+it('stops active native on remote cancel even when its Git fingerprint group cannot be confirmed stopped', async () => {
+  const f = await fixture(); await shim(`if(args[0]==='ls-files'){${hang(f.ready)}return;}`);
+  const claim: ClaimedRun = { run: { id: 'run', connectorId: 'one', projectId: 'project', requestedBy: 'owner', workId: 'work', kind: 'implementation', prompt: 'Implement', model: 'gpt-6-luna', reasoning: 'low', status: 'running', generation: 1, createdAt: 'now', updatedAt: 'now', execution: { provider: 'openai', method: 'codex-host', skills: [], tools: [] } }, project: { id: 'project', name: 'Fixture', instructions: '', repositoryUrl: '', deliveryAuthorization: '', createdAt: 'now' }, messages: [], settings: [] };
+  let paused = false; let claimed = false; let rejectTurn: ((error: Error) => void) | undefined; let gitTask: Promise<unknown> | undefined; let nativeStopped = false; let pid = 0;
+  let exit!: () => void; const exiting = new Promise<void>(resolve => { exit = resolve; });
+  const workerStop = vi.fn(async () => { if (rejectTurn) { nativeStopped = true; rejectTurn(new Error('Native stopped')); rejectTurn = undefined; } });
+  const worker = { start: async () => ['gpt-6-luna'], processIdentity: async () => ({ pid: 123, processGroupId: 123, startedAt: 'fixture', command: 'codex app-server' }), stop: workerStop, run: async (_claim: unknown, cwd: string, _prompt: string, _thread: string, _event: unknown, _bridge: unknown, options: GitOptions) => { gitTask = fingerprint(cwd, options).catch(() => undefined); return new Promise((_resolve, reject) => { rejectTurn = reject; }); } } as unknown as CodexAppServer;
+  const discovery = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer; let count = 0;
+  const complete = vi.fn(); const acknowledge = vi.fn();
+  const client = { claim: async () => { if (!claimed) { claimed = true; return claim; } await exiting; return undefined; }, readRun: async () => ({ ...claim.run, status: paused ? 'cancelled' : 'running' }), renew: async () => {}, complete, stopped: acknowledge } as unknown as WorkbenchConnectorClient;
+  const runner = new ConnectorRunner(f.config, { native: () => count++ === 0 ? discovery : worker, client: () => client });
+  const originalKill = process.kill.bind(process);
+  const kill = vi.spyOn(process, 'kill').mockImplementation((target, value) => target === -pid && (value === 'SIGKILL' || value === 'SIGTERM') ? true : originalKill(target, value));
+  const execution = runner.run(); const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey('run', '1')}.json`);
+  try {
+    pid = (await readyFile(f.ready)).pid; paused = true;
+    const deadline = Date.now() + 6000;
+    let retained: {gitStopUnconfirmed?:boolean;gitProcesses?:Record<string,unknown>;completion?:unknown;stopped?:boolean} = {};
+    while (Date.now() < deadline) { retained = JSON.parse(await readFile(spoolPath, 'utf8')); if (retained.gitStopUnconfirmed) break; await new Promise(resolve => setTimeout(resolve, 10)); }
+    expect(nativeStopped).toBe(true); expect(workerStop).toHaveBeenCalled(); expect(originalKill(-pid, 0)).toBe(true);
+    expect(retained.gitStopUnconfirmed).toBe(true); expect(Object.keys(retained.gitProcesses ?? {})).toHaveLength(1); expect(retained.completion).toBeUndefined(); expect(retained.stopped).toBeUndefined();
+    expect(complete).not.toHaveBeenCalled(); expect(acknowledge).not.toHaveBeenCalled();
+    await runner.stop().catch(() => undefined); exit(); await execution;
+  } finally { kill.mockRestore(); if (pid) originalKill(-pid, 'SIGKILL'); await gitTask; await runner.stop().catch(() => undefined); exit(); await execution; }
+});
+
+it.each(['missing-identity', 'unverifiable-identity'])('retains a crashed checkpoint Git reservation with %s despite old native stop proof', async mode => {
+  const f = await fixture(); let runner: ConnectorRunner;
+  const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey('run', '1')}.json`);
+  const spool = { runId: 'run', generation: 1, events: [], artifacts: [], gitExecutorPid: process.pid, gitProcesses: { checkpoint: mode === 'missing-identity' ? null : { pid: process.pid, processGroupId: Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).trim()), startedAt: 'unverifiable', command: 'git commit' } }, processIdentity: { pid: 123, processGroupId: 123, startedAt: 'old', command: 'codex app-server' } };
+  await writeSecureJson(spoolPath, spool);
+  const native = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer;
+  const acknowledge = vi.fn(); const complete = vi.fn();
+  const client = { claim: async () => { await runner.stop(); return undefined; }, readRun: async () => ({ generation: 1, status: 'cancelled' }), stopped: acknowledge, complete } as unknown as WorkbenchConnectorClient;
+  runner = new ConnectorRunner(f.config, { native: () => native, client: () => client }); await runner.run();
+  expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(spool); expect(acknowledge).not.toHaveBeenCalled(); expect(complete).not.toHaveBeenCalled();
+});
+
+it('keeps a real crashed checkpoint parent reservation through the Git identity persistence window', async () => {
+  const f = await fixture(); await writeFile(path.join(f.repo, 'source.txt'), 'candidate\n');
+  const hook = path.join(f.repo, '.git', 'hooks', 'pre-commit');
+  await writeFile(hook, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(f.ready)},JSON.stringify({pid:process.ppid}));setInterval(()=>{},1000);\n`); await chmod(hook, 0o700);
+  const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey('run', '1')}.json`);
+  const script = path.join(temporary, 'checkpoint-parent.mjs');
+  await writeFile(script, `import {checkpoint} from ${JSON.stringify(path.join(process.cwd(), 'src/connector/git.ts'))};import {readGitProcessIdentity} from ${JSON.stringify(path.join(process.cwd(), 'src/connector/codex.ts'))};import {writeSecureJson} from ${JSON.stringify(path.join(process.cwd(), 'src/connector/state.ts'))};
+const spool={runId:'run',generation:1,events:[],artifacts:[],gitExecutorPid:process.pid,gitProcesses:{},processIdentity:{pid:123,processGroupId:123,startedAt:'old',command:'codex app-server'}};const save=()=>writeSecureJson(${JSON.stringify(spoolPath)},spool);
+await checkpoint(${JSON.stringify(f.repo)},'candidate',{processTracking:{intent:async id=>{spool.gitProcesses[id]=null;await save();},started:async(id,pid)=>{const identity=await readGitProcessIdentity(pid);if(identity?.command.includes('commit'))await new Promise(()=>{});if(identity){spool.gitProcesses[id]=identity;await save();}},stopped:async id=>{delete spool.gitProcesses[id];await save();}}});`);
+  const parent = spawn(process.execPath, ['--import', path.join(process.cwd(), 'node_modules/tsx/dist/loader.mjs'), script], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = ''; parent.stdout.on('data', chunk => { output += chunk; }); parent.stderr.on('data', chunk => { output += chunk; });
+  const closed = new Promise<void>(resolve => parent.once('close', () => resolve())); let gitPid = 0; let runner: ConnectorRunner | undefined;
+  try {
+    try { gitPid = (await readyFile(f.ready)).pid; } catch (error) { throw new Error(`Checkpoint parent fixture failed: ${output}`, { cause: error }); }
+    parent.kill('SIGKILL'); await closed; expect(process.kill(-gitPid, 0)).toBe(true);
+    const persisted = JSON.parse(await readFile(spoolPath, 'utf8')); expect(Object.values(persisted.gitProcesses)).toEqual([null]);
+    const native = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer; const acknowledge = vi.fn(); const complete = vi.fn();
+    const client = { claim: async () => { await runner!.stop(); return undefined; }, readRun: async () => ({ generation: 1, status: 'cancelled' }), stopped: acknowledge, complete } as unknown as WorkbenchConnectorClient;
+    runner = new ConnectorRunner(f.config, { native: () => native, client: () => client }); await runner.run();
+    expect(process.kill(-gitPid, 0)).toBe(true); expect(acknowledge).not.toHaveBeenCalled(); expect(complete).not.toHaveBeenCalled(); expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(persisted);
+  } finally { parent.kill('SIGKILL'); await closed; if (gitPid) process.kill(-gitPid, 'SIGKILL'); await runner?.stop(); }
 });

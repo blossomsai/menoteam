@@ -11,6 +11,7 @@ import type { ClaimedRun } from '../src/connector/types.js';
 // Isolated filesystem preparation; the HTTP authorization refusal is the boundary
 // under test. This does not simulate a successful native review or PG validation.
 vi.mock('../src/connector/git.js', () => ({
+  waitForGit: vi.fn(async () => undefined),
   ensureWorktree: vi.fn(async () => ({ path: tmpdir(), baseRevision: 'base' })),
   readWorktreeMap: vi.fn(async () => ({ artifactRevision: 'candidate' })),
   createDiff: vi.fn(async () => 'diff'), diffRevision: vi.fn(() => 'candidate'),

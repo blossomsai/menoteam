@@ -5,7 +5,7 @@ import { mkdir, readdir, unlink, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer, readGitProcessIdentity, terminateVerifiedGitProcessGroup, terminateVerifiedProcessGroup, waitProcessGroup, type CodexProcessIdentity, type GitProcessIdentity } from './codex.js';
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
-import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit } from './git.js';
+import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit, type GitOptions } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
 import { assertExecutionSelection } from './selection.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
@@ -27,6 +27,8 @@ interface Spool {
   completion?: {threadId?:string;error?:string};
   stopped?: boolean;
   gitStopUnconfirmed?: boolean;
+  gitProcesses?: Record<string,GitProcessIdentity|null>;
+  gitExecutorPid?: number;
   processIdentity?:CodexProcessIdentity;
   skillDirectory?:string;
   qaInFlight?: boolean;
@@ -53,6 +55,7 @@ export class ConnectorRunner {
   private readonly activeRuns = new Set<string>();
   private readonly activeKinds = new Map<string,ClaimedRun['run']['kind']>();
   private readonly reportedRecovery = new Set<string>();
+  private readonly spoolWrites = new WeakMap<Spool,Promise<void>>();
   private client?: WorkbenchConnectorClient;
   constructor(private readonly config: ConnectorConfig, private readonly dependencies?: {
     native: () => CodexAppServer;
@@ -101,7 +104,10 @@ export class ConnectorRunner {
   private spoolPath(runId:string,generation:number):string {
     return path.join(this.config.dataDir,'spool',`${stateKey(runId,String(generation))}.json`);
   }
-  private async save(spool:Spool):Promise<void> { await writeSecureJson(this.spoolPath(spool.runId,spool.generation),spool); }
+  private async save(spool:Spool):Promise<void> {
+    const write=(this.spoolWrites.get(spool)??Promise.resolve()).catch(()=>{}).then(()=>writeSecureJson(this.spoolPath(spool.runId,spool.generation),spool));
+    this.spoolWrites.set(spool,write);await write;
+  }
   private async retainOrRemove(spool:Spool):Promise<void> {
     if(spool.events.length || spool.artifacts.length || spool.deliveryProgress) {
       const directory=path.join(this.config.dataDir,'unsent-evidence');
@@ -145,6 +151,20 @@ export class ConnectorRunner {
       }
       const remote = await this.client!.readRun(spool.runId);
       if (remote.generation !== spool.generation) continue; // Never reconcile a different execution.
+      if(Object.keys(spool.gitProcesses??{}).length){
+        if(spool.gitExecutorPid!==process.pid){
+          if(!Number.isSafeInteger(spool.gitExecutorPid)||spool.gitExecutorPid!<=1)continue;
+          try{process.kill(spool.gitExecutorPid!,0);continue;}catch(error){if((error as NodeJS.ErrnoException).code!=='ESRCH')continue;}
+        }
+        let confirmed=true;
+        for(const [id,identity] of Object.entries(spool.gitProcesses!)){
+          // Intent without child identity includes the spawn/persistence crash window.
+          if(!identity||(!await waitProcessGroup(identity.processGroupId,1)&&!await terminateVerifiedGitProcessGroup(identity))){confirmed=false;break;}
+          delete spool.gitProcesses![id];await this.save(spool);
+        }
+        if(!confirmed)continue;
+        spool.gitStopUnconfirmed=undefined;await this.save(spool);
+      }
       // A live original executor can be between commands. Never stop/release its QA or resource.
       // PID reuse/permission errors and legacy spools without executor identity fail closed.
       if(spool.qaInFlight){
@@ -214,7 +234,15 @@ export class ConnectorRunner {
     const runAbort = new AbortController();
     this.runAborts.add(runAbort);
     if(this.closing)runAbort.abort();
-    const gitOptions={signal:runAbort.signal};
+    const gitOptions:GitOptions={signal:runAbort.signal,processTracking:{
+      intent:async id=>{spool.gitExecutorPid=process.pid;(spool.gitProcesses??={})[id]=null;await this.save(spool);},
+      started:async(id,pid)=>{const identity=await readGitProcessIdentity(pid);if(identity){spool.gitProcesses![id]=identity;await this.save(spool);}},
+      stopped:async id=>{delete spool.gitProcesses?.[id];await this.save(spool);},
+    }};
+    const stopRunProcesses=async()=>{
+      const results=await Promise.allSettled([native.stop(),waitForGit(runAbort.signal)]);
+      const failed=results.find(result=>result.status==='rejected');if(failed?.status==='rejected')throw failed.reason;
+    };
     let timer:NodeJS.Timeout|undefined;
     let monitoring = false;
     let monitorPromise:Promise<void>|undefined;
@@ -228,9 +256,9 @@ export class ConnectorRunner {
       try {
         const remote = await client.readRun(claim.run.id);
         if (remote.generation !== claim.run.generation || remote.status !== 'running' || this.closing) {
-          cancelled = true; runAbort.abort(); await waitForGit(runAbort.signal); await native.stop();
+          cancelled = true; runAbort.abort(); await stopRunProcesses();
         } else if(!runAbort.signal.aborted&&!this.closing)await client.renew(claim.run.id,claim.run.generation);
-      } catch { cancelled = true; runAbort.abort(); await waitForGit(runAbort.signal); await native.stop(); }
+      } catch { cancelled = true; runAbort.abort(); await stopRunProcesses(); }
       finally { monitoring = false; }
     };
     try {
@@ -284,7 +312,7 @@ export class ConnectorRunner {
           // Best effort streaming; failed requests retain the exact same IDs for retry.
           try { await this.flush(spool); } catch { /* retried at final sync */ }
         });
-      },bridgeFile,runAbort.signal);
+      },bridgeFile,gitOptions);
       await native.stop();
       await waitForGit(runAbort.signal);
       await monitorPromise;
@@ -301,7 +329,7 @@ export class ConnectorRunner {
         spool.artifacts.push({kind:'diff',revision,data:diff,requestId:`diff:${claim.run.id}:${claim.run.generation}`});
         spool.qaExecution={directory:path.join(this.config.dataDir,'qa',randomUUID()),nonce:randomUUID(),phase:'stopped'};await bindQaExecutor(spool.qaExecution);spool.qaInFlight=true;await this.save(spool);
         const currentQaPolicy=savedQaPolicy(claim.settings,claim.run.projectId,claim.project.repositoryUrl);
-        const requiredQa=await captureRequiredLocalQa(cwd,{policy:sameQaPolicy(currentQaPolicy,claim.run.qaPolicySnapshot)?claim.run.qaPolicySnapshot:undefined,resources:this.config.qaResources??{},dataDirectory:path.join(this.config.dataDir,'qa'),state:spool.qaExecution,authorize:async()=>{await client.authorizeQaEffect(claim.run.id,claim.run.generation);},signal:runAbort.signal,save:async state=>{spool.qaExecution=state;await this.save(spool);}});
+        const requiredQa=await captureRequiredLocalQa(cwd,{policy:sameQaPolicy(currentQaPolicy,claim.run.qaPolicySnapshot)?claim.run.qaPolicySnapshot:undefined,resources:this.config.qaResources??{},dataDirectory:path.join(this.config.dataDir,'qa'),state:spool.qaExecution,authorize:async()=>{await client.authorizeQaEffect(claim.run.id,claim.run.generation);},signal:runAbort.signal,gitOptions,save:async state=>{spool.qaExecution=state;await this.save(spool);}});
         spool.qaInFlight=false;await this.save(spool);
         spool.artifacts.push({kind:'qa',revision,data:{...requiredQa,revision},requestId:`required-qa:${claim.run.id}:${claim.run.generation}`});
       }
@@ -316,6 +344,7 @@ export class ConnectorRunner {
       runAbort.signal.throwIfAborted();
       spool.completion={threadId:result.threadId}; await this.save(spool); await this.flush(spool);
     } catch (error) {
+      try{await stopRunProcesses();}catch(stopError){if((stopError as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);}throw stopError;}
       if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);throw error;}
       if(spool.qaInFlight){
         if(!spool.qaExecution||!await stopQaExecution(spool.qaExecution)){await this.save(spool);throw new Error('Fixed QA stop is unconfirmed; preserve the Work reservation for operator reconciliation');}
@@ -346,8 +375,7 @@ export class ConnectorRunner {
     } finally {
       this.runAborts.delete(runAbort);
       if(timer) clearInterval(timer);
-      await monitorPromise;
-      await native.stop();
+      await Promise.allSettled([monitorPromise,native.stop()]);
       if(bridgeFile) await unlink(bridgeFile).catch(()=>undefined);
       if(skillFiles) await skillFiles.cleanup();
       this.active.delete(native);

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, readFile, readlink, realpath, rename, writeFile } from 'node:fs/promises';
@@ -8,7 +8,10 @@ import type { ConnectorConfig, DiffArtifactData, DiffFile, DiffLine } from './ty
 const DIFF_LIMIT = 280_000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
-export interface GitOptions { signal?: AbortSignal; timeoutMs?: number; }
+export interface GitOptions {
+  signal?: AbortSignal; timeoutMs?: number;
+  processTracking?: { intent:(id:string)=>Promise<void>; started:(id:string,pid:number)=>Promise<void>; stopped:(id:string)=>Promise<void> };
+}
 const activeGit = new WeakMap<AbortSignal, Set<Promise<unknown>>>();
 
 /** Wait for this run's owned Git groups, including cancellation cleanup. */
@@ -30,14 +33,18 @@ export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,args:string[],
   return (await executeGit(cwd,env,args,{timeoutMs,signal},onProcessStart,onProcessStop)).output;
 }
 function runGit(cwd:string,args:string[],options:GitOptions):Promise<string>{
-  return gitWithEnv(cwd,{},args,undefined,undefined,options.timeoutMs,options.signal);
+  return executeGit(cwd,{},args,options).then(result=>result.output);
 }
 function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOptions,onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,truncate=false):Promise<{output:string;truncated:boolean}>{
   const {signal,timeoutMs=30_000}=options;
   signal?.throwIfAborted();
   if(process.platform==='win32')throw new Error('Bounded Connector Git requires process-group signals');
   if(!Number.isFinite(timeoutMs)||timeoutMs<=0)throw new Error('Git deadline must be finite and positive');
-  const task=new Promise<{output:string;truncated:boolean}>((resolve,reject)=>{
+  const id=randomUUID();
+  const task=(async()=>{
+    await options.processTracking?.intent(id);
+    if(signal?.aborted){await options.processTracking?.stopped(id);signal.throwIfAborted();}
+    return new Promise<{output:string;truncated:boolean}>((resolve,reject)=>{
     const child=spawn('git',args,{cwd,detached:true,stdio:['ignore','pipe','pipe'],shell:false,env:{...process.env,...env}});
     const stdout:Buffer[]=[];let bytes=0;let captured=0;let stderr='';let timedOut=false;let oversized=false;let aborted=false;let startError:Error|undefined;let processError:Error|undefined;let startTask:Promise<void>|undefined;let settled=false;let stopTimer:NodeJS.Timeout|undefined;
     const killGroup=()=>{if(child.pid){try{process.kill(-child.pid,'SIGKILL');return;}catch{/* fall back to the direct child */}}child.kill('SIGKILL');};
@@ -61,7 +68,7 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
       if(keep.length){stdout.push(keep);captured+=keep.length;}
     });
     child.stderr.on('data',(chunk:Buffer)=>{if(stderr.length<4096)stderr+=chunk.toString('utf8').slice(0,4096-stderr.length);});
-    if(onProcessStart)child.once('spawn',()=>{startTask=Promise.resolve().then(()=>onProcessStart(child.pid!)).catch(error=>{startError=error instanceof Error?error:new Error('Could not record Git transport process');terminate();});});
+    if(onProcessStart||options.processTracking)child.once('spawn',()=>{startTask=Promise.resolve().then(async()=>{await options.processTracking?.started(id,child.pid!);await onProcessStart?.(child.pid!);}).catch(error=>{startError=error instanceof Error?error:new Error('Could not record Git transport process');terminate();});});
     child.once('error',error=>{processError=error;terminate();});
     child.once('close',(code,exitSignal)=>{clearTimeout(timer);void (async()=>{
       if(settled)return;
@@ -70,6 +77,7 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
         killGroup();
         if(!await waitGitProcessGroup(child.pid,2000))throw unconfirmed();
       }
+      await options.processTracking?.stopped(id);
       await onProcessStop?.();
       if(startError)throw startError;
       if(processError)throw processError;
@@ -77,7 +85,8 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
       if(code!==0){const error=new Error(`Git command failed (${code??exitSignal??'unknown'}): ${stderr.trim().slice(0,500)}`) as NodeJS.ErrnoException;error.code=String(code??exitSignal??'UNKNOWN');throw error;}
       return {output:Buffer.concat(stdout).toString('utf8'),truncated:truncate&&bytes>DIFF_LIMIT};
     })().then(result=>{if(result)settle(undefined,result);},error=>settle(error));});
-  });
+    });
+  })();
   if(signal){
     let tasks=activeGit.get(signal);if(!tasks){tasks=new Set();activeGit.set(signal,tasks);}tasks.add(task);
     const remove=()=>tasks.delete(task);void task.then(remove,error=>{if((error as NodeJS.ErrnoException).code!=='EUNCONFIRMEDPROCESS')remove();});
