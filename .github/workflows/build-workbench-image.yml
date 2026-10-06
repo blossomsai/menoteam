@@ -1,0 +1,79 @@
+name: Build and attest Workbench staging image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Menoteam CI
+    if: github.repository == 'blossomsai/menoteam'
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: verify
+    if: github.repository == 'blossomsai/menoteam' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out immutable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Read Workbench schema boundary
+        id: schema
+        run: |
+          file="$(find migrations -maxdepth 1 -type f -regex '.*/[0-9]+_.*\.sql' -print | sort | tail -n 1)"
+          test -n "$file"
+          echo "max=$(basename "$file")" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish by source SHA
+        id: image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/staging/Dockerfile.workbench
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/blossomsai/menoteam-work-map:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.menoteam.workbench-schema-max=${{ steps.schema.outputs.max }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest the immutable image digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/blossomsai/menoteam-work-map
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Publish digest and source record
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          printf 'image=ghcr.io/blossomsai/menoteam-work-map@%s\nsource=%s\n' \
+            "$IMAGE_DIGEST" "$SOURCE_SHA" \
+            >> "$GITHUB_STEP_SUMMARY"

@@ -585,6 +585,80 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Merge the verified pull request using the fixed executor. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:prior!.targetRunId,targetRevision:prior!.targetRevision,targetConnectorId:prior!.targetConnectorId,operation:op};
         await store.put('run',run,tx);const result={run,operationId:run.id};await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(result as never)}),(${canonicalScope},'canonical',${tx.json(result as never)})`;return result;
     }
+    async function stagingTargetPolicy(projectId:string,targetId:string,tx:Sql,expectedVersion?:string) {
+        const project=await store.get<Project>('project',projectId,tx);
+        const policy=(await store.list<Setting>('setting',undefined,tx)).find(s=>s.kind==='connection'&&s.projectId===projectId&&s.data.provider==='github'&&s.data.purpose==='delivery'&&s.data.enabled!==false&&s.data.url===project?.repositoryUrl&&s.data.configuredBy&&s.data.allowStagingDeploy===true&&Array.isArray(s.data.stagingTargets)&&s.data.stagingTargets.includes(targetId));
+        if(!project?.repositoryUrl||!policy)fail(409,'Staging target is unavailable for this project');
+        if(expectedVersion&&policy.updatedAt!==expectedVersion)fail(409,'Staging target policy changed');
+        return {project,policy};
+    }
+    async function stagingConnector(projectId:string,targetId:string,action:'deploy_staging'|'rollback_staging',tx:Sql) {
+        const rows=await tx`SELECT id,project_ids,capabilities,last_seen FROM wb_connectors WHERE ${projectId}=ANY(project_ids)`;
+        const connector=rows.find(row=>Date.now()-new Date(row.last_seen??0).getTime()<120000&&Array.isArray(row.capabilities?.deploymentTargets)&&row.capabilities.deploymentTargets.includes(targetId)&&Array.isArray(row.capabilities?.deliveryActions)&&row.capabilities.deliveryActions.includes(action));
+        if(!connector)fail(409,'Staging Connector capability is unavailable');
+        return String(connector.id);
+    }
+    function stagingReservationScope(projectId:string,targetId:string){return `staging-target:${projectId}:${targetId}`;}
+    async function latestStagingDeployment(projectId:string,targetId:string,tx:Sql) {
+        const runs=await store.list<Run>('run',projectId,tx);
+        return runs.filter(run=>run.kind==='delivery'&&run.operation?.targetId===targetId&&['deploy_staging','rollback_staging'].includes(run.operation.action)&&run.operation.stagingReceipt&&['health_passed','rolled_back'].includes(run.operation.phase))
+            .sort((a,b)=>String(b.updatedAt).localeCompare(String(a.updatedAt)))[0];
+    }
+    async function requestStagingDeploy(user:Member,workId:string,raw:unknown,tx=sql,projectBoundary?:string){
+        const b=z.object({sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
+        const work=await store.get<Work>('work',workId,tx);if(!work||projectBoundary&&work.projectId!==projectBoundary)fail(404,'Work missing');
+        await grant(user,work!.projectId,true,tx);
+        const actor=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;if(!actor[0]||!['owner','admin'].includes(String(actor[0].role)))fail(403,'Staging deployment requires a project administrator');
+        const source=await store.get<Run>('run',b.sourceMergeRunId,tx);const sourceOp=source?.operation;
+        if(!source||source.projectId!==work!.projectId||source.workId!==workId||source.kind!=='delivery'||source.status!=='completed'||sourceOp?.action!=='merge_pr'||sourceOp.phase!=='merged'||!sourceOp.external?.mergeSha||source.connectorId!==source.targetConnectorId)fail(409,'Verified merged source receipt is unavailable');
+        if(!source.requestedBy||!await actorAuthorized({...source,requestedBy:source.requestedBy},tx))fail(403,'Original merge actor authorization was revoked');
+        const commitSha=sourceOp.external.mergeSha;if(!/^[a-f0-9]{40,64}$/u.test(commitSha))fail(409,'Merged source SHA is invalid');
+        const {policy}=await stagingTargetPolicy(work!.projectId,b.targetId,tx);
+        const connectorId=await stagingConnector(work!.projectId,b.targetId,'deploy_staging',tx);
+        const latest=await latestStagingDeployment(work!.projectId,b.targetId,tx);
+        const expectedCurrentDeploymentId=latest?.operation?.stagingReceipt?.deploymentId??null;
+        const requestScope=`staging-request:${work!.projectId}:${user.id}:${b.targetId}`;
+        const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
+        if(prior[0]){const saved=prior[0].result as {run?:Run};if(saved.run?.operation?.sourceMergeRunId!==source.id||saved.run.operation.imageDigest!==b.imageDigest)fail(409,'Request ID was already used for another staging image');return saved;}
+        const canonicalScope=`staging-operation:${work!.projectId}:${b.targetId}:${source.id}:${b.imageDigest}`;
+        const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        if(canonical[0]){
+            const saved=canonical[0].result as {run:Run;operationId:string};const current=await store.get<Run>('run',saved.run.id,tx);if(!current)fail(409,'Staging operation is unavailable');
+            const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${stagingReservationScope(work!.projectId,b.targetId)} AND request_id='reservation'`;
+            if(reservation[0]&&(reservation[0].result as {runId?:string}).runId!==current.id)fail(409,'Another staging operation owns this target');
+            if(['failed','interrupted','cancelled'].includes(current.status)){
+                if(['interrupted','cancelled'].includes(current.status)&&!current.stoppedAt)fail(409,'Connector process must be confirmed stopped before status reconciliation');
+                current.generation++;current.status='queued';current.stoppedAt=undefined;current.error=undefined;current.updatedAt=now();await store.put('run',current,tx);saved.run=current;
+            }
+            await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(saved as never)}) ON CONFLICT(scope,request_id) DO UPDATE SET result=EXCLUDED.result`;
+            return saved;
+        }
+        const reservationScope=stagingReservationScope(work!.projectId,b.targetId);
+        const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
+        if(reservation[0])fail(409,'Staging target is reserved by an unresolved operation');
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Deploy this exact merged commit to the configured staging target. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:source.targetRunId,targetRevision:source.targetRevision,targetConnectorId:connectorId,operation:{...sourceOp!,action:'deploy_staging',actorId:user.id,commitSha,candidateRunId:sourceOp.candidateRunId,candidateRevision:sourceOp.candidateRevision,artifactRevision:sourceOp.artifactRevision,phase:'queued',sourceMergeRunId:source.id,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,imageDigest:b.imageDigest,expectedCurrentDeploymentId}};
+        const saved={run,operationId:run.id};await store.put('run',run,tx);
+        await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'deploy_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;
+        return saved;
+    }
+    async function requestStagingRollback(user:Member,workId:string,raw:unknown,tx=sql,projectBoundary?:string){
+        const b=z.object({deploymentRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
+        const work=await store.get<Work>('work',workId,tx);if(!work||projectBoundary&&work.projectId!==projectBoundary)fail(404,'Work missing');
+        await grant(user,work!.projectId,true,tx);const actor=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;if(!actor[0]||!['owner','admin'].includes(String(actor[0].role)))fail(403,'Staging rollback requires a project administrator');
+        const current=await store.get<Run>('run',b.deploymentRunId,tx);const receipt=current?.operation?.stagingReceipt;
+        if(!current||current.workId!==workId||current.projectId!==work!.projectId||current.operation?.targetId!==b.targetId||!receipt||!['health_passed','rolled_back'].includes(receipt.phase)||!receipt.deploymentId)fail(409,'Current verified staging deployment is unavailable');
+        const {policy}=await stagingTargetPolicy(work!.projectId,b.targetId,tx);const connectorId=await stagingConnector(work!.projectId,b.targetId,'rollback_staging',tx);
+        if(!receipt.previousDeploymentId||!receipt.previousImageDigest)fail(409,'No previous health-verified deployment receipt is available');
+        const runs=await store.list<Run>('run',work!.projectId,tx);const previous=runs.find(run=>run.workId===workId&&run.operation?.targetId===b.targetId&&run.operation.stagingReceipt?.deploymentId===receipt.previousDeploymentId&&run.operation.stagingReceipt?.phase==='health_passed');
+        if(!previous?.operation?.sourceMergeRunId||!previous.operation.commitSha)fail(409,'Previous deployment source receipt is unavailable');
+        const source=await store.get<Run>('run',previous.operation.sourceMergeRunId,tx);if(!source||source.status!=='completed'||source.operation?.action!=='merge_pr'||source.operation.phase!=='merged'||source.operation.external?.mergeSha!==previous.operation.commitSha)fail(409,'Previous merged source receipt is unavailable');
+        const requestScope=`staging-rollback-request:${work!.projectId}:${user.id}:${b.targetId}`;const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;if(prior[0]){const saved=prior[0].result as {run:Run;operationId:string};if(saved.run.workId!==workId||saved.run.operation?.targetId!==b.targetId||saved.run.operation?.previousDeploymentRunId!==previous.id)fail(409,'Rollback request id is already bound to a different deployment');return saved;}
+        const reservationScope=stagingReservationScope(work!.projectId,b.targetId);if((await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`)[0])fail(409,'Staging target is reserved by an unresolved operation');
+        const canonicalScope=`staging-rollback:${work!.projectId}:${b.targetId}:${current.id}:${previous.id}`;const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        if(canonical[0]){const saved=canonical[0].result as {run:Run;operationId:string};await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(saved as never)}) ON CONFLICT(scope,request_id) DO UPDATE SET result=EXCLUDED.result`;return saved;}
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Roll staging back to the previous verified deployment receipt. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:current.targetRunId,targetRevision:current.targetRevision,targetConnectorId:connectorId,operation:{...current.operation!,action:'rollback_staging',actorId:user.id,sourceMergeRunId:previous.operation.sourceMergeRunId,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,commitSha:previous.operation.commitSha,imageDigest:receipt.previousImageDigest,previousDeploymentRunId:previous.id,previousDeploymentId:receipt.previousDeploymentId,rollbackToImageDigest:receipt.previousImageDigest,expectedCurrentDeploymentId:receipt.deploymentId,phase:'queued',stagingReceipt:undefined,stagingEffectStage:undefined}};
+        const saved={run,operationId:run.id};await store.put('run',run,tx);await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'rollback_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;return saved;
+    }
     async function draftPrPolicy(projectId:string,repositoryUrl:string,baseBranch:string,tx:Sql):Promise<void>{
         const project=await store.get<Project>('project',projectId,tx);
         if(!project?.repositoryUrl||project.repositoryUrl!==repositoryUrl)fail(409,'Draft PR repository policy changed');
@@ -631,6 +705,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return store.transaction(`delivery:${workId}`,tx=>requestDraftPr(user,workId,req.body,tx));
     });
     app.post('/api/workbench/works/:id/merge',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`delivery:${workId}`,tx=>requestMergePr(user,workId,req.body,tx));});
+    app.post('/api/workbench/works/:id/staging',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,tx=>requestStagingDeploy(user,workId,req.body,tx));});
+    app.post('/api/workbench/works/:id/staging/rollback',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,tx=>requestStagingRollback(user,workId,req.body,tx));});
     app.get("/api/workbench/works/:id", async (req) => {
         const w = await store.get<Work>("work", (req.params as {
             id: string;
@@ -826,6 +902,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 baseBranch: z.string().regex(/^[A-Za-z0-9._/-]{1,200}$/u).optional(),
                 allowDraftPr: z.boolean().default(false),
                 allowMergePr: z.boolean().default(false),
+                allowStagingDeploy: z.boolean().default(false),
+                stagingTargets: z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u)).max(20).default([]),
                 mergeMethod: z.enum(['merge','squash','rebase']).optional(),
                 requiredChecks: z.array(z.string().trim().min(1).max(200)).max(50).optional(),
                 configuredBy: z.string().optional()
@@ -833,6 +911,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 if (value.purpose === 'delivery' && (value.provider !== 'github' || !value.baseBranch || !value.allowDraftPr))
                     context.addIssue({ code: 'custom', message: 'Draft PR delivery requires GitHub, a base branch, and explicit create permission' });
                 if (value.allowMergePr && (value.mergeMethod!=='merge' || !value.requiredChecks?.length || new Set(value.requiredChecks).size!==value.requiredChecks.length)) context.addIssue({code:'custom',message:'Merge requires a fixed method and required checks'});
+                if (value.allowStagingDeploy && (!value.stagingTargets.length || value.provider !== 'github' || value.purpose !== 'delivery')) context.addIssue({code:'custom',message:'Staging deployment requires a GitHub delivery connection and explicit target IDs'});
             })])
         };
         return schemas[kind].parse(input);
@@ -1036,7 +1115,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(403, "Run denied");
         if (r!.connectorId !== c.id || r!.generation !== b.generation || (!reconciliation && (r!.status !== "running" || Date.parse(r!.leaseUntil ?? "") < Date.now())))
             fail(409, "Lease lost; stop and reconcile execution");
-        if(reconciliation&&(r!.kind!=='delivery'||r!.operation?.action!=='merge_pr'||!['merge_intent','merged'].includes(r!.operation.phase)))fail(403,'Only saved merge intent permits read-only effect recording');
+        if(reconciliation&&!(r!.kind==='delivery'&&(r!.operation?.action==='merge_pr'&&['merge_intent','merged'].includes(r!.operation.phase)||['deploy_staging','rollback_staging'].includes(r!.operation?.action??'')&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(r!.operation?.phase??''))))fail(403,'Only a saved delivery intent permits read-only reconciliation');
         if(!reconciliation&&!await actorAuthorized(r!,tx))fail(403,'Run authorization revoked; stop execution');
         if(!reconciliation&&requireExecution&&r!.kind!=='delivery')await validateRunSelection(r!,tx);
         return r!;
@@ -1060,6 +1139,60 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(operation.action==='merge_pr')await mergePrPolicy(run,tx);else await draftPrPolicy(run.projectId,operation.repositoryUrl,operation.baseBranch,tx);
         if(operation!.actorId!==run.requestedBy||body.generation!==run.generation)fail(409,'Draft PR authorization changed');
         return {authorized:true,repositoryUrl:project!.repositoryUrl};
+    }));
+    app.post('/api/workbench/connector/runs/:id/staging-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const c=await connector(req);const run=await store.get<Run>('run',(req.params as {id:string}).id,tx);const body=z.object({generation:z.number(),effect:z.enum(['provenance','transport','status'])}).strict().parse(req.body);
+        if(!run||run.kind!=='delivery'||!run.operation||!['deploy_staging','rollback_staging'].includes(run.operation.action)||run.connectorId!==c.id||!c.projectIds.includes(run.projectId))fail(403,'Staging operation unavailable');
+        const op=run.operation,targetId=op.targetId;if(!targetId||!op.sourceMergeRunId||!op.imageDigest||!op.commitSha)fail(409,'Staging operation identity is incomplete');
+        const capsRows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${c.id}`;const caps=capsRows[0]?.capabilities as Record<string,unknown>|undefined;
+        const hasIntent=Boolean(op.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase);
+        const statusOnly=body.effect==='status'||run.generation!==body.generation||run.status!=='running'||Date.parse(run.leaseUntil??'')<Date.now()||(['deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase));
+        if(statusOnly){
+            if(run.generation!==body.generation||!hasIntent)fail(409,'A saved staging intent and current generation are required for status reconciliation');
+            return {authorized:true as const,action:'status' as const};
+        }
+        if(!Array.isArray(caps?.deploymentTargets)||!caps.deploymentTargets.includes(targetId))fail(409,'Configured staging target capability is unavailable');
+        if(run.generation!==body.generation||run.status!=='running'||Date.parse(run.leaseUntil??'')<Date.now())fail(409,'Lease lost; stop and reconcile staging operation');
+        const action=op.action==='deploy_staging'?'deploy_staging':'rollback_staging';
+        const allowed=Array.isArray(caps?.deliveryActions)&&caps.deliveryActions.includes(action);if(!allowed)fail(409,'Staging action capability was revoked');
+        if(!await actorAuthorized(run,tx))fail(403,'Staging actor authorization was revoked');
+        const users=await tx`SELECT role FROM wb_users WHERE id=${run.requestedBy??''}`;if(!users[0]||!['owner','admin'].includes(String(users[0]!.role)))fail(403,'Staging action requires a project administrator');
+        const membership=await tx`SELECT role FROM wb_memberships WHERE user_id=${run.requestedBy??''} AND project_id=${run.projectId}`;if(users[0]!.role!=='owner'&&(!membership[0]||!['owner','admin'].includes(String(membership[0]!.role))))fail(403,'Staging project authorization was revoked');
+        if(op.actorId!==run.requestedBy)fail(409,'Staging actor binding changed');
+        const {project}=await stagingTargetPolicy(run.projectId,targetId,tx,op.targetPolicyVersion);
+        const source=await store.get<Run>('run',op.sourceMergeRunId,tx);
+        if(!source||source.status!=='completed'||source.kind!=='delivery'||source.operation?.action!=='merge_pr'||source.operation.phase!=='merged'||source.operation.external?.mergeSha!==op.commitSha)fail(409,'Exact merged source receipt is unavailable');
+        if(op.action==='rollback_staging'){
+            const previous=op.previousDeploymentRunId?await store.get<Run>('run',op.previousDeploymentRunId,tx):undefined;
+            if(!previous?.operation?.stagingReceipt||previous.operation.stagingReceipt.phase!=='health_passed'||previous.operation.stagingReceipt.imageDigest!==op.imageDigest||previous.operation.stagingReceipt.commitSha!==op.commitSha)fail(409,'Previous verified deployment receipt changed');
+        }
+        const nextPhase=op.action==='deploy_staging'?'deploy_intent':'rollback_intent';
+        if(op.phase==='queued'){
+            if(body.effect!=='provenance')fail(409,'A staging mutation must begin with provenance authorization');
+            op.phase=nextPhase;op.effectIntentGeneration=run.generation;op.stagingEffectStage='intent';run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
+            const intent:Artifact={id:`artifact:${run.id}:staging-intent:${run.generation}`,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{operationId:run.id,action:op.action,phase:op.phase,targetId,commitSha:op.commitSha,imageDigest:op.imageDigest,sourceMergeRunId:op.sourceMergeRunId,actorId:op.actorId,targetPolicyVersion:op.targetPolicyVersion,generation:run.generation},createdAt:now()};await store.put('artifact',intent,tx);
+        }else if(op.phase!==nextPhase||op.effectIntentGeneration!==run.generation||body.effect!=='transport'||op.stagingEffectStage!=='intent'&&op.stagingEffectStage!=='transport_intent')fail(409,'Staging mutation intent is immutable; status reconciliation is required');
+        if(body.effect==='transport'){op.stagingEffectStage='transport_intent';run.operation=op;run.updatedAt=now();await store.put('run',run,tx);}
+        return {authorized:true as const,action:op.action==='deploy_staging'?'deploy' as const:'rollback' as const};
+    }));
+    app.post('/api/workbench/connector/runs/:id/staging-progress',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const body=z.object({generation:z.number(),receipt:z.object({operationId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),phase:z.enum(['deployed','health_passed','rolled_back','target_offline','unknown']),deploymentId:z.string().regex(/^deploy_[A-Za-z0-9_-]{1,100}$/u).optional(),commitSha:z.string().regex(/^[a-f0-9]{40}$/u),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),activeCommitSha:z.string().regex(/^[a-f0-9]{40}$/u).optional(),activeImageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u).optional(),previousDeploymentId:z.string().regex(/^deploy_[A-Za-z0-9_-]{1,100}$/u).optional(),previousImageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u).optional(),checkedAt:z.string().datetime()}).strict()}).strict().parse(req.body);
+        const run0=await store.get<Run>('run',(req.params as {id:string}).id,tx);const stage=run0?.operation;
+        const readOnly=Boolean(stage?.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(stage?.phase??'');
+        const run=await leased(req,tx,false,readOnly);if(run.kind!=='delivery'||!run.operation||!['deploy_staging','rollback_staging'].includes(run.operation.action))fail(403,'Staging delivery operation required');
+        if(!run.operation.effectIntentGeneration)fail(409,'A saved staging intent is required for receipt reconciliation');
+        const op=run.operation,receipt=body.receipt;if(receipt.operationId!==run.id||receipt.targetId!==op.targetId||receipt.commitSha!==op.commitSha||receipt.imageDigest!==op.imageDigest)fail(409,'Staging receipt does not match the immutable operation');
+        const validDeploy=op.action==='deploy_staging'&&receipt.phase==='health_passed'&&receipt.deploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
+        const validRollback=op.action==='rollback_staging'&&receipt.phase==='rolled_back'&&receipt.deploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
+        if(receipt.phase==='health_passed'&&!validDeploy||receipt.phase==='rolled_back'&&!validRollback)fail(409,'Staging health receipt does not prove the requested image is active');
+        const phase=receipt.phase==='unknown'||receipt.phase==='deployed'?'deploy_unknown':receipt.phase;
+        op.phase=phase;op.stagingReceipt=receipt;run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
+        const artifactId=`artifact:${run.id}:staging:${run.generation}:${phase}`;let artifact=await store.get<Artifact>('artifact',artifactId,tx);
+        const data={operationId:run.id,action:op.action,phase,targetId:op.targetId,sourceMergeRunId:op.sourceMergeRunId,targetPolicyVersion:op.targetPolicyVersion,commitSha:op.commitSha,imageDigest:op.imageDigest,previousDeploymentRunId:op.previousDeploymentRunId,receipt};
+        if(artifact){if(!isDeepStrictEqual(artifact.data,data))fail(409,'Staging receipt is immutable');}
+        else{artifact={id:artifactId,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data,createdAt:now()};await store.put('artifact',artifact,tx);}
+        if((validDeploy||validRollback)&&op.targetId){const reservationScope=stagingReservationScope(run.projectId,op.targetId);await tx`DELETE FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' AND result->>'runId'=${run.id}`;}
+        return {run,artifact};
     }));
     app.post("/api/workbench/connector/claim", async (req, reply) => {
         const c = await connector(req);
@@ -1274,7 +1407,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(403, "Run denied");
         if (["completed", "failed"].includes(existing!.status))
             return existing;
-        const r = await leased(req, tx, false, existing!.kind==='delivery'&&existing!.operation?.phase==='merged', false);
+        const stagingReceiptReconciliation=existing!.kind==='delivery'&&['deploy_staging','rollback_staging'].includes(existing!.operation?.action??'')&&Boolean(existing!.operation?.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(existing!.operation?.phase??'');
+        const r = await leased(req, tx, false, existing!.kind==='delivery'&&(existing!.operation?.phase==='merged'||stagingReceiptReconciliation), false);
         const b = z.object({
             generation: z.number(),
             threadId: z.string().optional(),
@@ -1324,7 +1458,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await grant(actors[0] as unknown as Member, r.projectId, false, tx);
         const b = z.object({
             generation: z.number(),
-            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "submit_review_result", "post_message", "update_settings", "create_skill"]),
+            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "request_staging_deploy", "request_staging_rollback", "submit_review_result", "post_message", "update_settings", "create_skill"]),
             input: z.record(z.string(), z.unknown()),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
@@ -1337,6 +1471,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         }
         if(b.action==='request_delivery'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request delivery');
         if(b.action==='request_merge'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request merge');
+        if((b.action==='request_staging_deploy'||b.action==='request_staging_rollback')&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request staging delivery');
         if(b.action==='dispatch'&&r.sourceIds?.length&&!(await store.get<Project>('project',r.projectId,tx))?.feedbackIntake?.allowExecution)fail(403,'Feedback execution grant revoked');
         if(r.allowedActions&&!r.allowedActions.includes(b.action))fail(403,'This intake grant does not authorize that action');
         const skillInput = b.action === 'create_skill' ? z.object({ scope: z.enum(['project', 'workspace']).optional(), name: text, data: z.record(z.string(), z.unknown()) }).strict().parse(b.input) : undefined;
@@ -1435,6 +1570,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             const prior=await store.get<Run>('run',input.priorDeliveryRunId,tx);if(!prior?.workId||prior.projectId!==r.projectId)fail(404,'Prior delivery receipt is unavailable');
             result=await requestMergePr(actors[0] as unknown as Member,prior!.workId!,input,tx,r.projectId);
         }
+        else if (b.action === 'request_staging_deploy') {
+            const input=z.object({workId:text,sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
+            const {workId,...request}=input;result=await requestStagingDeploy(actors[0] as unknown as Member,workId,request,tx,r.projectId);
+        }
+        else if (b.action === 'request_staging_rollback') {
+            const input=z.object({workId:text,deploymentRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
+            const {workId,...request}=input;result=await requestStagingRollback(actors[0] as unknown as Member,workId,request,tx,r.projectId);
+        }
         else if (b.action === "dispatch") {
             const input = z.union([
                 z.object({workId:text,prompt:text,kind:z.enum(["implementation","review"]),model:z.enum(["gpt-6-luna","gpt-6.1-sol"]),reasoning:z.enum(["low","medium","high","xhigh"]).default("medium")}).strict(),
@@ -1480,7 +1623,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const input=z.object({settingId:text,expectedUpdatedAt:z.string().min(1),name:text.optional(),data:z.record(z.string(),z.unknown()).optional()}).strict().parse(b.input);
                 const {settingId,...change}=input;
                 const setting=await store.get<Setting>('setting',settingId,tx);
-                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','allowMergePr','mergeMethod','requiredChecks','baseBranch','configuredBy','coverage','requirements','resource','providerResource'];
+                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','allowMergePr','allowStagingDeploy','stagingTargets','mergeMethod','requiredChecks','baseBranch','configuredBy','coverage','requirements','resource','providerResource'];
                 if(setting?.kind==='provider')fail(403,'Master cannot change workspace provider connections');
                 if(setting?.kind==='connection'&&change.data&&protectedConnectionKeys.some(key=>Object.hasOwn(change.data!,key)))fail(403,'Master cannot change connection or delivery authorization policy');
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);

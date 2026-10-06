@@ -14,6 +14,7 @@ import { captureRequiredLocalQa } from './local-qa.js';
 import { assertQaResourcePolicy,bindQaExecutor,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
 import { savedQaPolicy,sameQaPolicy } from '../workbench/local-qa.js';
 import { mergePullRequest } from './github-merge-pr.js';
+import { runStagingOperation, stopStagingProcess, type StagingReceipt, type StagingRequest } from './staging-deploy.js';
 import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
 
 const activeDeliveryExecutors=new Set<string>();
@@ -23,6 +24,10 @@ interface Spool {
   events: ConnectorEvent[];
   artifacts: UploadArtifact[];
   deliveryProgress?: {phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string};
+  stagingIntent?: Omit<StagingRequest,'action'|'operationId'>;
+  stagingReceipt?: StagingReceipt;
+  stagingTransportStarted?:boolean;
+  stagingTransportStopped?:boolean;
   threadId?: string;
   completion?: {threadId?:string;error?:string};
   stopped?: boolean;
@@ -34,7 +39,8 @@ interface Spool {
   qaInFlight?: boolean;
   qaExecution?: QaExecution;
   deliveryProcessIdentity?:GitProcessIdentity;
-  deliveryExecutor?:{pid:number;executionId:string;stage:'git'|'http'|'completion'};
+  stagingProcessIdentity?:CodexProcessIdentity;
+  deliveryExecutor?:{pid:number;executionId:string;stage:'git'|'http'|'staging'|'completion'};
 }
 const delay = (ms:number) => new Promise(resolve => setTimeout(resolve,ms));
 export function buildRunPrompt(claim: ClaimedRun, skillPaths?: Record<string, string>): string {
@@ -61,6 +67,7 @@ export class ConnectorRunner {
     native: () => CodexAppServer;
     client: (models:string[], modelReasoningEfforts?:Record<string,string[]>) => WorkbenchConnectorClient;
     delivery?:{fetcher?:typeof fetch;transport?:Parameters<typeof createDraftPullRequest>[5]};
+    staging?:{transport?:Parameters<typeof runStagingOperation>[4];provenanceVerifier?:Parameters<typeof runStagingOperation>[5];targetValidator?:Parameters<typeof runStagingOperation>[7]};
   }) {}
   private native():CodexAppServer { return this.dependencies?.native() ?? new CodexAppServer(this.config.codexBinary); }
 
@@ -109,7 +116,7 @@ export class ConnectorRunner {
     this.spoolWrites.set(spool,write);await write;
   }
   private async retainOrRemove(spool:Spool):Promise<void> {
-    if(spool.events.length || spool.artifacts.length || spool.deliveryProgress) {
+    if(spool.events.length || spool.artifacts.length || spool.deliveryProgress || spool.stagingReceipt || spool.stagingIntent) {
       const directory=path.join(this.config.dataDir,'unsent-evidence');
       await mkdir(directory,{recursive:true,mode:0o700});
       await rename(this.spoolPath(spool.runId,spool.generation),path.join(directory,`${stateKey(spool.runId,String(spool.generation))}.json`));
@@ -118,6 +125,13 @@ export class ConnectorRunner {
   private async flush(spool:Spool):Promise<void> {
     const client = this.client!;
     if(spool.deliveryProgress?.phase==='merged'){await client.deliveryProgress(spool.runId,spool.generation,spool.deliveryProgress);spool.deliveryProgress=undefined;spool.stopped=false;spool.completion={};await this.save(spool);}
+    if(spool.stagingReceipt){
+      const receipt=spool.stagingReceipt;
+      if(!spool.completion)spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'};
+      await this.save(spool);
+      await client.stagingProgress(spool.runId,spool.generation,receipt);
+      spool.stagingReceipt=undefined;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='completion');await this.save(spool);
+    }
     if (spool.stopped) {
       await client.stopped(spool.runId,spool.generation,spool.threadId);
       await this.retainOrRemove(spool);
@@ -138,6 +152,19 @@ export class ConnectorRunner {
     else if (spool.completion) await client.complete(spool.runId,spool.generation,spool.completion);
     if (spool.stopped || spool.completion) await unlink(this.spoolPath(spool.runId,spool.generation));
   }
+  private async reconcileStaging(spool:Spool):Promise<void>{
+    const client=this.client!,intent=spool.stagingIntent,targetId=intent?.targetId,target=targetId?this.config.deploymentTargets?.[targetId]:undefined;
+    if(!intent||!targetId||!target)throw new Error('Saved staging target configuration is unavailable; reservation retained');
+    const authorize=async()=>{const grant=await client.authorizeStagingEffect(spool.runId,spool.generation,'status');if(grant.action!=='status')throw new Error('Staging status authorization changed');};
+    const {previousDeploymentId:_previousDeploymentId,...statusIntent}=intent;
+    const receipt=await runStagingOperation(targetId,target,{...statusIntent,action:'status',operationId:spool.runId},
+      {starting:async()=>{spool.stagingTransportStarted=true;spool.stagingTransportStopped=false;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);},
+       started:async identity=>{spool.stagingProcessIdentity=identity;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);},
+       stopped:async()=>{spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);}},
+      this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,authorize,this.dependencies?.staging?.targetValidator);
+    spool.stagingReceipt=receipt;spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging status did not confirm a verified deployment; target reservation remains held'};
+    await this.save(spool);await this.flush(spool);
+  }
   private async recover():Promise<void> {
     const directory = path.join(this.config.dataDir,'spool');
     await mkdir(directory,{recursive:true,mode:0o700});
@@ -145,6 +172,24 @@ export class ConnectorRunner {
       if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
       const spool = await readJson<Spool>(path.join(directory,file));
       if (!spool || this.activeRuns.has(spool.runId)) continue;
+      if(spool.stagingReceipt){try{await this.flush(spool);}catch{/* Durable receipt remains for the next pass. */}continue;}
+      if(spool.stagingIntent&&spool.completion&&!spool.stagingProcessIdentity&&spool.deliveryExecutor?.stage==='completion'){
+        try{await this.flush(spool);}catch{/* Durable completion remains for the next pass. */}continue;
+      }
+      if(spool.stagingIntent&&spool.deliveryExecutor?.stage==='staging'){
+        const executor=spool.deliveryExecutor;let executorStopped=false;
+        if(!Number.isSafeInteger(executor.pid)||executor.pid<=1||!executor.executionId)continue;
+        if(executor.pid===process.pid){if(activeDeliveryExecutors.has(executor.executionId))continue;executorStopped=true;}
+        else{try{process.kill(executor.pid,0);continue;}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')executorStopped=true;else continue;}}
+        if(!executorStopped)continue;
+        if(spool.stagingProcessIdentity){
+          const gone=await waitProcessGroup(spool.stagingProcessIdentity.processGroupId,1);
+          if(!gone&&!await stopStagingProcess(spool.stagingProcessIdentity))continue;
+          spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);
+        }else if(!spool.stagingTransportStopped)continue;
+        try{await this.reconcileStaging(spool);}catch{/* Unknown remote outcome and reservation stay durable. */}
+        continue;
+      }
       if(spool.gitStopUnconfirmed){
         if(!this.reportedRecovery.has(spool.runId))console.error('Git process group stop remains unconfirmed; manual Connector recovery is required');
         this.reportedRecovery.add(spool.runId);continue; // Native stop proof cannot release an unconfirmed Git group.
@@ -385,15 +430,17 @@ export class ConnectorRunner {
   }
 
   private async executeDelivery(claim:ClaimedRun):Promise<void>{
-    const client=this.client!;const run=claim.run;const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[],deliveryExecutor:{pid:process.pid,executionId:randomUUID(),stage:run.operation?.action==='merge_pr'?'http':'git'}};
+    const client=this.client!;const run=claim.run;const initialStage=run.operation?.action==='deploy_staging'||run.operation?.action==='rollback_staging';const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[],deliveryExecutor:{pid:process.pid,executionId:randomUUID(),stage:initialStage?'staging':run.operation?.action==='merge_pr'?'http':'git'}};
     activeDeliveryExecutors.add(spool.deliveryExecutor!.executionId);
     try{
       await this.save(spool);
       if(run.operation?.action!=='merge_pr'||run.operation.phase!=='merge_intent')await client.renew(run.id,run.generation);
+      if(initialStage){await this.executeStaging(claim,spool);return;}
       if(run.operation?.action==='merge_pr'){
         const result=await mergePullRequest(claim,async()=>{const auth=await client.authorizeDeliveryEffect(run.id,run.generation);if(auth.repositoryUrl!==run.operation?.repositoryUrl)throw new Error('Merge repository authorization changed');},this.dependencies?.delivery?.fetcher??fetch,async phase=>{spool.deliveryProgress={phase};await this.save(spool);await this.flush(spool);});
         spool.deliveryExecutor!.stage='completion';spool.deliveryProgress={phase:'merged',...result};await this.save(spool);await this.flush(spool);return;
       }
+      if(run.operation?.action!=='create_draft_pr')throw new Error('Unsupported fixed delivery action');
       await createDraftPullRequest(this.config,claim,this.dependencies?.delivery?.fetcher??fetch,async phase=>{
         if(phase.phase==='published'&&run.operation?.phase==='pr_created')return;
         spool.deliveryExecutor!.stage='http';spool.deliveryProgress=phase;await this.save(spool);await this.flush(spool);
@@ -406,6 +453,17 @@ export class ConnectorRunner {
     }catch(error){
       // Replay successful completion after a lost server response; never re-execute effects.
       if(spool.completion)throw error;
+      if(initialStage){
+        if(spool.stagingProcessIdentity||spool.stagingTransportStarted&&!spool.stagingTransportStopped){await this.save(spool);throw new Error('Staging SSH stop is unconfirmed; reservation retained for reconciliation');}
+        if(spool.stagingIntent){
+          try{await this.reconcileStaging(spool);return;}catch{
+            spool.completion={error:'Staging authorization, provenance, or remote status could not be verified; reservation remains held when intent was saved'};await this.save(spool);
+            try{await this.flush(spool);}catch{/* Preserve the exact intent and completion for later reconciliation. */}
+          }
+          throw new Error('Staging operation could not be verified; inspect its durable status');
+        }
+        throw error;
+      }
       if(spool.deliveryProcessIdentity||(error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){await this.save(spool);throw new Error('Draft PR transport stop is unconfirmed; reconciliation is required');}
       const current=await client.readRun(run.id).catch(()=>undefined);
       if(current?.generation===run.generation&&['paused','cancelled','interrupted'].includes(current.status)){
@@ -423,5 +481,30 @@ export class ConnectorRunner {
       }
       throw new Error('Draft PR operation failed; inspect the durable delivery run');
     }finally{activeDeliveryExecutors.delete(spool.deliveryExecutor!.executionId);}
+  }
+
+  private async executeStaging(claim:ClaimedRun,spool:Spool):Promise<void>{
+    const client=this.client!,run=claim.run,op=run.operation;
+    if(!op||!['deploy_staging','rollback_staging'].includes(op.action)||!op.targetId||!op.commitSha||!op.imageDigest||!op.expectedCurrentDeploymentId&&op.expectedCurrentDeploymentId!==null)throw new Error('Staging operation identity is incomplete');
+    const target=this.config.deploymentTargets?.[op.targetId];if(!target)throw new Error('Staging Connector target is not configured');
+    const rollback=op.action==='rollback_staging';if(rollback&&!op.previousDeploymentId)throw new Error('Rollback is missing its saved previous deployment identity');
+    const statusOnly=op.phase!=='queued'||Boolean(op.effectIntentGeneration);
+    const stagingIntent:Spool['stagingIntent']={targetId:op.targetId,commitSha:op.commitSha,imageDigest:op.imageDigest,expectedCurrentDeploymentId:op.expectedCurrentDeploymentId??null,...(rollback&&op.previousDeploymentId?{previousDeploymentId:op.previousDeploymentId}:{})};
+    spool.stagingIntent=stagingIntent;spool.deliveryExecutor!.stage='staging';await this.save(spool);
+    const expectedAction=statusOnly?'status':rollback?'rollback':'deploy';
+    const {previousDeploymentId:_savedPreviousDeploymentId,...requestIntent}=stagingIntent;
+    const request:StagingRequest={...requestIntent,...(!statusOnly&&rollback&&op.previousDeploymentId?{previousDeploymentId:op.previousDeploymentId}:{}),operationId:run.id,action:expectedAction};
+    const authorize=async(effect:'provenance'|'transport')=>{
+      const grant=await client.authorizeStagingEffect(run.id,run.generation,statusOnly?'status':effect);
+      if(grant.action!==expectedAction)throw new Error('Staging authorization changed before the next external effect');
+    };
+    const receipt=await runStagingOperation(op.targetId,target,request,{
+      starting:async()=>{spool.stagingTransportStarted=true;spool.stagingTransportStopped=false;spool.deliveryExecutor!.stage='staging';await this.save(spool);},
+      started:async identity=>{spool.stagingProcessIdentity=identity;spool.deliveryExecutor!.stage='staging';await this.save(spool);},
+      stopped:async()=>{spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);}
+    },this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,authorize,this.dependencies?.staging?.targetValidator);
+    spool.deliveryExecutor!.stage='completion';spool.stagingReceipt=receipt;
+    spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'};
+    await this.save(spool);await this.flush(spool);
   }
 }

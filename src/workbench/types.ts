@@ -52,7 +52,7 @@ export interface Run {
     causedByRunId?: string;
     kind: 'master' | 'implementation' | 'review' | 'delivery';
     operation?: {
-        action: 'create_draft_pr' | 'merge_pr';
+        action: 'create_draft_pr' | 'merge_pr' | 'deploy_staging' | 'rollback_staging';
         actorId: string;
         candidateRunId: string;
         candidateRevision: string;
@@ -66,7 +66,7 @@ export interface Run {
         workTitle: string;
         changeSummary: string;
         qaStatus: string;
-        phase: 'queued' | 'published' | 'pr_created' | 'ready_intent' | 'merge_intent' | 'merged';
+        phase: 'queued' | 'published' | 'pr_created' | 'ready_intent' | 'merge_intent' | 'merged' | 'deploy_intent' | 'deploy_unknown' | 'deployed' | 'health_passed' | 'rollback_intent' | 'rolled_back' | 'target_offline';
         effectIntentGeneration?: number;
         external?: { pullRequestNumber?: number; pullRequestUrl?: string; headSha?: string; baseSha?: string; mergeSha?: string; pullRequestNodeId?: string };
         priorDeliveryRunId?: string;
@@ -76,6 +76,28 @@ export interface Run {
         integrationBaseSha?: string;
         qaPolicySnapshot?: QaPolicy;
         policySnapshot?: { id: string; version: string; requiredChecks: string[] };
+        targetId?: string;
+        targetPolicyVersion?: string;
+        imageDigest?: string;
+        sourceMergeRunId?: string;
+        previousDeploymentRunId?: string;
+        previousDeploymentId?: string;
+        rollbackToImageDigest?: string;
+        stagingEffectStage?: 'intent' | 'transport_intent';
+        expectedCurrentDeploymentId?: string | null;
+        stagingReceipt?: {
+            operationId: string;
+            targetId: string;
+            phase: 'deployed' | 'health_passed' | 'rolled_back' | 'target_offline' | 'unknown';
+            deploymentId?: string;
+            commitSha: string;
+            imageDigest: string;
+            activeCommitSha?: string;
+            activeImageDigest?: string;
+            previousDeploymentId?: string;
+            previousImageDigest?: string;
+            checkedAt: string;
+        };
 
     };
     qaPolicySnapshot?: QaPolicy;

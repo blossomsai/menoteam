@@ -7,10 +7,20 @@ export interface ConnectorConfig {
   dataDir: string;
   projects: Record<string, string>;
   qaResources?: Record<string, {url:string}>;
+  deploymentTargets?: Record<string, StagingDeploymentTarget>;
   codexBinary?: string;
   models?: string[];
   pollIntervalMs?: number;
   leaseRenewIntervalMs?: number;
+}
+
+export interface StagingDeploymentTarget {
+  sshHost: string;
+  sshUser: string;
+  identityFile: string;
+  knownHostsFile: string;
+  hostKeyFingerprint: string;
+  imageRepository: 'ghcr.io/blossomsai/menoteam-work-map';
 }
 
 export interface ClaimedRun {

@@ -21,7 +21,7 @@ export class ConnectorHttpError extends Error {
 
 function routeCategory(path: string): string {
   if (path === '/api/workbench/connector/claim') return 'connector.claim';
-  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress)$/u)?.[1];
+  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress|staging-authorize|staging-progress)$/u)?.[1];
   if (route) return `connector.runs.${route}`;
   if (/^\/api\/workbench\/connector\/runs\/[^/]+$/u.test(path)) return 'connector.runs.read';
   return 'unknown';
@@ -40,7 +40,7 @@ export class WorkbenchConnectorClient {
   private readonly codexModels: string[];
   private readonly modelReasoningEfforts: Record<string, string[]>;
 
-  constructor(private readonly config: Pick<ConnectorConfig, 'serverUrl' | 'token'>, private readonly fetcher: typeof fetch = fetch, codexModels: string[] = [], modelReasoningEfforts: Record<string, string[]> = {}) {
+  constructor(private readonly config: Pick<ConnectorConfig, 'serverUrl' | 'token' | 'deploymentTargets'>, private readonly fetcher: typeof fetch = fetch, codexModels: string[] = [], modelReasoningEfforts: Record<string, string[]> = {}) {
     const url = new URL(config.serverUrl);
     const loopback = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(url.hostname);
     if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
@@ -58,7 +58,12 @@ export class WorkbenchConnectorClient {
       models: this.codexModels,
       modelReasoningEfforts: this.modelReasoningEfforts,
       localWorktrees: true,
-      ...(process.env.MENOTEAM_GITHUB_TOKEN ? { git: true, githubWrite: true, deliveryActions: ['create_draft_pr','merge_pr'] } : {}),
+      ...(process.env.MENOTEAM_GITHUB_TOKEN ? {
+        git: true,
+        githubWrite: true,
+        deliveryActions: ['create_draft_pr','merge_pr', ...(Object.keys(this.config.deploymentTargets ?? {}).length ? ['deploy_staging','rollback_staging'] : [])],
+        ...(Object.keys(this.config.deploymentTargets ?? {}).length ? { deploymentTargets: Object.keys(this.config.deploymentTargets!) } : {}),
+      } : {}),
       ...(runKinds ? { runKinds: [...new Set(runKinds)] } : {}),
     };
     const result = await this.request<ClaimedRun | undefined>('/api/workbench/connector/claim', {
@@ -88,6 +93,8 @@ export class WorkbenchConnectorClient {
     });
   }
   deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string}):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
+  authorizeStagingEffect(runId:string,generation:number,effect:'provenance'|'transport'|'status'):Promise<{authorized:true;action:'deploy'|'rollback'|'status'}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-authorize`,{method:'POST',body:{generation,effect}});}
+  stagingProgress(runId:string,generation:number,receipt:import('./staging-deploy.js').StagingReceipt):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-progress`,{method:'POST',body:{generation,receipt}});}
 
   pauseState(runId: string): Promise<Run> { return this.readRun(runId); }
 
@@ -173,6 +180,11 @@ function validateResponse(path: string, value: unknown): unknown {
   if (path.endsWith('/qa-authorize')) return z.object({authorized:z.literal(true)}).strict().parse(value);
   if (path.endsWith('/delivery-authorize')) return z.object({ authorized: z.literal(true), repositoryUrl: z.string().url() }).parse(value);
   if (path.endsWith('/delivery-progress')) return z.object({
+    run: z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough(),
+    artifact: z.object({ id: z.string(), kind: z.literal('delivery'), revision: z.string(), data: z.unknown() }).passthrough(),
+  }).parse(value);
+  if (path.endsWith('/staging-authorize')) return z.object({authorized:z.literal(true),action:z.enum(['deploy','rollback','status'])}).strict().parse(value);
+  if (path.endsWith('/staging-progress')) return z.object({
     run: z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough(),
     artifact: z.object({ id: z.string(), kind: z.literal('delivery'), revision: z.string(), data: z.unknown() }).passthrough(),
   }).parse(value);
