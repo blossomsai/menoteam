@@ -15,6 +15,19 @@ const profileSetting = { id: 'profile-1', kind: 'profile' as const, name: 'Build
 function snapshot(currentMember = owner, settings = [] as Snapshot['settings'], runtimes = [runtime]): Snapshot {
   return { member: currentMember, projects: [project], works: [], messages: [], runs: [], artifacts: [], settings, runtimeProviders: runtimes, providerConnections: settings.filter(item => item.kind === 'provider').map(item => ({ id: item.id, name: item.name, connectorId: String(item.data.connectorId ?? ''), enabled: item.data.enabled !== false, default: item.data.default === true, status: item.data.enabled === false ? 'disabled' : 'available', models: runtime.models, projectIds: ['project'], localWorktrees: true })) };
 }
+function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) {
+  const version = new Date(Date.now() - 60_000).toISOString();
+  const startedAt = new Date(Date.now() - 30_000).toISOString();
+  const finishedAt = new Date(Date.now() - 20_000).toISOString();
+  const capturedAt = new Date(Date.now() - 10_000).toISOString();
+  const requirements = [
+    { id: 'full-suite', category: 'tests' as const, commands: [{ executable: 'repo-bin' as const, bin: 'vitest', args: ['run'], timeoutMs: 60_000 }], report: 'vitest-json' as const },
+    { id: 'typecheck', category: 'typecheck' as const, commands: [{ executable: 'repo-bin' as const, bin: 'tsc', args: ['--noEmit'], timeoutMs: 60_000 }], report: 'none' as const },
+  ];
+  const policy = { id: 'policy-current', version, projectId, repositoryUrl: 'https://github.com/blossomsai/menoteam', configuredBy: owner.id, coverage: 'project/v1' as const, requirements };
+  const checks = requirements.slice(0, checkCount).map((requirement, index) => ({ requirementId: requirement.id, category: requirement.category, source: 'fixed-connector' as const, name: requirement.id, command: JSON.stringify(requirement.commands), exitCode: 0, output: 'ok', outputChannel: 'combined' as const, durationMs: 1, startedAt, finishedAt, testedRevision: fingerprint, ...(index === 0 ? { metrics: { total: 1, passed: 1, failed: 0, skipped: 0 } } : {}) }));
+  return { policy, data: { localQaContract: 'project-local-qa/v2', policy, candidateFingerprint: fingerprint, stale: false, verification: 'current', capturedAt, checks } };
+}
 
 let root: Root;
 let host: HTMLDivElement;
@@ -101,6 +114,34 @@ describe('mounted provider connection settings', () => {
     expect(update).toHaveBeenCalledWith('provider-1', { name: 'Renamed Codex', expectedUpdatedAt: providerSetting.updatedAt });
     await flush(() => button('Disable').click());
     expect(update).toHaveBeenLastCalledWith('provider-1', { data: { enabled: false }, expectedUpdatedAt: providerSetting.updatedAt });
+  });
+
+  it('shows host availability separately from the last completed native-run evidence', async () => {
+    const verified = { ...runtime, verifiedRunId: 'run-native-verified', verifiedAt: '2026-10-06T10:03:00.000Z' };
+    const current = snapshot(owner, [providerSetting], [verified]);
+    current.providerConnections = [{ id: providerSetting.id, name: providerSetting.name, connectorId: verified.connectorId, enabled: true, default: true, status: 'available', models: verified.models, projectIds: ['project'], localWorktrees: true }];
+    await mount(current);
+    expect(host.textContent).toContain('Available');
+    expect(host.textContent).toContain('online');
+    expect(host.textContent).toContain('Codex app available');
+    expect(host.textContent).toContain('local worktrees available');
+    expect(host.textContent).toContain('Last completed native run');
+    expect(host.textContent).toContain(verified.verifiedRunId);
+  });
+
+  it('does not infer a completed native run from heartbeat alone', async () => {
+    await mount(snapshot(owner, [providerSetting], [{ ...runtime, verifiedRunId: undefined, verifiedAt: undefined }]));
+    expect(host.textContent).toContain('Available');
+    expect(host.textContent).toContain('No completed native run has been verified yet.');
+  });
+
+  it('does not call an online host Available when a required capability is absent', async () => {
+    const unsupported = { ...runtime, localWorktrees: false };
+    const current = snapshot(owner, [providerSetting], [unsupported]);
+    current.providerConnections = [{ id: providerSetting.id, name: providerSetting.name, connectorId: unsupported.connectorId, enabled: true, default: true, status: 'available', models: unsupported.models, projectIds: ['project'], localWorktrees: false }];
+    await mount(current);
+    expect(host.textContent).toContain('Capability unavailable');
+    expect(host.textContent).not.toContain('DefaultAvailable');
   });
 
   it('keeps the rename draft when the server rejects a stale update', async () => {
@@ -415,53 +456,125 @@ describe('mounted provider connection settings', () => {
   it('keeps QA evidence bound to the latest diff revision', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
     const work = { id: 'work-1', projectId: project.id, title: 'QA binding', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
-    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { files: [], totalFiles: 0, truncated: false } };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { candidateRevision: 'commit-current', files: [], totalFiles: 0, truncated: false } };
     const staleQa = { id: 'qa-stale', projectId: project.id, workId: work.id, runId: 'review-stale', kind: 'qa' as const, revision: 'revision-old', createdAt: '2026-10-06T12:00:00.000Z', data: { verification: 'current', checks: [] } };
-    const currentQa = { id: 'qa-current', projectId: project.id, workId: work.id, runId: 'review-current', kind: 'qa' as const, revision: 'revision-current', createdAt: '2026-10-06T09:00:00.000Z', data: { verification: 'current', checks: [] } };
-    vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(currentQa);
-    await mount({ ...snapshot(), works: [work], artifacts: [diff, staleQa, currentQa] } as Snapshot);
+    const currentQa = { id: 'qa-current', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'qa' as const, revision: 'revision-current', createdAt: '2026-10-06T09:00:00.000Z', data: { verification: 'unknown', checks: [] } };
+    vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => id === diff.id ? diff : currentQa);
+    const candidateRun = { id: 'run-1', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', qaPolicySnapshot: { id: 'policy-1', version: '2026-10-06T09:00:00.000Z', projectId: project.id, repositoryUrl: 'https://github.com/blossomsai/menoteam', configuredBy: owner.id, coverage: 'project/v1' as const, requirements: [] } } as Snapshot['runs'][number];
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun], artifacts: [diff, staleQa, currentQa] } as Snapshot);
     await flush();
     expect(workbenchApi.artifact).toHaveBeenCalledWith(currentQa.id);
     expect(workbenchApi.artifact).not.toHaveBeenCalledWith(staleQa.id);
-    expect(host.textContent).toContain('Current evidence');
+    expect(host.textContent).toContain('Unknown');
+    expect(host.textContent).toContain('Required checks are missing for this candidate.');
+    expect(host.textContent).toContain('Typed review');
+    expect(host.textContent).toContain('No review is recorded.');
+    expect(host.textContent).toContain('Missing');
   });
 
   it('does not present typed review QA with a candidate fingerprint mismatch as current', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
     const work = { id: 'work-1', projectId: project.id, title: 'QA fingerprint binding', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
-    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { files: [], totalFiles: 0, truncated: false } };
-    const binding = { candidateRunId: 'candidate-run', commitSha: 'commit-current', candidateFingerprint: 'a'.repeat(64), diffArtifactId: diff.id, diffRevision: diff.revision, qaArtifactIds: [] };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-new', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { candidateRevision: 'commit-current', files: [], totalFiles: 0, truncated: false } };
+    const binding = { candidateRunId: 'candidate-new', commitSha: 'commit-current', candidateFingerprint: 'a'.repeat(64), diffArtifactId: diff.id, diffRevision: diff.revision, qaArtifactIds: ['qa-mismatch'] };
     const reviewRun = { id: 'review-run', projectId: project.id, workId: work.id, prompt: 'Review', kind: 'review' as const, model: 'gpt-6.1-sol', reasoning: 'medium' as const, status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', reviewBinding: binding } as Snapshot['runs'][number];
-    const mismatchedQa = { id: 'qa-mismatch', projectId: project.id, workId: work.id, runId: reviewRun.id, kind: 'qa' as const, revision: diff.revision, createdAt: '2026-10-06T11:00:00.000Z', data: { verification: 'current', typedReview: { ...binding, candidateFingerprint: 'b'.repeat(64), disposition: 'approved' } } };
+    const mismatchedQa = { id: 'qa-mismatch', projectId: project.id, workId: work.id, runId: reviewRun.id, kind: 'qa' as const, revision: diff.revision, createdAt: '2026-10-06T11:00:00.000Z', data: { verification: 'current', typedReview: { ...binding, candidateFingerprint: 'b'.repeat(64), reviewerRunId: reviewRun.id, disposition: 'approved' } } };
     const diffMetadata = { id: diff.id, projectId: diff.projectId, workId: diff.workId, runId: diff.runId, kind: diff.kind, revision: diff.revision, createdAt: diff.createdAt };
     const qaMetadata = { id: mismatchedQa.id, projectId: mismatchedQa.projectId, workId: mismatchedQa.workId, runId: mismatchedQa.runId, kind: mismatchedQa.kind, revision: mismatchedQa.revision, createdAt: mismatchedQa.createdAt };
     expect(diffMetadata).not.toHaveProperty('data'); expect(qaMetadata).not.toHaveProperty('data');
-    const artifactSpy = vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(mismatchedQa);
-    await mount({ ...snapshot(), works: [work], runs: [reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
+    const artifactSpy = vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => id === diff.id ? diff : mismatchedQa);
+    const candidateRun = { id: 'candidate-new', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun, reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
     await flush();
     expect(artifactSpy).toHaveBeenCalledWith(mismatchedQa.id);
     expect(host.textContent).toContain('does not match the latest candidate');
     expect(host.textContent).not.toContain('Current evidence');
-    expect(host.textContent).not.toContain('Typed review');
+    expect(host.textContent).not.toContain('approved');
+  });
+
+  it('marks complete fixed QA coverage as meeting the recorded requirements', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'Required QA', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-required', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-required', createdAt: new Date().toISOString(), data: { candidateRevision: 'commit-required', files: [], totalFiles: 0, truncated: false } };
+    const fingerprint = 'c'.repeat(64);
+    const { policy, data } = localQaFixture(project.id, fingerprint);
+    const qa = { id: 'qa-required', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'qa' as const, revision: diff.revision, createdAt: new Date().toISOString(), data };
+    const candidateRun = { id: 'candidate-run', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', qaPolicySnapshot: policy } as Snapshot['runs'][number];
+    vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => id === diff.id ? diff : qa);
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun], artifacts: [diff, qa] } as Snapshot);
+    await flush();
+    const required = host.querySelector('[aria-label="Required checks"]')!;
+    expect(required.textContent).toContain('Current evidence');
+    expect(required.textContent).toContain('requirements met');
+  });
+
+  it('keeps current QA evidence from implying that omitted policy requirements passed', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'Incomplete QA', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-incomplete', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-incomplete', createdAt: new Date().toISOString(), data: { candidateRevision: 'commit-incomplete', files: [], totalFiles: 0, truncated: false } };
+    const fingerprint = 'd'.repeat(64);
+    const { policy, data } = localQaFixture(project.id, fingerprint, 1);
+    const qa = { id: 'qa-incomplete', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'qa' as const, revision: diff.revision, createdAt: new Date().toISOString(), data };
+    const candidateRun = { id: 'candidate-run', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', qaPolicySnapshot: policy } as Snapshot['runs'][number];
+    vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => id === diff.id ? diff : qa);
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun], artifacts: [diff, qa] } as Snapshot);
+    await flush();
+    const required = host.querySelector('[aria-label="Required checks"]')!;
+    expect(required.textContent).toContain('Current evidence');
+    expect(required.textContent).toContain('required checks are incomplete');
+    expect(required.textContent).not.toContain('requirements met');
+  });
+
+  it('keeps required QA status unknown when the evidence request fails', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'Unavailable QA', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-unavailable', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-unavailable', createdAt: new Date().toISOString(), data: { candidateRevision: 'commit-unavailable', files: [], totalFiles: 0, truncated: false } };
+    const { policy } = localQaFixture(project.id, 'e'.repeat(64));
+    const qa = { id: 'qa-unavailable', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'qa' as const, revision: diff.revision, createdAt: new Date().toISOString() };
+    const candidateRun = { id: 'candidate-run', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', qaPolicySnapshot: policy } as Snapshot['runs'][number];
+    vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => { if (id === diff.id) return diff; throw new Error('temporarily unavailable'); });
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun], artifacts: [diff, qa] as Snapshot['artifacts'] } as Snapshot);
+    await flush();
+    const required = host.querySelector('[aria-label="Required checks"]')!;
+    expect(required.textContent).toContain('Unknown');
+    expect(required.textContent).toContain('could not be loaded or verified');
+    expect(required.textContent).not.toContain('Required checks are missing');
   });
 
   it('fetches and displays matching typed review from metadata-only snapshot artifacts', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
     const work = { id: 'work-1', projectId: project.id, title: 'QA metadata fetch', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
-    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { files: [], totalFiles: 0, truncated: false } };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { candidateRevision: 'commit-current', files: [], totalFiles: 0, truncated: false } };
     const binding = { candidateRunId: 'candidate-run', commitSha: 'commit-current', candidateFingerprint: 'a'.repeat(64), diffArtifactId: diff.id, diffRevision: diff.revision, qaArtifactIds: ['qa-matched'] };
     const reviewRun = { id: 'review-run', projectId: project.id, workId: work.id, prompt: 'Review', kind: 'review' as const, model: 'gpt-6.1-sol', reasoning: 'medium' as const, status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', reviewBinding: binding } as Snapshot['runs'][number];
     const qa = { id: 'qa-matched', projectId: project.id, workId: work.id, runId: reviewRun.id, kind: 'qa' as const, revision: diff.revision, createdAt: '2026-10-06T11:00:00.000Z', data: { verification: 'current', typedReview: { ...binding, disposition: 'changes_requested', findings: [{ id: 'finding', blocking: true, summary: 'Keep evidence bound' }], reviewerRunId: reviewRun.id } } };
     const diffMetadata = { id: diff.id, projectId: diff.projectId, workId: diff.workId, runId: diff.runId, kind: diff.kind, revision: diff.revision, createdAt: diff.createdAt };
     const qaMetadata = { id: qa.id, projectId: qa.projectId, workId: qa.workId, runId: qa.runId, kind: qa.kind, revision: qa.revision, createdAt: qa.createdAt };
     expect(diffMetadata).not.toHaveProperty('data'); expect(qaMetadata).not.toHaveProperty('data');
-    const artifactSpy = vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(qa);
-    await mount({ ...snapshot(), works: [work], runs: [reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
+    const artifactSpy = vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => id === diff.id ? diff : qa);
+    const candidateRun = { id: 'candidate-run', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun, reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
     await flush();
     expect(artifactSpy).toHaveBeenCalledWith(qa.id);
     expect(host.textContent).toContain('Typed review');
     expect(host.textContent).toContain('Keep evidence bound');
     expect(host.textContent).toContain('Current evidence');
+  });
+
+  it('keeps freshness separate from failed command results', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'Failed current checks', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { candidateRevision: 'commit-current', files: [], totalFiles: 0, truncated: false } };
+    const fingerprint = 'a'.repeat(64);
+    const commandQa = { id: 'qa-command', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'qa' as const, revision: diff.revision, createdAt: '2026-10-06T11:00:00.000Z', data: { verification: 'current', stale: false, candidateFingerprint: fingerprint, checks: [{ name: 'Focused check', command: 'pnpm test', exitCode: 1, testedRevision: fingerprint, output: 'assertion failed' }] } };
+    const candidateRun = { id: 'candidate-run', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
+    vi.spyOn(workbenchApi, 'artifact').mockImplementation(async id => id === diff.id ? diff : commandQa);
+    await mount({ ...snapshot(), works: [work], runs: [candidateRun], artifacts: [diff, commandQa] } as Snapshot);
+    await flush();
+    expect(host.textContent).toContain('Command checks');
+    expect(host.textContent).toContain('Current evidence');
+    expect(host.textContent).toContain('0 passed · 1 failed or unknown');
+    expect(host.querySelector('[aria-label="Command checks"]')?.textContent).not.toContain('Passed');
   });
 
 });

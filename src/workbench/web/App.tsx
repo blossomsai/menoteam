@@ -7,6 +7,7 @@ import { Textarea } from '../../local/web/src/components/ui/textarea';
 import { ProviderConnections } from './ProviderConnections';
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { isCausalMasterWake } from '../types';
+import { hasRequiredLocalQa } from '../local-qa';
 import { ApiError, workbenchApi, type Snapshot } from './api';
 import { canManageProject, filterWorks, readRoute, selectProject, selectWork, type Route, type View } from './routes';
 import { cancelInstructionsDraft, completeInstructionsSave, editInstructionsDraft, hasRemoteInstructionsUpdate, keepInstructionsDraft, startInstructionsDraft, useLatestInstructions } from './instructions-draft';
@@ -454,7 +455,7 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, settings, provider
   const [requestId,setRequestId]=useState(()=>crypto.randomUUID());const [deliveryBusy,setDeliveryBusy]=useState(false);
   const [reviewEvidence,setReviewEvidence]=useState<Artifact|null>(null);const [mergeRequestId,setMergeRequestId]=useState(()=>crypto.randomUUID());
   useEffect(() => {
-    if (tab === 'overview' || !latest) { setArtifact(null); setArtifactState('idle'); return; }
+    if (tab === 'overview' || tab === 'qa' || !latest) { setArtifact(null); setArtifactState('idle'); return; }
     let active = true; setArtifactState('loading'); setArtifact(null);
     void workbenchApi.artifact(latest.id).then(result => {
       if (!active) return;
@@ -474,6 +475,7 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, settings, provider
   const priorPr=[...runs].reverse().find(run=>run.kind==='delivery'&&run.operation?.action==='create_draft_pr'&&run.status==='completed'&&run.operation.phase==='pr_created');
   const typedReview=isRecord(reviewEvidence?.data)&&isRecord(reviewEvidence.data.typedReview)?reviewEvidence.data.typedReview:null;
   useEffect(()=>{if(tab!=='overview'||!priorPr)return;let active=true;const candidates=artifacts.filter(item=>item.kind==='qa'&&runs.some(run=>run.id===item.runId&&run.kind==='review'&&run.status==='completed'));void Promise.all(candidates.map(item=>workbenchApi.artifact(item.id).catch(()=>null))).then(values=>{if(active)setReviewEvidence(values.find(item=>item&&isRecord(item.data)&&isRecord(item.data.typedReview)&&item.data.typedReview.disposition==='approved'&&item.data.typedReview.candidateRunId===priorPr.operation?.candidateRunId&&item.data.typedReview.commitSha===priorPr.operation?.commitSha)??null);});return()=>{active=false;};},[tab,priorPr?.id,artifacts,runs]);
+  if(tab==='qa')return <QaEvidencePanel work={work} latestDiff={latestDiff} artifacts={artifacts} runs={runs}/>;
   if (tab === 'overview') {
     const latestRun = [...runs].filter(run => run.kind === 'implementation' || run.kind === 'review').sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     const execution = latestRun?.execution;
@@ -498,18 +500,115 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, settings, provider
     const legacyModelAvailable = !connectionId && legacyIdentityProven && Boolean(legacyRuntime?.available && legacyRuntime.models.includes(model) && !capabilityBlocked && !identityConflict);
     return <div className="space-y-6"><section><h2 className="mb-2 font-semibold">Current overview</h2><p className="whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground">{work.overview || 'No overview has been recorded yet.'}</p></section><section className="space-y-2"><h2 className="font-semibold">Execution selection</h2><dl className="grid gap-2 rounded-lg border p-3 text-sm sm:grid-cols-[9rem_minmax(0,1fr)]"><dt className="text-muted-foreground">Provider connection</dt><dd>{connectionLabel} · {connection?.status ?? (connectionId ? 'status unavailable' : legacyIdentityRecorded ? legacyRuntime?.available ? 'historical affinity' : 'historical ID recorded · unavailable' : 'not recorded')}</dd><dt className="text-muted-foreground">Connector</dt><dd className="break-all">{connectorId}</dd>{latestRun?.threadId && <><dt className="text-muted-foreground">Native thread</dt><dd className="break-all">{latestRun.threadId}</dd></>}<dt className="text-muted-foreground">Profile</dt><dd>{executionProfileLabel}</dd><dt className="text-muted-foreground">{latestRun?.handoffFromRunId ? 'Effective model' : 'Model'}</dt><dd>{model}</dd>{latestRun?.handoffFromRunId && typeof execution?.profile?.data.model === 'string' && <><dt className="text-muted-foreground">Profile model</dt><dd>{execution.profile.data.model} · unchanged</dd></>}</dl>{!modelAvailable && <p role="alert" className="text-sm text-destructive">{executionProblem}</p>}{latestRun?.handoffFromRunId && <p role="status" className="text-sm text-muted-foreground">Explicit model handoff from run {latestRun.handoffFromRunId}; the saved Agent profile and earlier run remain unchanged.</p>}{legacyModelAvailable && latestRun?.threadId && <p role="status" className="text-sm text-muted-foreground">This legacy Work continues on its recorded Connector and native thread. No connection record has been added and its binding cannot be changed here.</p>}{legacyModelAvailable && !latestRun?.threadId && <p role="status" className="text-sm text-muted-foreground">The historical Connector identity and model are available. No native thread was recorded for this run.</p>}</section>{deliveries.length>0&&<section className="space-y-2"><h2 className="font-semibold">Delivery</h2>{deliveries.map(item=><FullArtifactCard key={item.id} artifact={item}/>)}</section>}{priorPr&&typedReview&&<section className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"><div><strong className="text-sm">Merge reviewed pull request</strong><p className="text-xs text-muted-foreground">Approved review {String(typedReview.reviewerRunId)} · candidate {priorPr.operation?.commitSha}</p></div><Button disabled={deliveryBusy} onClick={async()=>{setDeliveryBusy(true);setError('');try{await workbenchApi.requestMergePr(work.id,{priorDeliveryRunId:priorPr.id,reviewRunId:String(typedReview.reviewerRunId),requestId:mergeRequestId});setMergeRequestId(crypto.randomUUID());await refresh();}catch(error){setError(errorMessage(error));}finally{setDeliveryBusy(false);}}}>{deliveryBusy?'Queueing…':'Queue merge'}</Button></section>}<section><h2 className="mb-2 font-semibold">Related</h2>{work.sources.length ? <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">{work.sources.map(source => <li key={source}>{source}</li>)}</ul> : <p className="text-sm text-muted-foreground">No related sources.</p>}</section></div>;
   }
-  return <section className="space-y-4"><header><h2 className="font-semibold">{tab === 'changes' ? 'Changes' : 'QA'}</h2><p className="mt-1 text-sm text-muted-foreground">{tab === 'changes' ? 'Recorded file changes from this Work.' : 'Checks and verification evidence for this Work.'}</p></header>
+  return <section className="space-y-4"><header><h2 className="font-semibold">Changes</h2><p className="mt-1 text-sm text-muted-foreground">Recorded file changes from this Work.</p></header>
     {tab==='changes'&&latestDiff&&(()=>{const candidate=runs.find(run=>run.id===latestDiff.runId&&run.kind==='implementation'&&run.status==='completed');const existing=runs.find(run=>run.kind==='delivery'&&run.targetRunId===candidate?.id);const retryable=existing&&['failed','interrupted','cancelled'].includes(existing.status);return <section className="flex flex-wrap items-center justify-between gap-3 rounded-lg border p-3"><div><strong className="text-sm">Draft pull request</strong><p className="text-xs text-muted-foreground">{existing?`Delivery ${existing.status}${existing.operation?.phase?` · ${existing.operation.phase}`:''}`:project.repositoryUrl?'Create a reviewable draft from this exact candidate.':'Connect a repository to enable delivery.'}</p></div>{candidate&&<Button disabled={deliveryBusy||(!retryable&&!!existing)||!project.repositoryUrl} onClick={async()=>{setDeliveryBusy(true);setError('');try{await workbenchApi.requestDraftPr(work.id,{candidateRunId:candidate.id,candidateRevision:latestDiff.revision,action:'create_draft_pr',requestId});setRequestId(crypto.randomUUID());await refresh();}catch(error){setError(errorMessage(error));}finally{setDeliveryBusy(false);}}}>{deliveryBusy?'Queueing…':retryable?'Retry Draft PR':existing?'Queued':'Create Draft PR'}</Button>}</section>;})()}
     {deliveries.map(item=><FullArtifactCard key={item.id} artifact={item}/>)}
-    {!selected.length && !relatedRuns.length && deliveries.length===0 ? <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">{tab === 'changes' ? 'No change evidence has been recorded yet.' : 'No QA evidence has been recorded yet.'}</div> : <>
+    {!selected.length && !relatedRuns.length && deliveries.length===0 ? <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">No change evidence has been recorded yet.</div> : <>
       {relatedRuns.map(run => <div key={run.id} className="rounded-lg border p-3"><div className="flex items-center justify-between gap-2"><strong className="text-sm">{run.kind === 'review' ? 'Review run' : 'Implementation run'}</strong><Badge variant="outline" className="capitalize">{run.status}</Badge></div>{run.error && <p className="mt-2 text-sm text-destructive">{run.error}</p>}<p className="mt-2 text-xs text-muted-foreground">Updated {new Date(run.updatedAt).toLocaleString()}</p></div>)}
       {selected.length > 0 && artifactState === 'loading' && <p role="status" className="rounded-lg border p-4 text-sm text-muted-foreground">Loading latest evidence…</p>}
       {artifactState === 'error' && <p role="alert" className="rounded-lg border border-destructive/30 p-4 text-sm text-destructive">Could not load the latest evidence.</p>}
-      {tab === 'qa' && artifactState === 'mismatch' && <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">The recorded QA evidence does not match the latest candidate. Run QA again for the latest changes.</p>}
-      {tab === 'qa' && !latest && artifacts.some(item => item.kind === 'qa') && <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">The recorded QA evidence does not match the latest candidate. Run QA again for the latest changes.</p>}
       {artifact && <ArtifactCard key={artifact.id} artifact={artifact} />}
     </>}
   </section>;
+}
+
+function QaEvidencePanel({work,latestDiff,artifacts,runs}:{work:Work;latestDiff:Artifact|undefined;artifacts:Artifact[];runs:Run[]}){
+  const candidate=latestDiff&&runs.find(run=>run.id===latestDiff.runId&&run.kind==='implementation');
+  const candidateReviews=runs.filter(run=>run.kind==='review'&&run.workId===work.id&&run.reviewBinding?.candidateRunId===candidate?.id&&run.reviewBinding?.diffRevision===latestDiff?.revision);
+  const latestBoundReview=[...candidateReviews].sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0];
+  const latestReview=latestBoundReview??[...runs].filter(run=>run.kind==='review'&&run.workId===work.id).sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0];
+  const metadata=artifacts.filter(item=>item.kind==='qa'&&item.workId===work.id&&(item.runId===candidate?.id||item.runId===latestReview?.id));
+  const requestKey=[latestDiff?.id??'',latestDiff?.runId??'',latestDiff?.revision??'',...metadata.map(item=>item.id).sort()].join(':');
+  const [loaded,setLoaded]=useState<Record<string,Artifact>>({});
+  const [failed,setFailed]=useState<string[]>([]);
+  const [loading,setLoading]=useState(false);
+  useEffect(()=>{
+    let active=true;
+    if(!latestDiff){setLoaded({});setFailed([]);setLoading(false);return()=>{active=false;};}
+    const ids=[latestDiff.id,...metadata.map(item=>item.id)];
+    const expected=new Map< string,Artifact>([[latestDiff.id,latestDiff],...metadata.map(item=>[item.id,item] as [string,Artifact])]);
+    setLoaded({});setFailed([]);setLoading(true);
+    void Promise.all(ids.map(async id=>{try{return await workbenchApi.artifact(id);}catch{return null;}})).then(results=>{
+      if(!active)return;
+      const next:Record<string,Artifact>={};const missing:string[]=[];
+      results.forEach((result,index)=>{const id=ids[index]!,reference=expected.get(id);if(!result||!reference||result.id!==id||result.workId!==work.id||result.projectId!==work.projectId||result.runId!==reference.runId||result.kind!==reference.kind||result.revision!==reference.revision)missing.push(id);else next[id]=result;});
+      setLoaded(next);setFailed(missing);setLoading(false);
+    });
+    return()=>{active=false;};
+  },[requestKey,work.id,work.projectId]);
+
+  const diff=latestDiff?loaded[latestDiff.id]:undefined;
+  const diffData=isRecord(diff?.data)?diff.data:{};
+  const commitSha=typeof diffData.candidateRevision==='string'?diffData.candidateRevision:undefined;
+  const candidateQa=metadata.filter(item=>item.runId===candidate?.id).map(item=>loaded[item.id]).filter((item):item is Artifact=>Boolean(item));
+  const currentCandidateQa=candidateQa.filter(item=>item.revision===latestDiff?.revision).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
+  const localQa=currentCandidateQa.find(item=>isRecord(item.data)&&item.data.localQaContract==='project-local-qa/v2')??candidateQa.find(item=>isRecord(item.data)&&item.data.localQaContract==='project-local-qa/v2');
+  const localData=isRecord(localQa?.data)?localQa.data:{};
+  const localChecks=Array.isArray(localData.checks)?localData.checks.filter(isRecord):[];
+  const localFingerprint=typeof localData.candidateFingerprint==='string'?localData.candidateFingerprint:undefined;
+  const policy=candidate?.qaPolicySnapshot;
+  const localCurrent=Boolean(localQa&&latestDiff&&candidate&&localQa.runId===candidate.id&&localQa.revision===latestDiff.revision&&localData.localQaContract==='project-local-qa/v2'&&localData.verification==='current'&&localData.stale===false&&localFingerprint&&/^[a-f0-9]{64}$/u.test(localFingerprint)&&localChecks.length>0&&localChecks.every(check=>check.testedRevision===localFingerprint));
+  const localFailed=localChecks.filter(check=>check.exitCode!==0).length;
+  let requiredStatus:'Not configured'|'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
+  if(!policy)requiredStatus='Not configured';
+  else if(!localQa&&candidate&&candidate.status!=='completed')requiredStatus='Pending';
+  else if(!localQa&&failed.some(id=>metadata.some(item=>item.id===id&&item.runId===candidate?.id)))requiredStatus='Unknown';
+  else if(!localQa)requiredStatus='Missing';
+  else if(localData.stale===true||localData.verification==='stale'||localQa.revision!==latestDiff?.revision)requiredStatus='Stale';
+  else if(localCurrent)requiredStatus='Current';
+  else requiredStatus='Unknown';
+  const localRequirementMet=Boolean(localCurrent&&policy&&localFingerprint&&hasRequiredLocalQa(localData,localFingerprint,policy));
+  const requiredDetail=!policy?'No required-check policy was recorded.':requiredStatus==='Pending'?'Required checks have not finished.':requiredStatus==='Unknown'?'Required checks could not be loaded or verified.':requiredStatus==='Missing'?'Required checks are missing for this candidate.':requiredStatus==='Stale'?'Recorded required checks do not match this candidate.':localRequirementMet?`${localChecks.length} required checks recorded · requirements met`:localFailed?`${localChecks.length} required checks recorded · ${localFailed} failed or unknown`:`${localChecks.length} required checks recorded · required checks are incomplete`;
+
+  const commandQa=currentCandidateQa.find(item=>{const data=isRecord(item.data)?item.data:{};return Array.isArray(data.checks)&&data.localQaContract!=='project-local-qa/v2'&&!isRecord(data.typedReview);})
+    ??candidateQa.find(item=>{const data=isRecord(item.data)?item.data:{};return Array.isArray(data.checks)&&data.localQaContract!=='project-local-qa/v2'&&!isRecord(data.typedReview);});
+  const commandData=isRecord(commandQa?.data)?commandQa.data:{};
+  const commandChecks=Array.isArray(commandData.checks)?commandData.checks.filter(isRecord):[];
+  const commandFingerprint=typeof commandData.candidateFingerprint==='string'?commandData.candidateFingerprint:undefined;
+  const commandCurrent=Boolean(commandQa&&latestDiff&&candidate&&commandQa.runId===candidate.id&&commandQa.revision===latestDiff.revision&&commandData.verification==='current'&&commandData.stale===false&&commandFingerprint&&/^[a-f0-9]{64}$/u.test(commandFingerprint)&&commandChecks.length>0&&commandChecks.every(check=>check.testedRevision===commandFingerprint));
+  let commandStatus:'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
+  if(!commandQa&&candidate&&candidate.status!=='completed')commandStatus='Pending';
+  else if(!commandQa&&failed.some(id=>metadata.some(item=>item.id===id&&item.runId===candidate?.id)))commandStatus='Unknown';
+  else if(!commandQa)commandStatus='Missing';
+  else if(commandData.stale===true||commandData.verification==='stale'||commandQa.revision!==latestDiff?.revision)commandStatus='Stale';
+  else if(commandCurrent)commandStatus='Current';
+  else commandStatus='Unknown';
+  const commandDetail=commandQa?`${checksDetail(commandChecks)}${commandCurrent?' · bound to this candidate':''}`:commandStatus==='Pending'?'Command checks have not finished.':commandStatus==='Unknown'?'Command-check evidence could not be loaded or verified.':'No command-check evidence is recorded.';
+  const commandPassed=commandChecks.filter(check=>check.exitCode===0).length;
+  const commandFailed=commandChecks.filter(check=>check.exitCode!==0).length;
+
+  const reviewRun=latestReview;
+  const reviewMetadata=reviewRun&&metadata.find(item=>item.runId===reviewRun.id);
+  const reviewArtifact=reviewMetadata?loaded[reviewMetadata.id]:undefined;
+  const reviewData=isRecord(reviewArtifact?.data)&&isRecord(reviewArtifact.data.typedReview)?reviewArtifact.data.typedReview:{};
+  const binding=reviewRun?.reviewBinding;
+  const reviewMatches=Boolean(candidate&&latestDiff&&commitSha&&reviewRun?.status==='completed'&&binding&&binding.candidateRunId===candidate.id&&binding.diffRevision===latestDiff.revision&&binding.commitSha===commitSha&&/^[a-f0-9]{64}$/u.test(binding.candidateFingerprint)&&reviewArtifact?.revision===latestDiff.revision&&reviewData.candidateRunId===candidate.id&&reviewData.diffRevision===latestDiff.revision&&reviewData.commitSha===commitSha&&reviewData.candidateFingerprint===binding.candidateFingerprint&&reviewData.reviewerRunId===reviewRun.id&&reviewData.disposition&&['approved','changes_requested','insufficient_evidence'].includes(String(reviewData.disposition)));
+  let reviewStatus:'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
+  if(!reviewRun)reviewStatus='Missing';
+  else if(['queued','running'].includes(reviewRun.status))reviewStatus='Pending';
+  else if(binding?.candidateRunId!==candidate?.id||binding?.diffRevision!==latestDiff?.revision)reviewStatus='Stale';
+  else if(reviewArtifact&&!reviewMatches)reviewStatus='Stale';
+  else if(reviewMatches)reviewStatus='Current';
+  else if(failed.some(id=>metadata.some(item=>item.id===id&&item.runId===reviewRun.id)))reviewStatus='Unknown';
+  else if(reviewRun.status==='completed')reviewStatus='Missing';
+  const statusVariant=(status:string)=>status==='Current'?'secondary':status==='Stale'?'destructive':'outline';
+  function checksDetail(checks:Record<string,unknown>[]) { return checks.length?`${checks.filter(check=>check.exitCode===0).length} passed · ${checks.filter(check=>check.exitCode!==0).length} failed or unknown`:'No checks recorded'; }
+  return <section className="space-y-4"><header><h2 className="font-semibold">QA</h2><p className="mt-1 text-sm text-muted-foreground">Evidence is shown separately for the latest candidate.</p></header>
+    {!latestDiff?<p className="rounded-lg border border-dashed p-5 text-sm text-muted-foreground">No candidate changes are recorded. QA status is unknown.</p>:<>
+      <p className="break-all rounded-md bg-muted/40 p-3 text-xs text-muted-foreground">Current candidate · {candidate?.id??latestDiff.runId} · {commitSha??'commit unavailable'}</p>
+      {loading&&<p role="status" className="text-sm text-muted-foreground">Loading candidate evidence…</p>}
+      {failed.length>0&&!loading&&<p role="status" className="text-sm text-muted-foreground">Some evidence could not be loaded. Those results remain unknown.</p>}
+      <EvidenceSection title="Required checks" status={requiredStatus} detail={requiredDetail}/>
+      <EvidenceSection title="Command checks" status={commandStatus} detail={commandDetail}/>
+      <section className="space-y-2 rounded-lg border p-3"><header className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">Typed review</h3><Badge variant={statusVariant(reviewStatus)}>{reviewStatus==='Current'?'Current evidence':reviewStatus}</Badge></header><p className="text-sm text-muted-foreground">{reviewRun?`Run ${reviewRun.id} · ${reviewMatches?String(reviewData.disposition):reviewStatus==='Stale'?'does not match the latest candidate':'result unavailable'}`:'No review is recorded.'}</p>{reviewMatches&&Array.isArray(reviewData.findings)&&reviewData.findings.map((item,index)=>isRecord(item)?<p key={String(item.id??index)} className="text-sm">{item.blocking===true?'Blocking · ':''}{String(item.summary??'Finding')}</p>:null)}{reviewStatus==='Stale'&&<p className="text-xs text-amber-800">This review does not match the latest candidate and cannot approve it.</p>}</section>
+      <details className="rounded-lg border"><summary className="cursor-pointer px-3 py-2 text-sm">Evidence details</summary><div className="space-y-3 p-3">{diff&&<ArtifactCard artifact={diff}/ >}{localQa&&loaded[localQa.id]&&<ArtifactCard artifact={loaded[localQa.id]!}/ >}{commandQa&&loaded[commandQa.id]&&<ArtifactCard artifact={loaded[commandQa.id]!}/ >}{reviewArtifact&&reviewMatches&&<ArtifactCard artifact={reviewArtifact}/>}</div></details>
+    </>}
+  </section>;
+}
+
+function EvidenceSection({title,status,detail}:{title:string;status:string;detail:string}){
+  const variant=status==='Current'?'secondary':status==='Stale'?'destructive':'outline';
+  return <section aria-label={title} className="space-y-2 rounded-lg border p-3"><header className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">{title}</h3><Badge variant={variant}>{status==='Current'?'Current evidence':status}</Badge></header><p className="text-sm text-muted-foreground">{detail}</p></section>;
 }
 
 function FullArtifactCard({artifact}:{artifact:Artifact}){const [full,setFull]=useState<Artifact|null>(null);useEffect(()=>{let active=true;void workbenchApi.artifact(artifact.id).then(value=>{if(active)setFull(value);}).catch(()=>undefined);return()=>{active=false;};},[artifact.id]);return full?<ArtifactCard artifact={full}/>:<p className="rounded-lg border p-3 text-sm text-muted-foreground">Loading delivery evidence…</p>;}
