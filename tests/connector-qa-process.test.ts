@@ -13,8 +13,8 @@ import type { WorkbenchConnectorClient } from '../src/connector/client.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
 function resource(){const policy=qaPolicyFixture();policy.resource!.database=`controlled_${randomUUID().replaceAll('-','')}_test`;return policy;}
 const descendantScript=`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});require('node:fs').writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,descendant:child.pid}));setInterval(()=>{},1000);`;
-async function recovery(directory:string){let acknowledgements=0,runner:ConnectorRunner;
-  const client={readRun:async()=>({id:'qa-run',generation:1,status:'interrupted'}),stopped:async()=>{acknowledgements++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
+async function recovery(directory:string,qaPolicySnapshot:ReturnType<typeof qaPolicyFixture>){let acknowledgements=0,runner:ConnectorRunner;
+  const client={readRun:async()=>({id:'qa-run',generation:1,status:'interrupted',qaPolicySnapshot}),stopped:async()=>{acknowledgements++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
   runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
   await runner.run();return acknowledgements;
 }
@@ -86,23 +86,23 @@ describe('controlled REAL child process and cross-process resource proofs (opera
     const saved=(await readJson<QaExecution>(old.stateFile))!;expect(saved.phase).toBe('stopped');
     const spool={runId:'qa-run',generation:1,events:[],artifacts:[],qaInFlight:true,qaExecution:saved};
     const file=path.join(f.directory,'spool',`${stateKey('qa-run','1')}.json`);await writeSecureJson(file,spool);
-    expect(await recovery(f.directory)).toBe(0);expect(await readJson(file)).toEqual(spool);
+    expect(await recovery(f.directory,policy)).toBe(0);expect(await readJson(file)).toEqual(spool);
     await expect(releaseQaResource(saved)).rejects.toThrow('executor stop proof');
     const blocked=await f.parent(f.state(),policy,'lock');expect(await blocked.closed).toBe(1);
     await expect(readFile(marker)).rejects.toMatchObject({code:'ENOENT'});
-    await f.stopParent(old.entry);expect(await recovery(f.directory)).toBe(1);
+    await f.stopParent(old.entry);expect(await recovery(f.directory,policy)).toBe(1);
     await expect(readFile(marker)).rejects.toMatchObject({code:'ENOENT'});
     const next=await f.parent(f.state(),policy,'lock');await f.until(async()=>next.output.includes('owned'));next.child.stdin!.write('release');expect(await next.closed).toBe(0);
   },qaFixtureBudget(40_000)),40_000);
   it.each(['revoked','changed-resource'])('blocks real repository GO after %s without losing stop/ownership proof',async mode=>qaProcessFixture(async f=>{
     const execution=f.state(),policy=resource(),marker=path.join(f.directory,'must-not-go');
-    await acquireQaResource(execution,policy);await claimQaResource(execution);
+    await acquireQaResource(execution,policy);await claimQaResource(execution,policy);
     const ownerFile=path.join(execution.resourceLock!.directory,'owner.json'),owner=await readJson(ownerFile);
     try{
       const result=f.track(runQaCommand(execution,process.execPath,['-e',"require('node:fs').writeFileSync(process.argv[1],'bad')",marker],f.directory,qaChildEnvironment(),10_000,()=>writeSecureJson(path.join(f.directory,'state.json'),execution),f.abort.signal,async()=>{
         if(mode==='revoked')throw Error('revoked lease/policy');
         await writeSecureJson(ownerFile,{...(owner as object),owner:'forged replacement'});
-      }));
+      },policy));
       await expect(result).rejects.toThrow(mode==='revoked'?'revoked':'no GO');
       await expect(readFile(marker)).rejects.toMatchObject({code:'ENOENT'});expect(await stopQaExecution(execution)).toBe(true);
     }finally{await writeSecureJson(ownerFile,owner);} // Restore only this fixture's deliberate nonce corruption.

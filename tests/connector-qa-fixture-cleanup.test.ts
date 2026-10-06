@@ -17,7 +17,7 @@ describe('fixture teardown ownership contract (mocked identities, no processes o
     const current={pid:process.pid,processGroupId:process.pid,startedAt:'test-parent',command:'contract-fixture'},child={pid:424242,processGroupId:424242,startedAt:'test-child',command:'node qa-child.js'};
     const read=vi.spyOn(processes,'readProcessIdentity').mockResolvedValue(current),wait=vi.spyOn(processes,'waitProcessGroup').mockResolvedValue(true),kill=vi.spyOn(process,'kill').mockReturnValue(true);
     try{
-      await acquireQaResource(execution,policy);await claimQaResource(execution);
+      await acquireQaResource(execution,policy);await claimQaResource(execution,policy);
       execution.identity=child;execution.phase='running';fixture.observed.push({...child,pid:424243});
       const ownerFile=path.join(execution.resourceLock!.directory,'owner.json');
       await expect(fixture.cleanup(cleanupDeadline())).rejects.toThrow('stop proof unknown');expect(JSON.parse(await readFile(ownerFile,'utf8')).owner).toBe(execution.nonce);

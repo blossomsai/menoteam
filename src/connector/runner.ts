@@ -9,7 +9,7 @@ import { assertExecutionSelection } from './selection.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
 import { createDraftPullRequest } from './github-draft-pr.js';
 import { captureRequiredLocalQa } from './local-qa.js';
-import { bindQaExecutor,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
+import { assertQaResourcePolicy,bindQaExecutor,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
 import { savedQaPolicy,sameQaPolicy } from '../workbench/local-qa.js';
 import { mergePullRequest } from './github-merge-pr.js';
 import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
@@ -137,7 +137,7 @@ export class ConnectorRunner {
       // PID reuse/permission errors and legacy spools without executor identity fail closed.
       if(spool.qaInFlight){
         if(!spool.qaExecution||!qaExecutorStopped(spool.qaExecution)||!await stopQaExecution(spool.qaExecution))continue;
-        try{await releaseQaResource(spool.qaExecution);}catch{continue;}
+        try{assertQaResourcePolicy(spool.qaExecution,remote.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);}catch{continue;}
         spool.qaExecution.phase='stopped';spool.qaInFlight=false;spool.stopped=true;await this.save(spool);
       }
       if (['completed','failed'].includes(remote.status)) { await this.retainOrRemove(spool); continue; }
@@ -288,7 +288,7 @@ export class ConnectorRunner {
     } catch (error) {
       if(spool.qaInFlight){
         if(!spool.qaExecution||!await stopQaExecution(spool.qaExecution)){await this.save(spool);throw new Error('Fixed QA stop is unconfirmed; preserve the Work reservation for operator reconciliation');}
-        await releaseQaResource(spool.qaExecution);spool.qaInFlight=false;await this.save(spool);
+        assertQaResourcePolicy(spool.qaExecution,claim.run.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);spool.qaInFlight=false;await this.save(spool);
       }
       if (!(error instanceof ConnectorHttpError)) {
         const cause=error as {nativeStage?:string;nativeCategory?:string;nativeCode?:number;message?:string};

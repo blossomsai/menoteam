@@ -4,7 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fingerprint } from './git.js';
 import { hasRequiredLocalQa, qaMetrics, LOCAL_QA_CONTRACT, type FixedQaCheck, type QaPolicy } from '../workbench/local-qa.js';
-import { bindQaExecutor, acquireQaResource, authorizedQaResource, claimQaResource, QaResourceContention, qaChildEnvironment, releaseQaResource, runQaCommand, stopQaExecution, type QaExecution, type QaResourceConfig } from './qa-process.js';
+import { assertQaResourcePolicy,bindQaExecutor, acquireQaResource, authorizedQaResource, claimQaResource, QaResourceContention, qaChildEnvironment, releaseQaResource, runQaCommand, stopQaExecution, type QaExecution, type QaResourceConfig } from './qa-process.js';
 
 export async function captureRequiredLocalQa(cwd:string,options:{policy?:QaPolicy;resources:Record<string,QaResourceConfig>;dataDirectory:string;save:(state:QaExecution)=>Promise<void>;authorize?:()=>Promise<void>;state?:QaExecution;signal?:AbortSignal}) {
   const {policy,signal}=options;
@@ -20,9 +20,9 @@ export async function captureRequiredLocalQa(cwd:string,options:{policy?:QaPolic
   let acquired=false;let failure:unknown;
   try {
     await bindQaExecutor(state);await acquireQaResource(state,policy);await save();
-    try{await claimQaResource(state);acquired=true;await save();}catch(error){
+    try{await claimQaResource(state,policy);acquired=true;await save();}catch(error){
       // A contended resource never starts QA or releases someone else's ownership.
-      if(error instanceof QaResourceContention){state.resourceLock=undefined;state.resourceLocks=undefined;await save();return unavailable();}
+      if(error instanceof QaResourceContention){state.resourceLock=undefined;state.resourceLocks=undefined;state.expectedResourceDirectories=[];await save();return unavailable();}
       throw error;
     }
     await options.authorize?.();
@@ -35,7 +35,7 @@ export async function captureRequiredLocalQa(cwd:string,options:{policy?:QaPolic
         const executable=command.executable==='node'?process.execPath:path.join(cwd,'node_modules','.bin',command.bin!);
         const args=command.args.map(arg=>arg.replaceAll('{reportFile}',reportFile).replaceAll('{outputDir}',temporary));
         await options.authorize?.();signal?.throwIfAborted();
-        const result=await runQaCommand(state,executable,args,cwd,qaChildEnvironment(resourceUrl,providerUrl),command.timeoutMs,save,signal,options.authorize);
+        const result=await runQaCommand(state,executable,args,cwd,qaChildEnvironment(resourceUrl,providerUrl),command.timeoutMs,save,signal,options.authorize,policy);
         output+=result.output;exitCode=result.exitCode;if(exitCode!==0)break;
       }
       const after=await fingerprint(cwd),finishedAt=new Date().toISOString();
@@ -57,7 +57,7 @@ export async function captureRequiredLocalQa(cwd:string,options:{policy?:QaPolic
   }catch(error){failure=error;throw error;}finally{
     // Includes abort/timeout/crash: do not clear the spool or resource until actual group stop proof.
     if(!await stopQaExecution(state)){await save();throw new Error('QA stop is unconfirmed; preserve resource and Work reservation',{cause:failure});}
-    if(acquired)await releaseQaResource(state);
+    if(acquired){assertQaResourcePolicy(state,policy);await releaseQaResource(state);}
     state.phase='stopped';await save();await rm(temporary,{recursive:true,force:true});
   }
 }

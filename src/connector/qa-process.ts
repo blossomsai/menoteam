@@ -8,9 +8,36 @@ import { modelChildEnvironment, readProcessIdentity, terminateProcessGroup, wait
 import { readJson, stateKey, writeSecureJson } from './state.js';
 import type { QaPolicy } from '../workbench/local-qa.js';
 
-export type QaExecution = { directory:string; nonce:string; executor?:CodexProcessIdentity; phase:'starting'|'running'|'stopped'; identity?:CodexProcessIdentity; identityFile?:string; resourceLock?:{directory:string;owner:string};resourceLocks?:{directory:string;owner:string}[] };
+export type QaExecution = { directory:string; nonce:string; executor?:CodexProcessIdentity; phase:'starting'|'running'|'stopped'; identity?:CodexProcessIdentity; identityFile?:string; resourceLock?:{directory:string;owner:string};resourceLocks?:{directory:string;owner:string}[];expectedResourceDirectories?:string[] };
 export type QaResourceConfig = {url:string};
 export class QaResourceContention extends Error {}
+const RESOURCE_ROOT=path.join('/tmp','menoteam-qa-resources');
+function assertResourceSet(state:QaExecution):void {
+  const validDirectory=(value:unknown):value is string=>typeof value==='string'&&path.dirname(value)===RESOURCE_ROOT&&/^[a-f0-9]{64}$/u.test(path.basename(value));
+  const expected=state.expectedResourceDirectories;
+  const explicit=state.resourceLocks!==undefined;
+  if(explicit&&(!Array.isArray(state.resourceLocks)||state.resourceLocks.length===0||state.resourceLock||!Array.isArray(expected)))throw new Error('QA resource ownership set is invalid; no GO or release permitted');
+  const locks=explicit?state.resourceLocks!:(state.resourceLock?[state.resourceLock]:[]);
+  if(typeof state.nonce!=='string'||!state.nonce||locks.some(lock=>!lock||!validDirectory(lock.directory)||lock.owner!==state.nonce)||new Set(locks.map(lock=>lock.directory)).size!==locks.length)throw new Error('QA resource ownership set is invalid; no GO or release permitted');
+  if(expected!==undefined){
+    const directories=locks.map(lock=>lock.directory).sort();
+    if(!Array.isArray(expected)||expected.some(value=>!validDirectory(value))||new Set(expected).size!==expected.length||JSON.stringify(expected)!==JSON.stringify([...expected].sort())||JSON.stringify(directories)!==JSON.stringify(expected))throw new Error('QA resource ownership set does not match frozen intent; no GO or release permitted');
+  }
+  // Only old single-resource/no-resource states lack this new persisted expectation.
+}
+function singleResourceState(state:QaExecution,lock:{directory:string;owner:string}):QaExecution {
+  return {...state,resourceLocks:undefined,resourceLock:lock,expectedResourceDirectories:[lock.directory]};
+}
+export function assertQaResourcePolicy(state:QaExecution,policy?:QaPolicy):void {
+  assertResourceSet(state);
+  if(!policy){
+    if(state.resourceLocks!==undefined||(state.expectedResourceDirectories?.length??0)>0)throw new Error('Frozen QA resource policy unavailable; retain reservations');
+    return; // Legacy single-resource recovery and generic unconfigured/no-DB state.
+  }
+  const expected=[...new Set([policy.resource,policy.providerResource].filter(resource=>!!resource).map(resource=>path.join(RESOURCE_ROOT,stateKey(resource!.hostname==='localhost'?'127.0.0.1':resource!.hostname,String(resource!.port),resource!.database))))].sort();
+  const actual=(state.resourceLocks??(state.resourceLock?[state.resourceLock]:[])).map(lock=>lock.directory).sort();
+  if(JSON.stringify(actual)!==JSON.stringify(expected))throw new Error('QA resource ownership does not match frozen policy; no GO or release permitted');
+}
 export function qaChildEnvironment(resourceUrl?:string,providerUrl?:string):NodeJS.ProcessEnv {
   // Reuse the Codex boundary; never inherit ambient database or Connector credential locations.
   const isolated=modelChildEnvironment();
@@ -45,7 +72,8 @@ export function qaExecutorStopped(state:QaExecution):boolean {
   try{process.kill(state.executor.pid,0);return false;}catch(error){return (error as NodeJS.ErrnoException).code==='ESRCH';}
 }
 export async function assertQaOwnership(state:QaExecution):Promise<void> {
-  if(state.resourceLocks){for(const lock of state.resourceLocks)await assertQaOwnership({...state,resourceLocks:undefined,resourceLock:lock});return;}
+  assertResourceSet(state);
+  if(state.resourceLocks){for(const lock of state.resourceLocks)await assertQaOwnership(singleResourceState(state,lock));return;}
   if(!sameIdentity(state.executor,await readProcessIdentity(process.pid)))throw new Error('Original QA executor ownership unavailable');
   if(!state.resourceLock)return;
   const owner=await readJson<{owner:string;executionDirectory:string;executor:CodexProcessIdentity}>(path.join(state.resourceLock.directory,'owner.json'));
@@ -54,23 +82,24 @@ export async function assertQaOwnership(state:QaExecution):Promise<void> {
 export async function acquireQaResource(state:QaExecution,policy:QaPolicy):Promise<void> {
   if(policy.providerResource){
     const locks:NonNullable<QaExecution['resourceLocks']>=[];
-    for(const resource of [policy.resource!,policy.providerResource]){const single={...state,resourceLocks:undefined,resourceLock:undefined};await acquireQaResource(single,{...policy,resource,providerResource:undefined});if(single.resourceLock)locks.push(single.resourceLock);}
-    state.resourceLock=undefined;state.resourceLocks=[...new Map(locks.map(lock=>[lock.directory,lock])).values()].sort((a,b)=>a.directory.localeCompare(b.directory));return;
+    for(const resource of [policy.resource!,policy.providerResource]){const single={...state,resourceLocks:undefined,resourceLock:undefined,expectedResourceDirectories:undefined};await acquireQaResource(single,{...policy,resource,providerResource:undefined});if(single.resourceLock)locks.push(single.resourceLock);}
+    state.resourceLock=undefined;state.resourceLocks=[...new Map(locks.map(lock=>[lock.directory,lock])).values()].sort((a,b)=>a.directory.localeCompare(b.directory));state.expectedResourceDirectories=state.resourceLocks.map(lock=>lock.directory);return;
   }
   if(!policy.resource)return;
   const r=policy.resource;
   // Global on this host, not per Work/Connector. Persistent ownership survives parent death.
-  const root=path.join('/tmp','menoteam-qa-resources');
+  const root=RESOURCE_ROOT;
   await mkdir(root,{recursive:true,mode:0o700});
   const meta=await lstat(root);if(!meta.isDirectory()||meta.isSymbolicLink()||(meta.mode&0o077)!==0||meta.uid!==(process.getuid?.()??meta.uid))throw new Error('QA resource lock directory is not private');
   const directory=path.join(root,stateKey(r.hostname==='localhost'?'127.0.0.1':r.hostname,String(r.port),r.database));
   // Persist the intended owner before mkdir. Never steal a lock, including an incomplete lock.
-  state.resourceLock={directory,owner:state.nonce};
+  state.resourceLock={directory,owner:state.nonce};state.expectedResourceDirectories=[directory];
 }
 /** One small filesystem critical section for this same resource, across Connector processes.
  * A crashed/incomplete guard is deliberately not stolen. It needs operator stop reconciliation. */
 async function withResourceGuard<T>(state:QaExecution,action:()=>Promise<T>):Promise<T> {
-  if(state.resourceLocks){const locks=state.resourceLocks;const visit=(index:number):Promise<T>=>index===locks.length?action():withResourceGuard({...state,resourceLocks:undefined,resourceLock:locks[index]},()=>visit(index+1));return visit(0);}
+  assertResourceSet(state);
+  if(state.resourceLocks){const locks=state.resourceLocks;const visit=(index:number):Promise<T>=>index===locks.length?action():withResourceGuard(singleResourceState(state,locks[index]!),()=>visit(index+1));return visit(0);}
   if(!state.resourceLock)return action();
   const executor=await readProcessIdentity(process.pid);
   if(!validExecutor(executor))throw new Error('QA guard executor identity unavailable');
@@ -88,23 +117,28 @@ async function withResourceGuard<T>(state:QaExecution,action:()=>Promise<T>):Pro
 export async function withQaOwnership<T>(state:QaExecution,action:()=>Promise<T>):Promise<T> {
   return withResourceGuard(state,async()=>{await assertQaOwnership(state);return action();});
 }
-export async function claimQaResource(state:QaExecution):Promise<void> {
+export async function claimQaResource(state:QaExecution,policy?:QaPolicy):Promise<void> {
+  assertResourceSet(state);
+  assertQaResourcePolicy(state,policy);
   await bindQaExecutor(state);
   if(state.resourceLocks){
     const claimed:typeof state.resourceLocks=[];
-    try{for(const lock of state.resourceLocks){await claimQaResource({...state,resourceLocks:undefined,resourceLock:lock});claimed.push(lock);}}
+    try{for(const lock of state.resourceLocks){await claimSingleQaResource(singleResourceState(state,lock));claimed.push(lock);}}
     catch(error){
       // Only a known contention proves the failed lock was never acquired. I/O/persistence
       // failures keep every intent in the spool, including a possibly incomplete owner.
       if(error instanceof QaResourceContention){
-        try{for(const lock of [...claimed].reverse())await releaseQaResource({...state,resourceLocks:undefined,resourceLock:lock});}
+        try{for(const lock of [...claimed].reverse())await releaseQaResource(singleResourceState(state,lock));}
         catch(cause){throw new Error('QA partial acquisition rollback is unconfirmed; retain all resource intents',{cause});}
-        state.resourceLocks=undefined;
+        state.resourceLocks=undefined;state.expectedResourceDirectories=[];
       }
       throw error;
     }
     return;
   }
+  await claimSingleQaResource(state);
+}
+async function claimSingleQaResource(state:QaExecution):Promise<void>{
   if(!state.resourceLock)return;
   await withResourceGuard(state,async()=>{
     try{await mkdir(state.resourceLock!.directory,{mode:0o700});}catch(error){if((error as NodeJS.ErrnoException).code==='EEXIST')throw new QaResourceContention('Disposable QA resource is owned by another execution; no command started');throw error;}
@@ -112,17 +146,23 @@ export async function claimQaResource(state:QaExecution):Promise<void> {
   });
 }
 export async function releaseQaResource(state:QaExecution):Promise<void> {
-  if(state.resourceLocks){for(const lock of [...state.resourceLocks].reverse()){await releaseQaResource({...state,resourceLocks:undefined,resourceLock:lock});state.resourceLocks=state.resourceLocks.filter(value=>value.directory!==lock.directory);}state.resourceLocks=undefined;return;}
+  assertResourceSet(state);
+  if(state.resourceLocks){
+    // Retain the complete persisted intent until every release is confirmed. A retry can
+    // confirm an absent lock only after the same original-parent/child stop proofs.
+    for(const lock of [...state.resourceLocks].reverse())await releaseQaResource(singleResourceState(state,lock));
+    state.resourceLocks=undefined;state.expectedResourceDirectories=[];return;
+  }
   if(!state.resourceLock)return;
   await withResourceGuard(state,async()=>{
     // A stopped command is insufficient: only the original live owner or a proven dead owner can release.
     if(state.executor?.pid===process.pid){if(!sameIdentity(state.executor,await readProcessIdentity(process.pid)))throw new Error('Original QA executor identity changed');}
     else if(!qaExecutorStopped(state))throw new Error('Original QA executor stop proof missing; retain resource ownership');
     if(!await stopQaExecution(state))throw new Error('QA resource cannot be released before child stop proof');
-    try{await lstat(state.resourceLock!.directory);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){state.resourceLock=undefined;return;}throw error;}
+    try{await lstat(state.resourceLock!.directory);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){state.resourceLock=undefined;state.expectedResourceDirectories=[];return;}throw error;}
     const owner=await readJson<{owner:string;executionDirectory:string;executor:CodexProcessIdentity}>(path.join(state.resourceLock!.directory,'owner.json'));
     if(state.resourceLock!.owner!==state.nonce||owner?.owner!==state.resourceLock!.owner||owner.executionDirectory!==state.directory||!sameIdentity(owner.executor,state.executor))throw new Error('QA resource ownership cannot be proven; retain reservation');
-    await rm(state.resourceLock!.directory,{recursive:true});state.resourceLock=undefined;
+    await rm(state.resourceLock!.directory,{recursive:true});state.resourceLock=undefined;state.expectedResourceDirectories=[];
   });
 }
 export async function stopQaExecution(state:QaExecution):Promise<boolean> {
@@ -134,7 +174,8 @@ export async function stopQaExecution(state:QaExecution):Promise<boolean> {
   if(!current||current.startedAt!==identity.startedAt||current.command!==identity.command||current.processGroupId!==identity.processGroupId)return false;
   try{return await terminateProcessGroup(identity.processGroupId,100);}catch{return false;}
 }
-export async function runQaCommand(state:QaExecution,executable:string,args:string[],cwd:string,env:NodeJS.ProcessEnv,timeoutMs:number,save:()=>Promise<void>,signal?:AbortSignal,beforeGo:()=>Promise<void>=async()=>{}):Promise<{exitCode:number|null;output:string}> {
+export async function runQaCommand(state:QaExecution,executable:string,args:string[],cwd:string,env:NodeJS.ProcessEnv,timeoutMs:number,save:()=>Promise<void>,signal?:AbortSignal,beforeGo:()=>Promise<void>=async()=>{},policy?:QaPolicy):Promise<{exitCode:number|null;output:string}> {
+  assertQaResourcePolicy(state,policy);
   signal?.throwIfAborted();await bindQaExecutor(state);await assertQaOwnership(state);
   state.phase='starting';state.identity=undefined;
   // Each command has its own startup intent. Keep resource ownership nonce separate.
@@ -167,6 +208,7 @@ export async function runQaCommand(state:QaExecution,executable:string,args:stri
           if(!identity||identity.pid!==child.pid)throw new Error('QA launcher identity missing');
           state.identity=identity;state.phase='running';await save();
           await withQaOwnership(state,async()=>{
+            assertQaResourcePolicy(state,policy);
             await beforeGo();await assertQaOwnership(state);
             if(settled||signal?.aborted)return;
             // Recovery cannot release this nonce while our executor PID is alive. If we die here,

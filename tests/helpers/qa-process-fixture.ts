@@ -75,7 +75,7 @@ export class QaProcessFixture {
     for(const identity of this.observed)try{budget();process.kill(identity.pid,0);throw Error('Fixture descendant still exists; evidence retained');}catch(error){if((error as NodeJS.ErrnoException).code!=='ESRCH')failures.push(error);}
     if(!failures.length)for(const state of stoppedStates)try{
       budget();for(const lock of state.resourceLocks??(state.resourceLock?[state.resourceLock]:[])){
-        const single={...state,resourceLocks:undefined,resourceLock:lock};
+        const single={...state,resourceLocks:undefined,resourceLock:lock,expectedResourceDirectories:[lock.directory]};
         const guard=lock.directory+'.guard';
         const guardOwner=await readJson<{nonce:string;resourceOwner:string;executor:CodexProcessIdentity}>(path.join(guard,'owner.json'));
         // Only a fully recorded guard from a registered, now-stopped fixture parent may be removed.

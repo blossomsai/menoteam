@@ -13,14 +13,14 @@ const save=async()=>{if(input.mode==='startup'&&input.state.phase==='running'){p
 const resume=()=>new Promise<void>(resolve=>process.stdin.once('data',()=>resolve()));
 await acquireQaResource(input.state,input.policy);await save();
 try {
-  await claimQaResource(input.state);await save();
+  await claimQaResource(input.state,input.policy);await save();
   if(input.mode==='lock'){
     process.stdout.write('owned\n');await resume();
   }else{
-    await runQaCommand(input.state,process.execPath,input.command,input.cwd,process.env,30_000,save);
+    await runQaCommand(input.state,process.execPath,input.command,input.cwd,process.env,30_000,save,undefined,undefined,input.policy);
     if(input.mode==='between'){
       process.stdout.write('between-commands\n');await resume();
-      await runQaCommand(input.state,process.execPath,input.secondCommand,input.cwd,process.env,30_000,save);
+      await runQaCommand(input.state,process.execPath,input.secondCommand,input.cwd,process.env,30_000,save,undefined,undefined,input.policy);
     }
   }
   await releaseQaResource(input.state);await save();
