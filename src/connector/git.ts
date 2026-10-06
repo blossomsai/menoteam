@@ -8,6 +8,21 @@ import type { ConnectorConfig, DiffArtifactData, DiffFile, DiffLine } from './ty
 const DIFF_LIMIT = 280_000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
+export interface GitDiagnostic {
+  command: string; code: string; elapsedMs: number; timeoutMs: number; stdoutBytes: number; stderrBytes: number; pid?: number;
+}
+export class GitCommandError extends Error {
+  readonly code?: string;
+  constructor(error:Error,readonly git:GitDiagnostic){super(error.message,{cause:error});this.code=(error as NodeJS.ErrnoException).code;}
+}
+function gitCommandCategory(args:string[]):string{
+  const command=args.find(arg=>['rev-parse','worktree','status','add','commit','diff','ls-files','config','push','ls-remote','fetch'].includes(arg));
+  if(command==='rev-parse')return args.includes('--show-toplevel')?'repository-root':args.includes('--verify')?'base-revision':'head-revision';
+  if(command==='worktree')return args.includes('add')?'worktree-add':'worktree-list';
+  if(command==='diff')return args.includes('--binary')?'diff-preview':args.includes('--name-status')?'diff-names':args.includes('--numstat')?'diff-stats':'diff';
+  return command??'other';
+}
+
 export interface GitOptions {
   signal?: AbortSignal; timeoutMs?: number;
   processTracking?: { intent:(id:string)=>Promise<void>; started:(id:string,pid:number)=>Promise<void>; stopped:(id:string)=>Promise<void> };
@@ -45,13 +60,18 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
     await options.processTracking?.intent(id);
     if(signal?.aborted){await options.processTracking?.stopped(id);signal.throwIfAborted();}
     return new Promise<{output:string;truncated:boolean}>((resolve,reject)=>{
+    const startedAt=Date.now();
     const child=spawn('git',args,{cwd,detached:true,stdio:['ignore','pipe','pipe'],shell:false,env:{...process.env,...env}});
-    const stdout:Buffer[]=[];let bytes=0;let captured=0;let stderr='';let timedOut=false;let oversized=false;let aborted=false;let startError:Error|undefined;let processError:Error|undefined;let startTask:Promise<void>|undefined;let settled=false;let stopTimer:NodeJS.Timeout|undefined;
+    const stdout:Buffer[]=[];let bytes=0;let captured=0;let stderrBytes=0;let stderr='';let timedOut=false;let oversized=false;let aborted=false;let startError:Error|undefined;let processError:Error|undefined;let startTask:Promise<void>|undefined;let settled=false;let stopTimer:NodeJS.Timeout|undefined;
     const killGroup=()=>{if(child.pid){try{process.kill(-child.pid,'SIGKILL');return;}catch{/* fall back to the direct child */}}child.kill('SIGKILL');};
     const unconfirmed=()=>Object.assign(new Error('Git process group could not be confirmed stopped'),{code:'EUNCONFIRMEDPROCESS'});
     const settle=(error?:Error,result?:{output:string;truncated:boolean})=>{
       if(settled)return;settled=true;clearTimeout(timer);if(stopTimer)clearTimeout(stopTimer);signal?.removeEventListener('abort',abort);
-      if(error)reject(error);else resolve(result!);
+      if(error){
+        const code=(error as NodeJS.ErrnoException).code;
+        const safeCode=['ABORT_ERR','ETIMEDOUT','ENOBUFS','EUNCONFIRMEDPROCESS','ENOENT','EACCES','EPERM'].includes(code??'')?code!:/^\d+$/u.test(code??'')?'GIT_EXIT':'LIFECYCLE_ERROR';
+        reject(new GitCommandError(error,{command:gitCommandCategory(args),code:safeCode,elapsedMs:Date.now()-startedAt,timeoutMs,stdoutBytes:bytes,stderrBytes,...(child.pid?{pid:child.pid}:{})}));
+      }else resolve(result!);
     };
     const terminate=()=>{
       killGroup();
@@ -67,7 +87,7 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
       const keep=truncate?chunk.subarray(0,Math.max(0,DIFF_LIMIT-captured)):chunk;
       if(keep.length){stdout.push(keep);captured+=keep.length;}
     });
-    child.stderr.on('data',(chunk:Buffer)=>{if(stderr.length<4096)stderr+=chunk.toString('utf8').slice(0,4096-stderr.length);});
+    child.stderr.on('data',(chunk:Buffer)=>{stderrBytes+=chunk.length;if(stderr.length<4096)stderr+=chunk.toString('utf8').slice(0,4096-stderr.length);});
     if(onProcessStart||options.processTracking)child.once('spawn',()=>{startTask=Promise.resolve().then(async()=>{await options.processTracking?.started(id,child.pid!);await onProcessStart?.(child.pid!);}).catch(error=>{startError=error instanceof Error?error:new Error('Could not record Git transport process');terminate();});});
     child.once('error',error=>{processError=error;terminate();});
     child.once('close',(code,exitSignal)=>{clearTimeout(timer);void (async()=>{

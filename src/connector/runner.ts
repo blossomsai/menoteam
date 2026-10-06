@@ -5,7 +5,7 @@ import { mkdir, readdir, unlink, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer, readGitProcessIdentity, terminateVerifiedGitProcessGroup, terminateVerifiedProcessGroup, waitProcessGroup, type CodexProcessIdentity, type GitProcessIdentity } from './codex.js';
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
-import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit, type GitOptions } from './git.js';
+import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit, GitCommandError, type GitOptions } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
 import { assertExecutionSelection } from './selection.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
@@ -356,9 +356,11 @@ export class ConnectorRunner {
         const failureStage=allowedStages.includes(cause?.nativeStage ?? '') ? cause.nativeStage! : stage;
         const category=['rpc-failure','unavailable-model'].includes(cause?.nativeCategory ?? '') ? cause.nativeCategory! : 'local-failure';
         const code=typeof cause?.nativeCode==='number' && Number.isInteger(cause.nativeCode) ? cause.nativeCode : undefined;
-        console.error(`Native execution failure stage=${failureStage} category=${category}${code===undefined?'':` code=${code}`}`);
+        const gitDiagnostic=error instanceof GitCommandError?error.git:undefined;
+        if(gitDiagnostic)console.error(`Git execution failure stage=${failureStage} command=${gitDiagnostic.command} code=${gitDiagnostic.code} elapsedMs=${gitDiagnostic.elapsedMs} timeoutMs=${gitDiagnostic.timeoutMs} stdoutBytes=${gitDiagnostic.stdoutBytes} stderrBytes=${gitDiagnostic.stderrBytes}`);
+        else console.error(`Native execution failure stage=${failureStage} category=${category}${code===undefined?'':` code=${code}`}`);
         // Raw native cause stays local/private: never include it in logs, API completion or prompts.
-        try { await writeSecureJson(path.join(this.config.dataDir,'diagnostics',`${stateKey(claim.run.id,String(claim.run.generation))}.json`),{runId:claim.run.id,generation:claim.run.generation,stage:failureStage,category,code,cause:typeof cause?.message==='string'?cause.message:'Unknown local error'}); } catch { /* Preserve primary failure even if private evidence cannot be written. */ }
+        try { await writeSecureJson(path.join(this.config.dataDir,'diagnostics',`${stateKey(claim.run.id,String(claim.run.generation))}.json`),{runId:claim.run.id,generation:claim.run.generation,stage:failureStage,category,code,...(gitDiagnostic?{git:gitDiagnostic}:{}),cause:typeof cause?.message==='string'?cause.message:'Unknown local error'}); } catch { /* Preserve primary failure even if private evidence cannot be written. */ }
       }
       await native.stop(); await eventWrites;
       if(skillFiles) { await skillFiles.cleanup(); spool.skillDirectory=undefined; await this.save(spool); }

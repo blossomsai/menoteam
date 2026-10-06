@@ -45,7 +45,7 @@ it('bounds a hung workspace preparation command and confirms its group stopped',
   await chmod(file, 0o700); vi.stubEnv('PATH', `${bin}${path.delimiter}${process.env.PATH}`);
   const started = Date.now(); const kill = vi.spyOn(process, 'kill');
   try {
-    await expect(ensureWorktree(f.config, 'project', 'work', 'HEAD', { timeoutMs: 600 })).rejects.toMatchObject({ code: 'ETIMEDOUT' });
+    await expect(ensureWorktree(f.config, 'project', 'work', 'HEAD', { timeoutMs: 600 })).rejects.toMatchObject({ code: 'ETIMEDOUT', git: { command: 'repository-root', code: 'ETIMEDOUT', timeoutMs: 600, elapsedMs: expect.any(Number), stdoutBytes: 0, stderrBytes: 0, pid: expect.any(Number) } });
     const group = kill.mock.calls.find(([pid, signal]) => pid < 0 && signal === 'SIGKILL')?.[0];
     expect(group).toBeLessThan(-1); stopped(-group!); expect(Date.now() - started).toBeLessThan(4500);
   } finally { kill.mockRestore(); }
@@ -95,7 +95,9 @@ it('drains large diff stdout and stderr while retaining only the bounded preview
 it('rejects oversized ordinary Git output and confirms stop before its callback', async () => {
   const f = await fixture(); await shim(`if(args[0]==='oversized'){process.stdout.write('x'.repeat(5*1024*1024));setInterval(()=>{},1000);return;}`);
   let pid = 0; let confirmed = false;
-  await expect(gitWithEnv(f.repo, {}, ['oversized'], async value => { pid = value; }, async () => { stopped(pid); confirmed = true; })).rejects.toMatchObject({ code: 'ENOBUFS' });
+  const failure=await gitWithEnv(f.repo, {}, ['oversized'], async value => { pid = value; }, async () => { stopped(pid); confirmed = true; }).catch(error=>error);
+  expect(failure).toMatchObject({ code: 'ENOBUFS', git: { command: 'other', code: 'ENOBUFS', timeoutMs: 30_000, elapsedMs: expect.any(Number), stderrBytes: 0, pid: expect.any(Number) } });
+  expect(failure.git.stdoutBytes).toBeGreaterThan(4*1024*1024);
   expect(confirmed).toBe(true);
 });
 

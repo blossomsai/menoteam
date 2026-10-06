@@ -10,7 +10,7 @@ import { ConnectorRunner,buildRunPrompt } from '../src/connector/runner.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
 import { ConnectorHttpError, type WorkbenchConnectorClient } from '../src/connector/client.js';
 import { stateKey,writeSecureJson } from '../src/connector/state.js';
-import { diffRevision, ensureWorktree, fingerprint, git } from '../src/connector/git.js';
+import { diffRevision, ensureWorktree, fingerprint, git, GitCommandError } from '../src/connector/git.js';
 import type { ClaimedRun,ConnectorConfig,DiffArtifactData } from '../src/connector/types.js';
 import { LOCAL_QA_CONTRACT } from '../src/workbench/local-qa.js';
 function claim():ClaimedRun {
@@ -247,6 +247,23 @@ describe('Integrated connector lifecycle',()=>{
       const file=path.join(dataDir,'diagnostics',`${stateKey('run-one','1')}.json`);
       expect((await stat(file)).mode & 0o777).toBe(0o600);
       expect(JSON.parse(await readFile(file,'utf8')).cause).toBe('private raw native cause secret-token');
+    }finally{log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
+  });
+  it('records safe Git command, errno, timing and byte counts while keeping raw cause private',async()=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-git-diagnostic-'));
+    const diagnostic={command:'worktree-list',code:'ETIMEDOUT',elapsedMs:30_017,timeoutMs:30_000,stdoutBytes:0,stderrBytes:42,pid:456};
+    const failure=new GitCommandError(Object.assign(new Error('private raw git cause secret-token'),{code:'ETIMEDOUT'}),diagnostic);
+    const native={start:async()=>{throw failure;},stop:async()=>{}} as unknown as CodexAppServer;
+    const client={createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>claim().run,complete:async()=>{}} as unknown as WorkbenchConnectorClient;
+    const runner=new ConnectorRunner({serverUrl:'http://127.0.0.1:3200',token:'enrollment-secret',connectorId:'one',dataDir,projects:{}},{native:()=>native,client:()=>client});
+    (runner as unknown as {client:WorkbenchConnectorClient}).client=client;
+    const log=vi.spyOn(console,'error').mockImplementation(()=>{});
+    try{
+      await expect(runner.execute(claim())).rejects.toBe(failure);
+      expect(log).toHaveBeenCalledWith('Git execution failure stage=native-start command=worktree-list code=ETIMEDOUT elapsedMs=30017 timeoutMs=30000 stdoutBytes=0 stderrBytes=42');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('secret-token');expect(JSON.stringify(log.mock.calls)).not.toContain('enrollment-secret');
+      const file=path.join(dataDir,'diagnostics',`${stateKey('run-one','1')}.json`);
+      expect(JSON.parse(await readFile(file,'utf8'))).toMatchObject({git:diagnostic,cause:'private raw git cause secret-token'});expect((await stat(file)).mode&0o777).toBe(0o600);
     }finally{log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
   });
   it('retries durable IDs across real socket loss without executing the native turn twice',async()=>{
