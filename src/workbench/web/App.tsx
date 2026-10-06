@@ -545,7 +545,7 @@ function StagingOverview({work,runs,allRuns,settings,runtimeProviders,canManage,
     return capable.length===1;
   };
   const ordered=[...runs].sort((a,b)=>b.createdAt.localeCompare(a.createdAt)||b.id.localeCompare(a.id));
-  const merged=allRuns.filter(run=>run.kind==='delivery'&&run.operation?.action==='merge_pr'&&run.operation.phase==='merged').sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0];
+  const merged=allRuns.filter(run=>run.workId===work.id&&run.kind==='delivery'&&run.operation?.action==='merge_pr'&&run.operation.phase==='merged').sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0];
   return <section className="space-y-3" aria-label="Staging delivery"><header><h2 className="font-semibold">Staging</h2><p className="mt-1 text-sm text-muted-foreground">Deployment status for this Work.</p></header>
     {!ordered.length&&merged&&<div className="rounded-lg border border-dashed p-4 text-sm"><p className="font-medium">Merged source · {merged.operation?.commitSha??'commit unavailable'}</p><p className="mt-1 text-muted-foreground">Staging is not ready until a trusted build is linked to this commit.</p></div>}
     {ordered.map(run=>{const op=run.operation!,receipt=op.stagingReceipt,phase=resolveLabel(run),latest=latestByTarget(op.targetId??'')?.id===run.id;const busy=busyRun===run.id;return <article key={run.id} className="rounded-lg border p-3"><div className="flex flex-wrap items-start justify-between gap-3"><div className="min-w-0"><h3 className="text-sm font-medium">{op.action==='rollback_staging'?'Staging rollback':'Staging deployment'}</h3><p className="mt-1 text-sm text-muted-foreground">{op.targetId??'Target unavailable'} · {phase}</p></div><Badge variant={phase==='Health check passed'||phase==='Rolled back'?'secondary':phase==='Failed'||phase==='Target offline'?'destructive':'outline'}>{phase}</Badge></div>
@@ -841,9 +841,15 @@ function DeliveryConnectionSettings({ project, snapshot, refresh, setError }: { 
     if (!project.repositoryUrl || !draft.baseBranch.trim()) return;
     setBusy(true); setError('');
     try {
-      const data = { ...(existing?.data ?? {}), provider: 'github', url: project.repositoryUrl, enabled: true, purpose: 'delivery', baseBranch: draft.baseBranch.trim(), allowDraftPr: true, allowMergePr: draft.allowMerge, ...(draft.allowMerge ? { mergeMethod, requiredChecks: mergeChecks } : { requiredChecks: [] }), allowStagingDeploy: draft.allowStaging && draft.selectedTargets.length > 0, stagingTargets: draft.selectedTargets };
-      if (existing) await workbenchApi.updateSetting(existing.id, { data, expectedUpdatedAt: boundDraft.baseVersion });
-      else await workbenchApi.saveSetting({ kind: 'connection', projectId: project.id, name: 'GitHub delivery', data });
+      const submittedDraft: Draft = { ...draft, selectedTargets: [...draft.selectedTargets] };
+      const submittedBinding = { projectId: boundDraft.projectId, settingId: boundDraft.settingId, baseVersion: boundDraft.baseVersion };
+      const data = { ...(existing?.data ?? {}), provider: 'github', url: project.repositoryUrl, enabled: true, purpose: 'delivery', baseBranch: submittedDraft.baseBranch.trim(), allowDraftPr: true, allowMergePr: submittedDraft.allowMerge, ...(submittedDraft.allowMerge ? { mergeMethod, requiredChecks: submittedDraft.requiredChecks.split(',').map(value => value.trim()).filter(Boolean) } : { requiredChecks: [] }), allowStagingDeploy: submittedDraft.allowStaging && submittedDraft.selectedTargets.length > 0, stagingTargets: submittedDraft.selectedTargets };
+      const saved = existing
+        ? await workbenchApi.updateSetting(existing.id, { data, expectedUpdatedAt: submittedBinding.baseVersion })
+        : await workbenchApi.saveSetting({ kind: 'connection', projectId: project.id, name: 'GitHub delivery', data });
+      setBoundDraft(current => current.projectId !== submittedBinding.projectId || current.settingId !== submittedBinding.settingId || current.baseVersion !== submittedBinding.baseVersion
+        ? current
+        : { ...current, settingId: saved.id, baseVersion: saved.updatedAt, baseline: submittedDraft });
       await refresh();
     } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); }
   }}>

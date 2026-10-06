@@ -18,6 +18,9 @@ function snapshot(instructions: string, name = 'Project'): Snapshot {
 function healthyStagingRun(id = 'stage-run', workId = 'work'): Snapshot['runs'][number] {
   return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z', operation: { action: 'deploy_staging', actorId: 'owner', candidateRunId: 'candidate', candidateRevision: 'revision', artifactRevision: 'revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/org/repo', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/test', workTitle: 'Review delivery', changeSummary: 'staging change', qaStatus: 'current', phase: 'health_passed', targetId: 'stage-safe', imageDigest: `sha256:${'d'.repeat(64)}`, stagingReceipt: { operationId: id, targetId: 'stage-safe', phase: 'health_passed', deploymentId: 'deploy-2', commitSha: 'a'.repeat(40), imageDigest: `sha256:${'d'.repeat(64)}`, activeCommitSha: 'a'.repeat(40), activeImageDigest: `sha256:${'d'.repeat(64)}`, previousDeploymentId: 'deploy-1', previousImageDigest: `sha256:${'e'.repeat(64)}`, checkedAt: '2026-10-07T00:00:00.000Z' } } } as Snapshot['runs'][number];
 }
+function mergedRun(id: string, workId: string, commitSha: string, createdAt: string): Snapshot['runs'][number] {
+  return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt, updatedAt: createdAt, operation: { action: 'merge_pr', phase: 'merged', commitSha } } as Snapshot['runs'][number];
+}
 let root: Root;
 let host: HTMLDivElement;
 let responses: Array<Promise<Snapshot>>;
@@ -120,6 +123,59 @@ it('rebinds delivery settings when switching projects', async () => {
   await flush(() => { window.history.replaceState(null, '', '/workbench/?view=connections&project=project-b'); root.render(createElement(App)); });
   expect(host.querySelector<HTMLInputElement>('#delivery-base-branch')!.value).toBe('trunk');
   expect(host.textContent).not.toContain('unsaved-a');
+});
+
+it('shows the merged source for this Work, not a newer merge from another Work', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = snapshot('A'); value.projects[0]!.repositoryUrl = 'https://github.com/org/repo';
+  value.works = [{ id: 'work', projectId: 'project', title: 'Current Work', overview: '', status: 'in_progress', revision: 1, profileId: '', connectionId: 'provider', sources: [], createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z' }];
+  value.runs = [mergedRun('this-merge', 'work', 'a'.repeat(40), '2026-10-07T00:00:00.000Z'), mergedRun('other-merge', 'other-work', 'b'.repeat(40), '2026-10-07T00:01:00.000Z')];
+  responses = [Promise.resolve(value)];
+  await mount();
+  expect(host.textContent).toContain('Merged source · ' + 'a'.repeat(40));
+  expect(host.textContent).not.toContain('b'.repeat(40));
+});
+
+it('rebases a delivery settings draft on the successful save before refreshing', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=connections&project=project');
+  const initial = snapshot('A'); initial.projects[0]!.repositoryUrl = 'https://github.com/org/repo';
+  const setting = { id: 'delivery', kind: 'connection' as const, projectId: 'project', name: 'GitHub delivery', data: { provider: 'github', url: 'https://github.com/org/repo', purpose: 'delivery', baseBranch: 'main' }, updatedAt: 'v1' };
+  initial.settings = [setting]; responses = [Promise.resolve(initial)];
+  const saved = { ...setting, data: { ...setting.data, baseBranch: 'feature/first' }, updatedAt: 'v2' };
+  const update = vi.spyOn(workbenchApi, 'updateSetting').mockResolvedValueOnce(saved).mockResolvedValueOnce({ ...saved, data: { ...saved.data, baseBranch: 'feature/second' }, updatedAt: 'v3' });
+  await mount();
+  await type('feature/first', '#delivery-base-branch');
+  const form = host.querySelector<HTMLInputElement>('#delivery-base-branch')!.closest('form')!;
+  const refreshed = structuredClone(initial); refreshed.settings[0] = saved;
+  responses.push(Promise.resolve(refreshed));
+  await flush(() => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+  expect(update).toHaveBeenNthCalledWith(1, 'delivery', expect.objectContaining({ expectedUpdatedAt: 'v1' }));
+  expect(host.textContent).not.toContain('Your unsaved changes are still here');
+  expect(button('Save delivery settings').disabled).toBe(false);
+  await type('feature/second', '#delivery-base-branch');
+  responses.push(Promise.resolve({ ...refreshed, settings: [{ ...saved, data: { ...saved.data, baseBranch: 'feature/second' }, updatedAt: 'v3' }] }));
+  await flush(() => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+  expect(update).toHaveBeenNthCalledWith(2, 'delivery', expect.objectContaining({ expectedUpdatedAt: 'v2' }));
+});
+
+it('keeps edits made during save and marks them stale if a newer external version appears', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=connections&project=project');
+  const initial = snapshot('A'); initial.projects[0]!.repositoryUrl = 'https://github.com/org/repo';
+  const setting = { id: 'delivery', kind: 'connection' as const, projectId: 'project', name: 'GitHub delivery', data: { provider: 'github', url: 'https://github.com/org/repo', purpose: 'delivery', baseBranch: 'main' }, updatedAt: 'v1' };
+  initial.settings = [setting]; responses = [Promise.resolve(initial)];
+  const saved = deferred<typeof setting>(); const update = vi.spyOn(workbenchApi, 'updateSetting').mockReturnValue(saved.promise);
+  await mount(); await type('feature/submitted', '#delivery-base-branch');
+  const form = host.querySelector<HTMLInputElement>('#delivery-base-branch')!.closest('form')!;
+  await flush(() => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+  await type('feature/kept-edit', '#delivery-base-branch');
+  const external = { ...setting, data: { ...setting.data, baseBranch: 'external-change' }, updatedAt: 'v3' };
+  const latest = structuredClone(initial); latest.settings[0] = external; responses.push(Promise.resolve(latest));
+  saved.resolve({ ...setting, data: { ...setting.data, baseBranch: 'feature/submitted' }, updatedAt: 'v2' });
+  await flush();
+  expect(update).toHaveBeenCalledWith('delivery', expect.objectContaining({ expectedUpdatedAt: 'v1' }));
+  expect(host.querySelector<HTMLInputElement>('#delivery-base-branch')!.value).toBe('feature/kept-edit');
+  expect(host.textContent).toContain('Your unsaved changes are still here');
+  expect(button('Save delivery settings').disabled).toBe(true);
 });
 
 it('shows a health receipt and offers rollback only when workspace and project roles allow it',async()=>{
