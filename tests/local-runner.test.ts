@@ -21,11 +21,19 @@ async function fake(source: string, onEvent: Parameters<typeof runCodex>[0]['onE
   const handle = runCodex({ project, job, codexBinary: executable, onEvent }); active.push(handle);
   return { handle, folder };
 }
-async function waitForFile(file: string): Promise<string> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    try { return await readFile(file, 'utf8'); } catch { await new Promise((resolve) => setTimeout(resolve, 20)); }
+async function waitForFile(file: string, timeoutMs = 2_000, process?: Promise<unknown>): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  const exited = process?.then(
+    () => Promise.reject(new Error(`Process exited before file was created: ${file}`)),
+    (error) => Promise.reject(error),
+  );
+  while (Date.now() < deadline) {
+    try { return await readFile(file, 'utf8'); } catch { /* Keep waiting until the bounded deadline. */ }
+    const delay = new Promise((resolve) => setTimeout(resolve, Math.min(20, deadline - Date.now())));
+    if (exited) await Promise.race([delay, exited]);
+    else await delay;
   }
-  throw new Error(`File was not created: ${file}`);
+  throw new Error(`File was not created within ${timeoutMs}ms: ${file}`);
 }
 const treeScript = (exitParent: boolean, childStartupDelayMs = 0) => `
 const { spawn } = require('node:child_process');
@@ -85,7 +93,7 @@ let input=''; process.stdin.on('data',c=>input+=c); process.stdin.on('end',()=>{
 
   it('waits for delayed child startup, then cleans up the leaked child after parent exit', async () => {
     const { handle, folder } = await fake(treeScript(true, 250));
-    const heartbeat = join(folder, 'heartbeat'); await waitForFile(heartbeat);
+    const heartbeat = join(folder, 'heartbeat'); await waitForFile(heartbeat, 6_000, handle.result);
     await expect(handle.result).resolves.toEqual({ output: '' });
     const stopped = await readFile(heartbeat, 'utf8');
     await new Promise((resolve) => setTimeout(resolve, 120));
