@@ -454,6 +454,27 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('This legacy Work continues on its recorded Connector and native thread.'); expect(host.textContent).not.toContain('Execution is blocked'); expect(host.textContent).not.toContain('Connector unavailable');
   });
 
+  it('keeps readable handoff summary and actual failures visible while IDs stay in collapsed diagnostics', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=handoff-work');
+    const work = { id: 'handoff-work', projectId: project.id, title: 'Handoff Work', overview: '', status: 'failed' as const, revision: 2, profileId: 'profile-private-id', connectionId: providerSetting.id, sources: [], createdAt: '', updatedAt: '' };
+    const run = { id: 'run-private-id', projectId: project.id, workId: work.id, prompt: 'Continue', kind: 'implementation' as const, model: 'gpt-6.1-sol', reasoning: 'medium', status: 'failed' as const, generation: 2, handoffFromRunId: 'prior-run-private-id', error: 'Runtime failed in run-private-id', connectorId: runtime.connectorId, threadId: 'native-thread-private-id', createdAt: '', updatedAt: '', execution: { provider: 'openai' as const, method: 'codex-host' as const, connectionId: providerSetting.id, connectorId: runtime.connectorId, model: 'gpt-6.1-sol', profileId: 'profile-private-id', profile: { id: 'profile-private-id', name: 'Original Builder', data: { ...profileSetting.data, model: 'gpt-6-luna' } }, skills: [], tools: [] } } as Snapshot['runs'][number];
+    await mount({ ...snapshot(owner, [providerSetting, profileSetting]), works: [work], runs: [run] });
+    const details = host.querySelector('details')!;
+    expect(details.open).toBe(false);
+    const collapsedSummary = host.textContent?.replace(details.textContent ?? '', '') ?? '';
+    expect(collapsedSummary).toContain('OpenAI'); expect(collapsedSummary).toContain('Team Codex'); expect(collapsedSummary).toContain('Original Builder'); expect(collapsedSummary).toContain('gpt-6.1-sol'); expect(collapsedSummary).toContain('failed'); expect(collapsedSummary).toContain('Explicit model handoff');
+    expect(collapsedSummary).not.toContain('prior-run-private-id'); expect(collapsedSummary).not.toContain('native-thread-private-id'); expect(collapsedSummary).not.toContain('connector-real-123'); expect(collapsedSummary).not.toContain('profile-private-id');
+    const alerts = [...host.querySelectorAll('[role="alert"]')];
+    expect(alerts.length).toBeGreaterThanOrEqual(2);
+    expect(alerts.every(alert => alert.closest('details') === null)).toBe(true);
+    expect(alerts.map(alert => alert.textContent).join(' ')).toContain('Runtime failed in run-private-id');
+    expect(alerts.map(alert => alert.textContent).join(' ')).toContain('This model is not reported by the Work’s bound provider connection.');
+    expect(details.textContent).toContain('run-private-id'); expect(details.textContent).toContain('prior-run-private-id'); expect(details.textContent).toContain('native-thread-private-id'); expect(details.textContent).toContain('connector-real-123'); expect(details.textContent).toContain('profile-private-id'); expect(details.textContent).toContain(providerSetting.id);
+    details.open = true;
+    expect(details.open).toBe(true);
+    expect(details.querySelector('dd')?.textContent).toBe('run-private-id');
+  });
+
   it('shows revoked Worktree capability and does not offer an incompatible default action', async () => {
     const incompatibleRuntime = { ...runtime, localWorktrees: false };
     const current = snapshot(owner, [providerSetting], [incompatibleRuntime]);
