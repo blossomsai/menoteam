@@ -431,6 +431,13 @@ function WorkDetail({ work, project, snapshot, refresh, setError }: { work: Work
 function WorkProfileSelector({ work, project, snapshot, refresh, setError }: { work: Work; project: Project; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {
   const [busy, setBusy] = useState(false);
   const profiles = snapshot.settings.filter(item => item.kind === 'profile' && !item.projectId);
+  const firstImplementation = snapshot.runs.filter(run => run.workId === work.id && run.kind === 'implementation')
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
+  if (firstImplementation) {
+    const frozenProfileId = firstImplementation.execution?.profileId ?? firstImplementation.execution?.profile?.id ?? work.profileId;
+    const frozenProfileName = firstImplementation.execution?.profile?.name ?? profiles.find(profile => profile.id === frozenProfileId)?.name ?? (frozenProfileId ? 'Historical profile snapshot unavailable' : 'No profile');
+    return <div className="mb-5 flex flex-wrap items-center gap-3"><Label>Agent profile</Label><span className="text-sm">{frozenProfileName}</span><span role="status" className="text-xs text-muted-foreground">Frozen after implementation starts.</span></div>;
+  }
   return <div className="mb-5 flex flex-wrap items-center gap-3"><Label htmlFor={`work-profile-${work.id}`}>Agent profile</Label><select id={`work-profile-${work.id}`} className="h-9 min-w-56 rounded-md border bg-background px-3 text-sm" value={work.profileId} disabled={busy} onChange={async event => { setBusy(true); setError(''); try { await workbenchApi.updateWork(work.id, { revision: work.revision, profileId: event.target.value }); await refresh(); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); } }}><option value="">No profile</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {profile.projectId ? 'Project' : 'Workspace'}</option>)}</select><span role="status" className="text-xs text-muted-foreground">A queued run snapshots the selected profile’s enabled skill content and provenance.</span></div>;
 }
 

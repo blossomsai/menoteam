@@ -657,6 +657,16 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(404, "Work missing");
         if (w!.revision !== b.revision)
             fail(409, "Work changed; reload");
+        if (b.profileId !== undefined) {
+            const firstImplementation = (await store.list<Run>('run', projectId, tx))
+                .filter(run => run.workId === wid && run.kind === 'implementation')
+                .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0];
+            const frozenProfileId = firstImplementation
+                ? firstImplementation.execution?.profileId ?? firstImplementation.execution?.profile?.id ?? w!.profileId
+                : undefined;
+            if (firstImplementation && b.profileId !== frozenProfileId)
+                fail(409, 'Agent profile is frozen after implementation starts');
+        }
         if (b.profileId) {
             const profile = await store.get<Setting>('setting', b.profileId, tx);
             if (!profile || profile.kind !== 'profile' || profile.projectId) fail(400, 'Only workspace agent profiles can be assigned to Work');

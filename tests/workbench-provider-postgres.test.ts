@@ -472,6 +472,24 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     expect((await user('GET', `/works/${racedWork.id}`)).json().runs.find((item: any) => item.id === racedRun.id).execution).toEqual(racedExecution);
   });
 
+  it('rejects changing the profile after an implementation is assigned without changing the Work', async () => {
+    const project = await makeProject('Frozen Work profile');
+    const host = await enrollFixtureConnector('frozen-profile', project.id);
+    const connection = await addConnection(host.connectorId, 'Frozen profile Codex');
+    const profile = checked(await user('POST', '/settings', { kind: 'profile', name: 'Assigned profile', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [], tools: [] } }));
+    const replacement = checked(await user('POST', '/settings', { kind: 'profile', name: 'Replacement profile', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [], tools: [] } }));
+    settingIds.push(profile.id, replacement.id);
+    const work = checked(await user('POST', `/projects/${project.id}/works`, { title: 'Keep this profile', profileId: profile.id, connectionId: connection.id }));
+    const run = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Start implementation', workId: work.id, requestId: `profile-freeze-${suffix}` })).run;
+    expect(run.execution.profileId).toBe(profile.id);
+
+    const rejected = await user('PATCH', `/works/${work.id}`, { revision: work.revision, profileId: replacement.id });
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json().message).toMatch(/profile is frozen/u);
+    const current = checked(await user('GET', `/works/${work.id}`));
+    expect(current.work).toMatchObject({ revision: work.revision, profileId: profile.id });
+  });
+
   it('requires an explicit supported same-Work model handoff and preserves the source run snapshot', async () => {
     const project = await makeProject('Explicit model handoff');
     const host = await enrollFixtureConnector('handoff', project.id, ['gpt-6-luna', 'fixture-model']);

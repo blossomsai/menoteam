@@ -60,6 +60,16 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).not.toContain('Historical profile snapshot unavailable');
   });
 
+  it('shows the implementation snapshot profile after the Work selection has drifted', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=frozen-work');
+    const work = { id: 'frozen-work', projectId: project.id, title: 'Frozen Work', overview: '', status: 'in_progress' as const, revision: 2, profileId: 'changed-profile', connectionId: providerSetting.id, sources: [], createdAt: '', updatedAt: '' };
+    const run = { id: 'implementation-1', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6.1-sol', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '2026-10-06T10:00:00.000Z', updatedAt: '2026-10-06T10:01:00.000Z', execution: { provider: 'openai' as const, method: 'codex-host' as const, connectionId: providerSetting.id, connectorId: runtime.connectorId, model: 'gpt-6.1-sol', profileId: profileSetting.id, profile: { id: profileSetting.id, name: 'Original Builder', data: profileSetting.data }, skills: [], tools: [] } };
+    await mount({ ...snapshot(owner, [providerSetting, profileSetting]), works: [work], runs: [run] });
+    expect(host.textContent).toContain('Original Builder');
+    expect(host.textContent).toContain('Frozen after implementation starts.');
+    expect(host.querySelector(`#work-profile-${work.id}`)).toBeNull();
+  });
+
   it.each(['revoked project grant', 'unrecorded identity', 'explicit capability revocation'])('does not present legacy continuation after %s', async change => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=legacy-work');
     const work = { id: 'legacy-work', projectId: project.id, title: 'Legacy Work', overview: '', status: 'paused' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
