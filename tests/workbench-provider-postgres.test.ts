@@ -6,7 +6,7 @@ import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from '../src/db/migrate.js';
 import { createWorkbenchApp } from '../src/workbench/app.js';
-import { bytesHash, gitBlobHash, sealBundle } from '../src/workbench/skill-bundle.js';
+import { gitBlobHash } from '../src/workbench/skill-bundle.js';
 
 // This destructive-capable integration suite is opt-in. It only writes to a
 // dedicated loopback *_test database after an operator explicitly serializes it.
@@ -566,6 +566,27 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
   });
 
   it('keeps frozen skill bundles and tool authorization through ordinary continuation and explicit handoff, including legacy identity', async () => {
+    await app.close();
+    const commit = 'a'.repeat(40);
+    const skillText = '---\nname: handoff-skill\ndescription: Preserve a pinned handoff skill.\n---\nUse this imported instruction snapshot.';
+    const referenceText = '# Reference\nKeep this immutable dependency with the imported skill.';
+    const skillBytes = Buffer.from(skillText);
+    const referenceBytes = Buffer.from(referenceText);
+    const skillBlob = gitBlobHash(skillBytes);
+    const referenceBlob = gitBlobHash(referenceBytes);
+    const fixtureFetcher: typeof fetch = async input => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith('/commits/main')) return Response.json({ sha: commit });
+      if (url.pathname.endsWith(`/git/trees/${commit}`)) return Response.json({ truncated: false, tree: [
+        { path: 'handoff-skill/SKILL.md', type: 'blob', mode: '100644', sha: skillBlob, size: skillBytes.length },
+        { path: 'handoff-skill/references/guide.md', type: 'blob', mode: '100644', sha: referenceBlob, size: referenceBytes.length }
+      ] });
+      if (url.pathname.endsWith(`/git/blobs/${skillBlob}`)) return Response.json({ encoding: 'base64', content: skillBytes.toString('base64'), size: skillBytes.length });
+      if (url.pathname.endsWith(`/git/blobs/${referenceBlob}`)) return Response.json({ encoding: 'base64', content: referenceBytes.toString('base64'), size: referenceBytes.length });
+      return new Response('not found', { status: 404 });
+    };
+    app = await createWorkbenchApp({ sql, sourceFetcher: fixtureFetcher });
+    activeApp = app;
     const project = await makeProject('Handoff snapshot continuity');
     const host = await enrollFixtureConnector('handoff-snapshot', project.id, ['gpt-6-luna', 'gpt-6.1-sol', 'fixture-model']);
     const connection = await addConnection(host.connectorId, 'Snapshot original connection');
@@ -574,19 +595,23 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const advertisedEffort = 'fixture-advertised-effort';
     const capabilities = { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol', 'fixture-model'], modelReasoningEfforts: { 'fixture-model': [advertisedEffort] }, runKinds: ['implementation'] };
     await sql`UPDATE wb_connectors SET capabilities=${sql.json(capabilities)} WHERE id=${host.connectorId}`;
-    const skillText = `Pinned skill content ${suffix}`;
-    const skillBytes = Buffer.from(skillText);
-    const bundle = sealBundle('', 'a'.repeat(40), [{ path: 'SKILL.md', mode: '100644', encoding: 'base64', data: skillBytes.toString('base64'), bytes: skillBytes.length, sha256: bytesHash(skillBytes), sourceBlobSha: gitBlobHash(skillBytes) }]);
-    const skill = checked(await user('POST', '/settings', { kind: 'skill', name: `Pinned handoff skill ${suffix}`, data: { content: skillText, bundle } }));
+    const importedSkill = checked(await user('POST', `/projects/${project.id}/skills/import`, { url: 'https://github.com/example/skills/blob/main/handoff-skill/SKILL.md' }));
+    expect(importedSkill).toMatchObject({ projectId: project.id, data: { content: skillText, resolvedSha: commit, sourcePath: 'handoff-skill/SKILL.md' } });
+    expect(importedSkill.data.bundle.files.map((file: { path: string }) => file.path)).toEqual(['SKILL.md', 'references/guide.md']);
+    const skill = checked(await user('POST', `/settings/${importedSkill.id}/copy-to-workspace`));
     settingIds.push(skill.id);
+    expect(skill.projectId).toBeUndefined();
+    expect(skill).toMatchObject({ data: { content: skillText, bundle: importedSkill.data.bundle, copiedFrom: { settingId: importedSkill.id, projectId: project.id, resolvedSha: commit } } });
     const profile = checked(await user('POST', '/settings', { kind: 'profile', name: `Pinned handoff profile ${suffix}`, data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [skill.id], tools: [] } }));
     settingIds.push(profile.id);
     const work = checked(await user('POST', `/projects/${project.id}/works`, { title: 'Pinned handoff snapshot', profileId: profile.id, connectionId: connection.id }));
     const source = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Start with frozen profile', workId: work.id, requestId: `handoff-snapshot-source-${suffix}` })).run;
     const firstClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities, runKinds: ['implementation'] } }));
-    const enrichedSource = { ...firstClaim.run, execution: { ...firstClaim.run.execution, tools: ['read_context'] } };
-    await sql`UPDATE wb_records SET data=${sql.json(enrichedSource)} WHERE id=${source.id} AND kind='run'`;
     checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${source.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: firstClaim.run.generation, threadId: `handoff-snapshot-thread-${suffix}` } }));
+    // Preserve a nonempty tool authorization from an already-completed historical snapshot. Public profiles intentionally reject configurable tools.
+    const completedSource = (await sql`SELECT data FROM wb_records WHERE id=${source.id} AND kind='run'`).at(0)?.data;
+    const enrichedSource = { ...completedSource, execution: { ...completedSource.execution, tools: ['read_context'] } };
+    await sql`UPDATE wb_records SET data=${sql.json(enrichedSource)} WHERE id=${source.id} AND kind='run'`;
     const sourceBefore = (await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data;
 
     checked(await user('PATCH', `/settings/${profile.id}`, { data: { model: 'gpt-6.1-sol', reasoning: 'high', skillIds: [], tools: [] } }));
@@ -594,7 +619,7 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const ordinary = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Ordinary continuation retains frozen settings', workId: work.id, requestId: `handoff-snapshot-ordinary-${suffix}` })).run;
     expect(ordinary).toMatchObject({ threadId: sourceBefore.threadId, model: 'gpt-6-luna', reasoning: 'medium', execution: { connectionId: connection.id, connectorId: host.connectorId, model: 'gpt-6-luna', profile: { data: { model: 'gpt-6-luna', reasoning: 'medium' } }, tools: ['read_context'] } });
     expect(ordinary.execution.skills).toEqual(sourceBefore.execution.skills);
-    expect(ordinary.execution.skills[0]?.bundle).toEqual(bundle);
+    expect(ordinary.execution.skills[0]?.bundle).toEqual(importedSkill.data.bundle);
     const ordinaryClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities, runKinds: ['implementation'] } }));
     checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${ordinary.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: ordinaryClaim.run.generation, threadId: sourceBefore.threadId } }));
     const completedOrdinary = (await sql`SELECT data FROM wb_records WHERE id=${ordinary.id} AND kind='run'`).at(0)?.data;
@@ -610,7 +635,7 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     expect(handoff.execution.connectionId).toBeUndefined();
     expect(handoff.execution.profile).toEqual(legacyBefore.execution.profile);
     expect(handoff.execution.skills).toEqual(legacyBefore.execution.skills);
-    expect(handoff.execution.skills[0]?.bundle).toEqual(bundle);
+    expect(handoff.execution.skills[0]?.bundle).toEqual(importedSkill.data.bundle);
     expect((await sql`SELECT data FROM wb_records WHERE id=${ordinary.id}`).at(0)?.data).toEqual(legacyBefore);
     expect((await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data).toEqual(sourceBefore);
   });
