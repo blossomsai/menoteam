@@ -170,6 +170,8 @@ export interface RuntimeProvider {
     runKinds?: string[];
     codexAppServer?: boolean;
     localWorktrees?: boolean;
+    deploymentTargets?: string[];
+    deliveryActions?: Array<'deploy_staging' | 'rollback_staging'>;
     models: string[];
     modelReasoningEfforts?: Record<string,string[]>;
     lastSeen: string;

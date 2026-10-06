@@ -208,6 +208,13 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (!projectIds.length) return [];
         const connectors = await sql`SELECT id, capabilities, last_seen, project_ids FROM wb_connectors WHERE project_ids ?| ${projectIds}`;
         return Promise.all(connectors.map(async c => {
+            const available=!!c.last_seen && Date.now()-new Date(c.last_seen).getTime()<120000;
+            const deploymentTargets=available&&Array.isArray(c.capabilities?.deploymentTargets)
+                ?c.capabilities.deploymentTargets.filter((target:unknown):target is string=>typeof target==='string'&&/^[a-z0-9][a-z0-9-]{0,63}$/u.test(target))
+                :[];
+            const deliveryActions=available&&Array.isArray(c.capabilities?.deliveryActions)
+                ?c.capabilities.deliveryActions.filter((action:unknown):action is 'deploy_staging'|'rollback_staging'=>action==='deploy_staging'||action==='rollback_staging')
+                :[];
             const evidence = await sql`SELECT r.id,r.data->>'updatedAt' AS verified_at FROM wb_records r
                 WHERE r.kind='run' AND r.project_id IN ${sql(projectIds)}
                 AND r.data->>'connectorId'=${c.id} AND r.data->>'status'='completed'
@@ -216,7 +223,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                     AND m.data->>'runId'=r.id AND m.data->>'role' IN ('master','agent','subagent'))
                 ORDER BY r.updated_at DESC LIMIT 1`;
             return {provider:'openai',method:'codex-host',connectorId:c.id,projectIds:(c.project_ids as string[]).filter(pid=>projectIds.includes(pid)),runKinds:c.capabilities?.runKinds,codexAppServer:c.capabilities?.codexAppServer,localWorktrees:c.capabilities?.localWorktrees,
-                available:!!c.last_seen && Date.now()-new Date(c.last_seen).getTime()<120000,
+                available,
+                ...(deploymentTargets.length?{deploymentTargets}:{}),
+                ...(deliveryActions.length?{deliveryActions}:{}),
                 models:Array.isArray(c.capabilities?.models)?c.capabilities.models:[],
                 ...(c.capabilities?.modelReasoningEfforts&&typeof c.capabilities.modelReasoningEfforts==='object'?{modelReasoningEfforts:c.capabilities.modelReasoningEfforts as Record<string,string[]>}:{}),
                 lastSeen:c.last_seen?new Date(c.last_seen).toISOString():'',

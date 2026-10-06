@@ -57,6 +57,57 @@ it('delivery settings render only the supported merge method and save merge by d
   await flush(()=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
   expect(save).toHaveBeenCalledWith(expect.objectContaining({data:expect.objectContaining({allowMergePr:true,mergeMethod:'merge',requiredChecks:['Menoteam CI']})}));
 });
+
+it('offers only fresh unambiguous project-granted staging targets and saves the selected policy',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=connections&project=project');
+  const value=snapshot('A');value.projects[0]!.repositoryUrl='https://github.com/org/repo';
+  value.runtimeProviders=[
+    {provider:'openai',method:'codex-host',connectorId:'granted',available:true,projectIds:['project'],deploymentTargets:['stage-safe','stage-ambiguous'],deliveryActions:['deploy_staging','rollback_staging'],models:[],lastSeen:'2026-10-07T00:00:00.000Z'},
+    {provider:'openai',method:'codex-host',connectorId:'duplicate',available:true,projectIds:['project'],deploymentTargets:['stage-ambiguous'],deliveryActions:['deploy_staging'],models:[],lastSeen:'2026-10-07T00:00:00.000Z'},
+    {provider:'openai',method:'codex-host',connectorId:'outside',available:true,projectIds:['other-project'],deploymentTargets:['stage-secret'],deliveryActions:['deploy_staging'],models:[],lastSeen:'2026-10-07T00:00:00.000Z'},
+    {provider:'openai',method:'codex-host',connectorId:'stale',available:false,projectIds:['project'],deploymentTargets:['stage-old'],deliveryActions:['deploy_staging'],models:[],lastSeen:'2020-01-01T00:00:00.000Z'},
+  ];
+  value.settings=[{id:'existing-delivery',kind:'connection',projectId:'project',name:'GitHub delivery',data:{provider:'github',url:'https://github.com/org/repo',purpose:'delivery',enabled:true,allowDraftPr:true,allowMergePr:false,allowStagingDeploy:false,stagingTargets:[]},updatedAt:'2026-10-07T00:00:00.000Z'}];
+  responses=[Promise.resolve(value)];
+  const update=vi.spyOn(workbenchApi,'updateSetting').mockResolvedValue(value.settings[0]!);
+  await mount();
+  expect(host.textContent).toContain('stage-safe');
+  expect(host.textContent).not.toContain('stage-ambiguous');expect(host.textContent).not.toContain('stage-secret');expect(host.textContent).not.toContain('stage-old');
+  await flush(()=>host.querySelector<HTMLInputElement>('#staging-target-stage-safe')!.click());
+  await flush(()=>host.querySelector<HTMLInputElement>('#allow-staging')!.click());
+  const form=host.querySelector<HTMLInputElement>('#delivery-base-branch')!.closest('form')!;
+  responses.push(Promise.resolve(value));
+  await flush(()=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  expect(update).toHaveBeenCalledWith('existing-delivery',expect.objectContaining({expectedUpdatedAt:'2026-10-07T00:00:00.000Z',data:expect.objectContaining({allowStagingDeploy:true,stagingTargets:['stage-safe']})}));
+});
+
+it('shows a connector-reported health receipt and only offers rollback to a project admin',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work');
+  const value=snapshot('A');value.projects[0]!.repositoryUrl='https://github.com/org/repo';value.projectRoles={project:'admin'};
+  value.works=[{id:'work',projectId:'project',title:'Review delivery',overview:'Check the staging receipt',status:'in_progress',revision:1,profileId:'',connectionId:'provider',sources:[],createdAt:'2026-10-07T00:00:00.000Z',updatedAt:'2026-10-07T00:00:00.000Z'}];
+  value.providerConnections=[{id:'provider',name:'Codex',connectorId:'connector',enabled:true,default:true,status:'available',models:[],projectIds:['project']}];
+  value.runtimeProviders=[{provider:'openai',method:'codex-host',connectorId:'stage-connector',available:true,projectIds:['project'],deploymentTargets:['stage-safe'],deliveryActions:['rollback_staging'],models:[],lastSeen:'2026-10-07T00:00:00.000Z'}];
+  value.settings=[{id:'delivery',kind:'connection',projectId:'project',name:'GitHub delivery',data:{provider:'github',purpose:'delivery',url:'https://github.com/org/repo',allowStagingDeploy:true,stagingTargets:['stage-safe'],configuredBy:'owner'},updatedAt:'2026-10-07T00:00:00.000Z'}];
+  value.runs=[{id:'stage-run',projectId:'project',workId:'work',prompt:'',requestedBy:'owner',kind:'delivery',model:'internal',reasoning:'none',status:'completed',generation:1,createdAt:'2026-10-07T00:00:00.000Z',updatedAt:'2026-10-07T00:00:00.000Z',operation:{action:'deploy_staging',actorId:'owner',candidateRunId:'candidate',candidateRevision:'revision',artifactRevision:'revision',commitSha:'a'.repeat(40),candidateFingerprint:'b'.repeat(64),repositoryUrl:'https://github.com/org/repo',baseRevision:'c'.repeat(40),baseBranch:'main',remoteBranch:'codex/test',workTitle:'Review delivery',changeSummary:'staging change',qaStatus:'current',phase:'health_passed',targetId:'stage-safe',imageDigest:`sha256:${'d'.repeat(64)}`,stagingReceipt:{operationId:'stage-run',targetId:'stage-safe',phase:'health_passed',deploymentId:'deploy-2',commitSha:'a'.repeat(40),imageDigest:`sha256:${'d'.repeat(64)}`,activeCommitSha:'a'.repeat(40),activeImageDigest:`sha256:${'d'.repeat(64)}`,previousDeploymentId:'deploy-1',previousImageDigest:`sha256:${'e'.repeat(64)}`,checkedAt:'2026-10-07T00:00:00.000Z'}}} as Snapshot['runs'][number]];
+  responses=[Promise.resolve(value)];
+  const rollback=vi.spyOn(workbenchApi,'requestStagingRollback').mockResolvedValue({operationId:'rollback-run',run:value.runs[0]!});
+  await mount();
+  expect(host.textContent).toContain('Health check passed');expect(host.textContent).toContain('does not confirm the user flow');expect(host.textContent).not.toContain('Verified');
+  responses.push(Promise.resolve(value));
+  await click('Roll back to previous verified version');
+  expect(rollback).toHaveBeenCalledWith('work',{deploymentRunId:'stage-run',targetId:'stage-safe',requestId:expect.any(String)});
+});
+
+it('keeps staging unknown and reserved without presenting rollback as a successful action',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work');
+  const value=snapshot('A');value.projects[0]!.repositoryUrl='https://github.com/org/repo';value.projectRoles={project:'owner'};
+  value.works=[{id:'work',projectId:'project',title:'Unknown staging result',overview:'',status:'in_progress',revision:1,profileId:'',sources:[],createdAt:'2026-10-07T00:00:00.000Z',updatedAt:'2026-10-07T00:00:00.000Z'}];
+  value.runs=[{id:'stage-unknown',projectId:'project',workId:'work',prompt:'',kind:'delivery',model:'internal',reasoning:'none',status:'failed',generation:1,createdAt:'2026-10-07T00:00:00.000Z',updatedAt:'2026-10-07T00:00:00.000Z',operation:{action:'deploy_staging',actorId:'owner',candidateRunId:'candidate',candidateRevision:'revision',artifactRevision:'revision',commitSha:'a'.repeat(40),candidateFingerprint:'b'.repeat(64),repositoryUrl:'https://github.com/org/repo',baseRevision:'c'.repeat(40),baseBranch:'main',remoteBranch:'codex/test',workTitle:'Unknown staging result',changeSummary:'staging change',qaStatus:'current',phase:'deploy_unknown',effectIntentGeneration:1,targetId:'stage-safe',imageDigest:`sha256:${'d'.repeat(64)}`,stagingReceipt:{operationId:'stage-unknown',targetId:'stage-safe',phase:'unknown',commitSha:'a'.repeat(40),imageDigest:`sha256:${'d'.repeat(64)}`,checkedAt:'2026-10-07T00:00:00.000Z'}}} as Snapshot['runs'][number]];
+  responses=[Promise.resolve(value)];
+  const rollback=vi.spyOn(workbenchApi,'requestStagingRollback');
+  await mount();
+  expect(host.textContent).toContain('Outcome unknown');expect(host.textContent).toContain('target remains reserved');expect(host.textContent).not.toContain('Health check passed');expect(host.querySelector('button')?.textContent).not.toContain('Roll back');expect(rollback).not.toHaveBeenCalled();
+});
 async function login() {
   await type(member.email, '#login-email');
   await type('password', '#login-password');

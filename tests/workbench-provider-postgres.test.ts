@@ -353,6 +353,8 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const projectB = await makeProject('Explicit provider Project B');
     const connectorA = await enrollFixtureConnector('default-a', projectA.id);
     const connectorB = await enrollFixtureConnector('explicit-b', projectB.id);
+    await sql`UPDATE wb_connectors SET capabilities=${sql.json({codexAppServer:true,localWorktrees:true,models:['gpt-6-luna','gpt-6.1-sol'],runKinds:[],deploymentTargets:['private-target-a'],deliveryActions:['deploy_staging','rollback_staging'],sshHost:'private.example.test',identityFile:'/private/key'} as never)} WHERE id=${connectorA.connectorId}`;
+    await sql`UPDATE wb_connectors SET capabilities=${sql.json({codexAppServer:true,localWorktrees:true,models:['gpt-6-luna','gpt-6.1-sol'],runKinds:[],deploymentTargets:['project-b-stage'],deliveryActions:['deploy_staging','rollback_staging'],sshHost:'private-b.example.test',identityFile:'/private/b-key'} as never)} WHERE id=${connectorB.connectorId}`;
     const connectionA = await addConnection(connectorA.connectorId, 'Project A default');
     const connectionB = await addConnection(connectorB.connectorId, 'Project B explicit');
     const defaultA = checked(await user('PATCH', `/settings/${connectionA.id}`, { data: { default: true } }));
@@ -361,12 +363,14 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
 
     const master = checked(await user('POST', `/projects/${projectB.id}/messages`, { text: 'Use Project B provider', connectionId: connectionB.id, requestId: `master-b-${suffix}` }));
     expect(master.run.execution).toMatchObject({ connectionId: connectionB.id, connectorId: connectorB.connectorId });
-    const masterClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorB.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['master'] } } }));
+    const masterClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorB.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['master'], deploymentTargets: ['project-b-stage'], deliveryActions: ['deploy_staging', 'rollback_staging'] } } }));
     expect(masterClaim.run.id).toBe(master.run.id);
     const bridgeToken = checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${master.run.id}/bridge-token`, headers: { authorization: `Bearer ${connectorB.token}` }, payload: { generation: masterClaim.run.generation } })).token;
     const bridgeCall = (action: string, input: Record<string, unknown>, requestId: string) => app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${master.run.id}/tools`, headers: { authorization: `Bearer ${bridgeToken}` }, payload: { generation: masterClaim.run.generation, action, input, requestId } });
     const context = checked(await bridgeCall('read_context', {}, `context-b-${suffix}`));
     expect(context.runtimeProviders.map((item: any) => item.connectorId)).toEqual([connectorB.connectorId]);
+    expect(context.runtimeProviders[0]).toMatchObject({projectIds:[projectB.id],deploymentTargets:['project-b-stage'],deliveryActions:['deploy_staging','rollback_staging']});
+    expect(JSON.stringify(context.runtimeProviders)).not.toMatch(/private-target-a|private\.example\.test|private-b\.example\.test|identityFile|sshHost/u);
     expect(context.providerConnections.map((item: any) => item.id)).toEqual([connectionB.id]);
     const createWork = await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${master.run.id}/tools`, headers: { authorization: `Bearer ${bridgeToken}` }, payload: { generation: masterClaim.run.generation, action: 'create_work', input: { title: 'Project B explicit Work', connectionId: connectionB.id }, requestId: `create-b-${suffix}` } });
     const created = checked(createWork);
@@ -399,6 +403,9 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     expect(memberLogin.statusCode).toBe(200);
     expect((await user('POST', `/projects/${projectB.id}/works`, { title: 'Member cannot select B connection', connectionId: connectionB.id }, memberCookie)).statusCode).toBe(403);
     expect((await user('POST', `/projects/${projectB.id}/messages`, { text: 'Member cannot run in B', connectionId: connectionB.id, requestId: `member-b-${suffix}` }, memberCookie)).statusCode).toBe(403);
+    await sql`UPDATE wb_connectors SET last_seen=now()-interval '3 minutes' WHERE id=${connectorB.connectorId}`;
+    const staleRuntime=checked(await user('GET','/snapshot')).runtimeProviders.find((item:any)=>item.connectorId===connectorB.connectorId);
+    expect(staleRuntime.available).toBe(false);expect(staleRuntime).not.toHaveProperty('deploymentTargets');expect(staleRuntime).not.toHaveProperty('deliveryActions');
   });
 
   it('serializes concurrent default changes and freezes Work and run execution identity', async () => {
