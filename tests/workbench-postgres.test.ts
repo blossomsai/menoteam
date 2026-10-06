@@ -1356,6 +1356,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const previousRun=verifiedDeployment(previousId,previousDigest,previousAt,{deploymentId:'deploy_previous'});
         const currentRun=verifiedDeployment(currentId,currentDigest,currentAt,{deploymentId:'deploy_current',previousDeploymentId:'deploy_previous',previousImageDigest:previousDigest});
         await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${previousRun.id},'run',${p.id},${sql.json(previousRun as never)}),(${currentRun.id},'run',${p.id},${sql.json(currentRun as never)})`;
+        // Restore mutation capabilities via normal discovery after the read-only reconciliation proof.
+        expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps,runKinds:[]}}})).statusCode).toBe(204);
         const rollbackRequest=(requestId:string)=>user('POST',`/works/${work.id}/staging/rollback`,{deploymentRunId:currentRun.id,targetId:'staging',requestId});
         const rollbackQueued=checkedJson(await rollbackRequest('rollback-first')) as {run:Run};
         expect(rollbackQueued.run.operation).toMatchObject({action:'rollback_staging',phase:'queued',previousDeploymentRunId:previousRun.id,previousDeploymentId:'deploy_previous',rollbackToImageDigest:previousDigest});
