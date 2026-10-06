@@ -34,7 +34,7 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
@@ -50,7 +50,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'tr
       return authorize(effect);
     },
     stagingProgress: async (_id: string, _generation: number, receipt: StagingReceipt) => { receipts.push(receipt); },
-    stopped: async (_id:string,generation:number)=>{stoppedAcks.push(generation);return claim.run;},
+    stopped: async (_id:string,generation:number)=>{expect(_id).toBe(runId);expect(generation).toBe(1);stoppedAcks.push(generation);await options.stopAck?.(stoppedAcks.length,await readJson<Record<string,unknown>>(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`)));claim.run.stoppedAt=new Date().toISOString();return claim.run;},
     complete: async (_id: string, _generation: number, completion: { error?: string }) => { completions.push(completion); await runner.stop(); return claim.run; },
     readRun: async () => claim.run,
   } as unknown as WorkbenchConnectorClient;
@@ -221,12 +221,39 @@ describe('staging delivery Connector integration', () => {
   },10_000);
 
 
-  it('stops an orphaned verified SSH group during paused recovery without a status effect',async()=>{
-    const claim=stagingClaim('deploy_intent');claim.run.status='paused';const stops:unknown[]=[];const effects:string[]=[];
+  it.each(['paused','cancelled','interrupted'] as const)('acknowledges an orphaned verified SSH group during %s recovery without a status effect',async status=>{
+    const claim=stagingClaim('deploy_intent');claim.run.status=status;const stops:unknown[]=[];const effects:string[]=[];
     const result=await execute(claim,async effect=>{effects.push(effect);throw new Error('paused recovery must not authorize status');},async()=>{throw new Error('no transport');},{recovery:true,recoveryIdentity:true,stopProcess:async value=>{stops.push(value);return true;}});
-    expect(stops).toEqual([identity]);expect(effects).toEqual([]);expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);
+    expect(stops).toEqual([identity]);expect(result.stoppedAcks).toEqual([1]);expect(claim.run.stoppedAt).toBeTruthy();expect(claim.run.status).toBe(status);expect(claim.run.operation?.phase).toBe('deploy_intent');expect(effects).toEqual([]);expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);
     expect(result.spools[0]).toMatchObject({stagingIntent:{commitSha,imageDigest},stagingTransportStopped:true});
     expect(result.spools[0]?.stagingProcessIdentity).toBeUndefined();
+  });
+
+  it('retries a durably saved recovery acknowledgement after its first request fails',async()=>{
+    const claim=stagingClaim('deploy_intent');claim.run.status='paused';const stops:unknown[]=[];
+    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,recoveryIdentity:true,stopProcess:async value=>{stops.push(value);return true;},stopAck:async(attempt,spool)=>{
+      expect(spool).toMatchObject({generation:1,stopped:true,stagingTransportStopped:true,stagingIntent:{commitSha,imageDigest}});
+      expect(spool?.stagingProcessIdentity).toBeUndefined();
+      if(attempt===1)throw new Error('acknowledgement response lost');
+    }});
+    expect(stops).toEqual([identity]);expect(result.stoppedAcks).toEqual([1,1]);expect(claim.run.stoppedAt).toBeTruthy();
+    expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);expect(claim.run.operation?.phase).toBe('deploy_intent');
+    expect(result.spools[0]).toMatchObject({stopped:false,stagingTransportStopped:true,stagingIntent:{commitSha,imageDigest}});
+  });
+
+  it('keeps failed recovery acknowledgements and unknown remote intent for a later Connector',async()=>{
+    const claim=stagingClaim('deploy_intent');claim.run.status='interrupted';
+    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,recoveryIdentity:true,stopProcess:async()=>true,stopAck:async()=>{throw new Error('server unavailable');}});
+    expect(result.stoppedAcks).toEqual([1,1]);expect(claim.run.stoppedAt).toBeUndefined();expect(claim.run.operation?.phase).toBe('deploy_intent');
+    expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);
+    expect(result.spools[0]).toMatchObject({stopped:true,stagingTransportStopped:true,stagingIntent:{commitSha,imageDigest}});
+  });
+
+  it('does not acknowledge a paused orphan group without verified local stop proof',async()=>{
+    const claim=stagingClaim('deploy_intent');claim.run.status='paused';
+    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,recoveryIdentity:true,stopProcess:async()=>false});
+    expect(result.stoppedAcks).toEqual([]);expect(claim.run.stoppedAt).toBeUndefined();expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);
+    expect(result.spools[0]).toMatchObject({stagingTransportStopped:false,stagingProcessIdentity:identity,stagingIntent:{commitSha,imageDigest}});
   });
 
   it('does not leak a heartbeat stop rejection or release an unconfirmed local group',async()=>{

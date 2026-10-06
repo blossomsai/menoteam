@@ -198,7 +198,12 @@ export class ConnectorRunner {
           if(!gone&&!await (this.dependencies?.staging?.stopProcess??stopStagingProcess)(spool.stagingProcessIdentity).catch(()=>false))continue;
           spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);
         }else if(!spool.stagingTransportStopped)continue;
-        if(['paused','cancelled','interrupted'].includes(remote.status))continue;
+        if(['paused','cancelled','interrupted'].includes(remote.status)){
+          // Local stop proof unlocks resume/retry; it does not resolve the remote
+          // deployment. Keep a failed acknowledgement durable for the next pass.
+          if(!remote.stoppedAt||spool.stopped){spool.stopped=true;await this.save(spool);try{await this.flush(spool);}catch{/* Retry only the same-generation local stop acknowledgement. */}}
+          continue;
+        }
         try{await this.reconcileStaging(spool);}catch{/* Unknown remote outcome and reservation stay durable. */}
         continue;
       }
