@@ -1,89 +1,131 @@
 import { createHash } from 'node:crypto';
-import { execFile as execFileCb, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, readFile, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import type { ConnectorConfig, DiffArtifactData, DiffFile, DiffLine } from './types.js';
 
-const execFile = promisify(execFileCb);
 const DIFF_LIMIT = 280_000;
 const MAX_BUFFER = 4 * 1024 * 1024;
 
+export interface GitOptions { signal?: AbortSignal; timeoutMs?: number; }
+const activeGit = new WeakMap<AbortSignal, Set<Promise<unknown>>>();
+
+/** Wait for this run's owned Git groups, including cancellation cleanup. */
+export async function waitForGit(signal: AbortSignal): Promise<void> {
+  await Promise.all([...(activeGit.get(signal) ?? [])].map(task=>task.catch(error=>{
+    if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS')throw error;
+  })));
+}
+
 export async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execFile('git', args, { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
-  return stdout;
+  return gitWithEnv(cwd, {}, args);
 }
 async function waitGitProcessGroup(pid:number,timeoutMs:number):Promise<boolean>{
   const deadline=Date.now()+timeoutMs;
   while(Date.now()<deadline){try{process.kill(-pid,0);}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')return true;}await new Promise(resolve=>setTimeout(resolve,40));}
   try{process.kill(-pid,0);return false;}catch(error){return (error as NodeJS.ErrnoException).code==='ESRCH';}
 }
-export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,args:string[],onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,timeoutMs=30_000):Promise<string>{
-  if(process.platform==='win32')throw new Error('Bounded Draft PR Git transport requires process-group signals');
-  return new Promise((resolve,reject)=>{
+export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,args:string[],onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,timeoutMs=30_000,signal?:AbortSignal):Promise<string>{
+  return (await executeGit(cwd,env,args,{timeoutMs,signal},onProcessStart,onProcessStop)).output;
+}
+function runGit(cwd:string,args:string[],options:GitOptions):Promise<string>{
+  return gitWithEnv(cwd,{},args,undefined,undefined,options.timeoutMs,options.signal);
+}
+function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOptions,onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,truncate=false):Promise<{output:string;truncated:boolean}>{
+  const {signal,timeoutMs=30_000}=options;
+  signal?.throwIfAborted();
+  if(process.platform==='win32')throw new Error('Bounded Connector Git requires process-group signals');
+  if(!Number.isFinite(timeoutMs)||timeoutMs<=0)throw new Error('Git deadline must be finite and positive');
+  const task=new Promise<{output:string;truncated:boolean}>((resolve,reject)=>{
     const child=spawn('git',args,{cwd,detached:true,stdio:['ignore','pipe','pipe'],shell:false,env:{...process.env,...env}});
-    const stdout:Buffer[]=[];let bytes=0;let stderr='';let timedOut=false;let oversized=false;let settled=false;let startError:Error|undefined;let startTask:Promise<void>|undefined;
+    const stdout:Buffer[]=[];let bytes=0;let captured=0;let stderr='';let timedOut=false;let oversized=false;let aborted=false;let startError:Error|undefined;let processError:Error|undefined;let startTask:Promise<void>|undefined;let settled=false;let stopTimer:NodeJS.Timeout|undefined;
     const killGroup=()=>{if(child.pid){try{process.kill(-child.pid,'SIGKILL');return;}catch{/* fall back to the direct child */}}child.kill('SIGKILL');};
-    const timer=setTimeout(()=>{timedOut=true;killGroup();},timeoutMs);
-    const fail=(error:Error)=>{if(settled)return;settled=true;clearTimeout(timer);reject(error);};
-    child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>MAX_BUFFER){oversized=true;killGroup();return;}stdout.push(chunk);});
+    const unconfirmed=()=>Object.assign(new Error('Git process group could not be confirmed stopped'),{code:'EUNCONFIRMEDPROCESS'});
+    const settle=(error?:Error,result?:{output:string;truncated:boolean})=>{
+      if(settled)return;settled=true;clearTimeout(timer);if(stopTimer)clearTimeout(stopTimer);signal?.removeEventListener('abort',abort);
+      if(error)reject(error);else resolve(result!);
+    };
+    const terminate=()=>{
+      killGroup();
+      // SIGKILL may itself be delayed by the OS; retain reservation rather than wait forever or claim stop.
+      stopTimer??=setTimeout(()=>settle(unconfirmed()),2300);
+    };
+    const abort=()=>{aborted=true;terminate();};
+    const timer=setTimeout(()=>{timedOut=true;terminate();},timeoutMs);
+    signal?.addEventListener('abort',abort,{once:true});
+    child.stdout.on('data',(chunk:Buffer)=>{
+      bytes+=chunk.length;
+      if(!truncate&&bytes>MAX_BUFFER){oversized=true;terminate();return;}
+      const keep=truncate?chunk.subarray(0,Math.max(0,DIFF_LIMIT-captured)):chunk;
+      if(keep.length){stdout.push(keep);captured+=keep.length;}
+    });
     child.stderr.on('data',(chunk:Buffer)=>{if(stderr.length<4096)stderr+=chunk.toString('utf8').slice(0,4096-stderr.length);});
-    if(onProcessStart)child.once('spawn',()=>{startTask=onProcessStart(child.pid!).catch(error=>{startError=error instanceof Error?error:new Error('Could not record Git transport process');killGroup();});});
-    child.once('error',error=>fail(error));
-    child.once('close',(code,signal)=>{void (async()=>{
+    if(onProcessStart)child.once('spawn',()=>{startTask=Promise.resolve().then(()=>onProcessStart(child.pid!)).catch(error=>{startError=error instanceof Error?error:new Error('Could not record Git transport process');terminate();});});
+    child.once('error',error=>{processError=error;terminate();});
+    child.once('close',(code,exitSignal)=>{clearTimeout(timer);void (async()=>{
+      if(settled)return;
       if(startTask)await startTask;
       if(child.pid&&!await waitGitProcessGroup(child.pid,100)){
         killGroup();
-        if(!await waitGitProcessGroup(child.pid,2000)){const error=new Error('Git transport process group could not be confirmed stopped') as NodeJS.ErrnoException;error.code='EUNCONFIRMEDPROCESS';throw error;}
+        if(!await waitGitProcessGroup(child.pid,2000))throw unconfirmed();
       }
       await onProcessStop?.();
-      if(settled)return;settled=true;clearTimeout(timer);
-      if(startError){reject(startError);return;}
-      if(timedOut||oversized){const error=new Error('Git transport exceeded its time or output limit') as NodeJS.ErrnoException;error.code=timedOut?'ETIMEDOUT':'ENOBUFS';reject(error);return;}
-      if(code!==0){const error=new Error(`Git command failed (${code??signal??'unknown'}): ${stderr.trim().slice(0,500)}`) as NodeJS.ErrnoException;error.code=String(code??signal??'UNKNOWN');reject(error);return;}
-      resolve(Buffer.concat(stdout).toString('utf8'));
-    })().catch(error=>fail(error instanceof Error?error:new Error('Git transport lifecycle callback failed')));});
+      if(startError)throw startError;
+      if(processError)throw processError;
+      if(aborted||timedOut||oversized){const error=new Error(aborted?'Git command cancelled':'Git command exceeded its time or output limit') as NodeJS.ErrnoException;error.code=aborted?'ABORT_ERR':timedOut?'ETIMEDOUT':'ENOBUFS';throw error;}
+      if(code!==0){const error=new Error(`Git command failed (${code??exitSignal??'unknown'}): ${stderr.trim().slice(0,500)}`) as NodeJS.ErrnoException;error.code=String(code??exitSignal??'UNKNOWN');throw error;}
+      return {output:Buffer.concat(stdout).toString('utf8'),truncated:truncate&&bytes>DIFF_LIMIT};
+    })().then(result=>{if(result)settle(undefined,result);},error=>settle(error));});
   });
+  if(signal){
+    let tasks=activeGit.get(signal);if(!tasks){tasks=new Set();activeGit.set(signal,tasks);}tasks.add(task);
+    const remove=()=>tasks.delete(task);void task.then(remove,error=>{if((error as NodeJS.ErrnoException).code!=='EUNCONFIRMEDPROCESS')remove();});
+  }
+  return task;
 }
 
 export interface Worktree { path: string; revision: string; baseRevision: string; artifactRevision?: string; }
 
 /** Worktrees are based only on committed refs. Existing dirty checkout files are never copied implicitly. */
-export async function ensureWorktree(config: ConnectorConfig, projectId: string, workId: string, baseRef = 'HEAD'): Promise<Worktree> {
+export async function ensureWorktree(config: ConnectorConfig, projectId: string, workId: string, baseRef = 'HEAD', options: GitOptions = {}): Promise<Worktree> {
+  options.signal?.throwIfAborted();
   const configured = config.projects[projectId];
   if (!configured) throw new Error(`No local repository is configured for project ${projectId}`);
   const root = await realpath(configured);
   const dataDir = path.resolve(config.dataDir);
   if (dataDir === root || dataDir.startsWith(`${root}${path.sep}`)) throw new Error('Connector data directory must be outside project repositories');
-  const commonDir = (await git(root, 'rev-parse', '--show-toplevel')).trim();
+  const commonDir = (await runGit(root, ['rev-parse', '--show-toplevel'], options)).trim();
   if (await realpath(commonDir) !== root) throw new Error('Configured repository path must be its canonical worktree root');
   const target = path.join(dataDir, 'worktrees', projectId, workId);
   const stateFile = path.join(dataDir, 'worktree-map', `${encodeURIComponent(workId)}.json`);
   await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
   try {
     const existing = await realpath(target);
-    const registered = (await git(root, 'worktree', 'list', '--porcelain')).split(/\n/u).some(line => line === `worktree ${existing}`);
+    const registered = (await runGit(root, ['worktree', 'list', '--porcelain'], options)).split(/\n/u).some(line => line === `worktree ${existing}`);
     if (!registered || !existing.startsWith(`${path.join(dataDir, 'worktrees')}${path.sep}`)) throw new Error('Existing worktree mapping is not a registered connector worktree');
     const saved = JSON.parse(await readFile(stateFile, 'utf8')) as Worktree;
     if (saved.path !== existing || !/^[a-f0-9]{40,64}$/u.test(saved.baseRevision)) throw new Error('Saved Work mapping does not match the registered local worktree');
-    return { ...saved, revision: (await git(existing, 'rev-parse', 'HEAD')).trim() };
+    return { ...saved, revision: (await runGit(existing, ['rev-parse', 'HEAD'], options)).trim() };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
-  const revision = (await git(root, 'rev-parse', '--verify', `${baseRef}^{commit}`)).trim();
-  await git(root, 'worktree', 'add', '--detach', target, revision);
+  const revision = (await runGit(root, ['rev-parse', '--verify', `${baseRef}^{commit}`], options)).trim();
+  // Checking out a large repository gets more time than metadata commands, while remaining bounded.
+  await runGit(root, ['worktree', 'add', '--detach', target, revision], { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const actual = await realpath(target);
   const result = { path: actual, revision, baseRevision: revision };
+  options.signal?.throwIfAborted();
   await persistWorktreeMap(dataDir, workId, result);
   return result;
 }
 
-export async function fingerprint(cwd: string): Promise<string> {
+export async function fingerprint(cwd: string, options: GitOptions = {}): Promise<string> {
   const root = path.resolve(cwd);
-  const files = [...new Set((await git(cwd, 'ls-files', '-z', '--cached', '--others', '--exclude-standard')).split('\0').filter(Boolean))].sort();
+  const files = [...new Set((await runGit(cwd, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'], options)).split('\0').filter(Boolean))].sort();
   const hash = createHash('sha256');
   for (const file of files) {
+    options.signal?.throwIfAborted();
     const absolute = path.resolve(cwd, file);
     if (!absolute.startsWith(`${root}${path.sep}`)) throw new Error('Indexed path escaped the worktree');
     let metadata;
@@ -92,7 +134,7 @@ export async function fingerprint(cwd: string): Promise<string> {
     if (metadata.isSymbolicLink()) contentHash = createHash('sha256').update(`symlink:${await readlink(absolute)}`).digest('hex');
     else if (metadata.isFile()) {
       const fileHash = createHash('sha256');
-      for await (const chunk of createReadStream(absolute)) fileHash.update(chunk as Buffer);
+      for await (const chunk of createReadStream(absolute, { signal: options.signal })) fileHash.update(chunk as Buffer);
       contentHash = fileHash.digest('hex');
     } else contentHash = 'unsupported-file-kind';
     hash.update(`${file}\0${metadata.mode & 0o111}\0${metadata.isSymbolicLink() ? 'link' : metadata.isFile() ? 'file' : 'other'}\0${contentHash}\0`);
@@ -100,18 +142,18 @@ export async function fingerprint(cwd: string): Promise<string> {
   return hash.digest('hex');
 }
 
-export async function checkpoint(cwd: string, message: string): Promise<string> {
-  const before = await git(cwd, 'status', '--porcelain=v1', '--untracked-files=all');
-  if (!before.trim()) return (await git(cwd, 'rev-parse', 'HEAD')).trim();
-  await git(cwd, 'add', '-A', '--');
-  await execFile('git', ['-c','user.name=Menoteam Connector','-c','user.email=connector@localhost','commit','-m',message.slice(0,160)], { cwd, encoding:'utf8', maxBuffer: MAX_BUFFER });
-  return (await git(cwd, 'rev-parse', 'HEAD')).trim();
+export async function checkpoint(cwd: string, message: string, options: GitOptions = {}): Promise<string> {
+  const before = await runGit(cwd, ['status', '--porcelain=v1', '--untracked-files=all'], options);
+  if (!before.trim()) return (await runGit(cwd, ['rev-parse', 'HEAD'], options)).trim();
+  await runGit(cwd, ['add', '-A', '--'], options);
+  await runGit(cwd, ['-c','user.name=Menoteam Connector','-c','user.email=connector@localhost','commit','-m',message.slice(0,160)], options);
+  return (await runGit(cwd, ['rev-parse', 'HEAD'], options)).trim();
 }
 
-export async function createDiff(cwd: string, baseRevision: string): Promise<DiffArtifactData> {
+export async function createDiff(cwd: string, baseRevision: string, options: GitOptions = {}): Promise<DiffArtifactData> {
   if (!/^[a-f0-9]{40,64}$/u.test(baseRevision)) throw new Error('Diff base revision is invalid');
-  const candidateRevision = (await git(cwd, 'rev-parse', 'HEAD')).trim();
-  const names = await git(cwd, 'diff', '--name-status', '-z', '--find-renames', `${baseRevision}..HEAD`, '--');
+  const candidateRevision = (await runGit(cwd, ['rev-parse', 'HEAD'], options)).trim();
+  const names = await runGit(cwd, ['diff', '--name-status', '-z', '--find-renames', `${baseRevision}..HEAD`, '--'], options);
   const paths: Array<{ path: string; oldPath?: string; status: DiffFile['status'] }> = [];
   const nameParts = names.split('\0');
   for (let i = 0; i < nameParts.length;) {
@@ -121,9 +163,9 @@ export async function createDiff(cwd: string, baseRevision: string): Promise<Dif
     const state = code?.startsWith('R') ? 'renamed' : code === 'A' ? 'added' : code === 'D' ? 'deleted' : 'modified';
     paths.push(state === 'renamed' ? { path: second!, oldPath: first!, status: state } : { path: first!, status: state });
   }
-  const bounded = await boundedDiff(cwd, ['diff', '--find-renames', '--binary', '--no-ext-diff', '-U0', `${baseRevision}..${candidateRevision}`, '--']);
+  const bounded = await boundedDiff(cwd, ['diff', '--find-renames', '--binary', '--no-ext-diff', '-U0', `${baseRevision}..${candidateRevision}`, '--'], options);
   const patch = bounded.patch;
-  const patchStats = await git(cwd, 'diff', '--numstat', '-z', '--no-renames', `${baseRevision}..${candidateRevision}`, '--');
+  const patchStats = await runGit(cwd, ['diff', '--numstat', '-z', '--no-renames', `${baseRevision}..${candidateRevision}`, '--'], options);
   let totalAdditions = 0; let totalDeletions = 0;
   for (const row of patchStats.split('\0')) {
     const first = row.indexOf('\t'); if (first < 0) continue;
@@ -175,20 +217,7 @@ export function diffRevision(diff: DiffArtifactData): string {
   return createHash('sha256').update(diff.baseRevision).update('\0').update(diff.candidateRevision).digest('hex');
 }
 
-async function boundedDiff(cwd: string, args: string[]): Promise<{ patch: string; truncated: boolean }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, stdio: ['ignore','pipe','pipe'], shell: false });
-    const chunks: Buffer[] = []; let captured = 0; let total = 0; let stderr = '';
-    child.stdout.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (captured >= DIFF_LIMIT) return;
-      const keep = chunk.subarray(0, DIFF_LIMIT - captured); chunks.push(keep); captured += keep.length;
-    });
-    child.stderr.on('data', (chunk: Buffer) => { if (stderr.length < 4096) stderr += chunk.toString('utf8').slice(0, 4096 - stderr.length); });
-    child.once('error', reject);
-    child.once('close', code => {
-      if (code !== 0) reject(new Error(`git diff failed (${code ?? 'signal'}): ${stderr.trim().slice(0, 500)}`));
-      else resolve({ patch: Buffer.concat(chunks).toString('utf8'), truncated: total > DIFF_LIMIT });
-    });
-  });
+async function boundedDiff(cwd: string, args: string[], options: GitOptions): Promise<{ patch: string; truncated: boolean }> {
+  const result=await executeGit(cwd,{},args,options,undefined,undefined,true);
+  return {patch:result.output,truncated:result.truncated};
 }

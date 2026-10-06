@@ -82,7 +82,7 @@ export class CodexAppServer {
 
   async run(claim: ClaimedRun, cwd: string, prompt: string, threadId: string | undefined,
     onEvent: (event: Omit<ConnectorEvent, 'id'>) => void,
-    bridgeContextFile?: string): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
+    bridgeContextFile?: string, signal?: AbortSignal): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
     if (!this.child) await this.start(cwd);
     if (!this.models.includes(claim.run.model)) throw Object.assign(new Error(`Requested model is unavailable on this connector: ${claim.run.model}`), {nativeStage:'model-validation',nativeCategory:'unavailable-model'});
     if (claim.run.handoffFromRunId && !this.modelReasoningEfforts[claim.run.model]?.includes(claim.run.reasoning)) throw Object.assign(new Error(`Requested reasoning effort is unavailable for this model on this connector: ${claim.run.reasoning}`), {nativeStage:'model-validation',nativeCategory:'unavailable-reasoning-effort'});
@@ -122,7 +122,7 @@ export class CodexAppServer {
       if (p.threadId && p.threadId !== id) return;
       const item = p.item;
       if (message.method === 'item/started' && item?.type === 'commandExecution' && isVerificationCommand(item)) {
-        commandStarts.set(item.id, fingerprint(cwd).catch(() => null));
+        commandStarts.set(item.id, fingerprint(cwd,{signal}).catch(() => null));
       }
       if (message.method === 'item/completed' && item?.type === 'agentMessage' && typeof item.text === 'string') {
         finalText = item.text;
@@ -134,7 +134,7 @@ export class CodexAppServer {
           const evidence = (async () => {
             const before = await commandStarts.get(item.id) ?? null;
             const finishedAt = new Date().toISOString();
-            let after: string | null = null; try { after = await fingerprint(cwd); } catch { /* unproven */ }
+            let after: string | null = null; try { after = await fingerprint(cwd,{signal}); } catch { /* unproven */ }
             const testedRevision = before && before === after ? before : null;
             const durationMs = typeof item.durationMs === 'number' ? item.durationMs : null;
             checks.push({ name: command.slice(0, 160), command: command.slice(0, 1000), exitCode: item.exitCode ?? null, output: String(item.aggregatedOutput ?? '').slice(0, 30_000), outputChannel: 'combined', durationMs, startedAt: durationMs === null ? null : new Date(Date.parse(finishedAt) - durationMs).toISOString(), finishedAt, testedRevision, source: 'codex-command' });

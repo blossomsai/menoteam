@@ -5,7 +5,7 @@ import { mkdir, readdir, unlink, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer, readGitProcessIdentity, terminateVerifiedGitProcessGroup, terminateVerifiedProcessGroup, waitProcessGroup, type CodexProcessIdentity, type GitProcessIdentity } from './codex.js';
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
-import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap } from './git.js';
+import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
 import { assertExecutionSelection } from './selection.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
@@ -26,6 +26,7 @@ interface Spool {
   threadId?: string;
   completion?: {threadId?:string;error?:string};
   stopped?: boolean;
+  gitStopUnconfirmed?: boolean;
   processIdentity?:CodexProcessIdentity;
   skillDirectory?:string;
   qaInFlight?: boolean;
@@ -47,7 +48,7 @@ export function buildRunPrompt(claim: ClaimedRun, skillPaths?: Record<string, st
 export class ConnectorRunner {
   private closing = false;
   private readonly active = new Set<CodexAppServer>();
-  private readonly qaAborts = new Set<AbortController>();
+  private readonly runAborts = new Set<AbortController>();
   private readonly tasks = new Set<Promise<void>>();
   private readonly activeRuns = new Set<string>();
   private readonly activeKinds = new Map<string,ClaimedRun['run']['kind']>();
@@ -62,8 +63,8 @@ export class ConnectorRunner {
 
   async stop(): Promise<void> {
     this.closing = true;
-    for(const abort of this.qaAborts)abort.abort();
-    await Promise.all([...this.active].map(native=>native.stop()));
+    for(const abort of this.runAborts)abort.abort();
+    await Promise.all([...this.active].map(native=>native.stop()).concat([...this.runAborts].map(abort=>waitForGit(abort.signal))));
   }
 
   async run(): Promise<void> {
@@ -138,6 +139,10 @@ export class ConnectorRunner {
       if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
       const spool = await readJson<Spool>(path.join(directory,file));
       if (!spool || this.activeRuns.has(spool.runId)) continue;
+      if(spool.gitStopUnconfirmed){
+        if(!this.reportedRecovery.has(spool.runId))console.error('Git process group stop remains unconfirmed; manual Connector recovery is required');
+        this.reportedRecovery.add(spool.runId);continue; // Native stop proof cannot release an unconfirmed Git group.
+      }
       const remote = await this.client!.readRun(spool.runId);
       if (remote.generation !== spool.generation) continue; // Never reconcile a different execution.
       // A live original executor can be between commands. Never stop/release its QA or resource.
@@ -206,8 +211,10 @@ export class ConnectorRunner {
     const native = this.native();
     this.active.add(native);
     let cancelled = false;
-    const qaAbort = new AbortController();
-    this.qaAborts.add(qaAbort);
+    const runAbort = new AbortController();
+    this.runAborts.add(runAbort);
+    if(this.closing)runAbort.abort();
+    const gitOptions={signal:runAbort.signal};
     let timer:NodeJS.Timeout|undefined;
     let monitoring = false;
     let monitorPromise:Promise<void>|undefined;
@@ -216,30 +223,30 @@ export class ConnectorRunner {
     let skillFiles:RunSkillFiles|undefined;
     let stage='prepare-workspace';
     const monitor = async () => {
-      if (monitoring) return;
+      if (monitoring || runAbort.signal.aborted) return;
       monitoring = true;
       try {
         const remote = await client.readRun(claim.run.id);
         if (remote.generation !== claim.run.generation || remote.status !== 'running' || this.closing) {
-          cancelled = true; qaAbort.abort(); await native.stop();
-        } else await client.renew(claim.run.id,claim.run.generation);
-      } catch { cancelled = true; qaAbort.abort(); await native.stop(); }
+          cancelled = true; runAbort.abort(); await waitForGit(runAbort.signal); await native.stop();
+        } else if(!runAbort.signal.aborted&&!this.closing)await client.renew(claim.run.id,claim.run.generation);
+      } catch { cancelled = true; runAbort.abort(); await waitForGit(runAbort.signal); await native.stop(); }
       finally { monitoring = false; }
     };
     try {
       assertExecutionSelection(claim.run,this.config.connectorId);
-      timer = setInterval(()=>{if(!monitoring)monitorPromise=monitor();},this.config.leaseRenewIntervalMs ?? 10000);
+      timer = setInterval(()=>{if(!monitoring){monitorPromise=monitor();void monitorPromise.catch(()=>{});}},this.config.leaseRenewIntervalMs ?? 10000);
       // Keep Master shell/filesystem access away from enrollment configuration, spool and bridge grants.
       let cwd = path.join(path.dirname(path.resolve(this.config.dataDir)),`menoteam-master-${stateKey(this.config.connectorId,claim.run.projectId)}`);
       await mkdir(cwd,{recursive:true,mode:0o700});
       let baseRevision = '';
       if (requiresLocalWorktree(claim.run.kind)) {
         if (!claim.run.workId) throw new Error('Worker run requires Work identity');
-        const worktree = await ensureWorktree(this.config,claim.run.projectId,claim.run.workId);
+        const worktree = await ensureWorktree(this.config,claim.run.projectId,claim.run.workId,'HEAD',gitOptions);
         cwd = worktree.path; baseRevision = worktree.baseRevision;
         if (claim.run.kind === 'review') {
           const saved = await readWorktreeMap(this.config.dataDir,claim.run.workId);
-          const actual = diffRevision(await createDiff(cwd,baseRevision));
+          const actual = diffRevision(await createDiff(cwd,baseRevision,gitOptions));
           if (!claim.run.targetRevision || saved?.artifactRevision !== claim.run.targetRevision || actual !== claim.run.targetRevision)
             throw new Error('Review candidate revision does not match immutable target');
         }
@@ -254,12 +261,13 @@ export class ConnectorRunner {
         await writeSecureJson(bridgeFile,{serverUrl:this.config.serverUrl,token:grant.token,runId:claim.run.id,generation:claim.run.generation});
       }
       stage='native-start';
+      runAbort.signal.throwIfAborted();
       await native.start(cwd);
       stage='process-identity';
       spool.processIdentity=await native.processIdentity();
       if(!spool.processIdentity) throw new Error('Native process identity could not be verified');
       await this.save(spool);
-      const before = claim.run.kind === 'review' ? await fingerprint(cwd) : '';
+      const before = claim.run.kind === 'review' ? await fingerprint(cwd,gitOptions) : '';
       stage='native-run';
       // Read immediately before turn start: settings, grants and model discovery may
       // have changed while the isolated Worktree/native process was prepared.
@@ -267,6 +275,7 @@ export class ConnectorRunner {
       assertExecutionSelection(authorized,this.config.connectorId);
       if(authorized.status!=='running'||authorized.generation!==claim.run.generation||!isDeepStrictEqual(authorized.execution,claim.run.execution)||authorized.model!==claim.run.model||authorized.threadId!==claim.run.threadId||authorized.reasoning!==claim.run.reasoning||authorized.projectId!==claim.run.projectId||authorized.workId!==claim.run.workId||authorized.kind!==claim.run.kind)
         throw new Error('Frozen native execution authorization changed');
+      runAbort.signal.throwIfAborted();
       const result = await native.run(claim,cwd,buildRunPrompt(claim,skillFiles.paths),claim.run.threadId,event => {
         const entry:ConnectorEvent = {id:randomUUID(),...event,text:event.text.slice(0,60000)};
         eventWrites = eventWrites.then(async()=>{
@@ -275,36 +284,39 @@ export class ConnectorRunner {
           // Best effort streaming; failed requests retain the exact same IDs for retry.
           try { await this.flush(spool); } catch { /* retried at final sync */ }
         });
-      },bridgeFile);
+      },bridgeFile,runAbort.signal);
       await native.stop();
+      await waitForGit(runAbort.signal);
       await monitorPromise;
       await eventWrites;
       await skillFiles.cleanup(); spool.skillDirectory=undefined; await this.save(spool);
       spool.threadId = result.threadId;
       if (cancelled || this.closing) { spool.stopped=true; await this.save(spool); await this.flush(spool); return; }
       if (claim.run.kind === 'implementation') {
-        await checkpoint(cwd,`Menoteam Work ${claim.run.workId}`);
-        const diff = await createDiff(cwd,baseRevision);
+        await checkpoint(cwd,`Menoteam Work ${claim.run.workId}`,gitOptions);
+        const diff = await createDiff(cwd,baseRevision,gitOptions);
         const revision = diffRevision(diff);
         const saved = await readWorktreeMap(this.config.dataDir,claim.run.workId!);
         await persistWorktreeMap(this.config.dataDir,claim.run.workId!,{...saved!,artifactRevision:revision});
         spool.artifacts.push({kind:'diff',revision,data:diff,requestId:`diff:${claim.run.id}:${claim.run.generation}`});
         spool.qaExecution={directory:path.join(this.config.dataDir,'qa',randomUUID()),nonce:randomUUID(),phase:'stopped'};await bindQaExecutor(spool.qaExecution);spool.qaInFlight=true;await this.save(spool);
         const currentQaPolicy=savedQaPolicy(claim.settings,claim.run.projectId,claim.project.repositoryUrl);
-        const requiredQa=await captureRequiredLocalQa(cwd,{policy:sameQaPolicy(currentQaPolicy,claim.run.qaPolicySnapshot)?claim.run.qaPolicySnapshot:undefined,resources:this.config.qaResources??{},dataDirectory:path.join(this.config.dataDir,'qa'),state:spool.qaExecution,authorize:async()=>{await client.authorizeQaEffect(claim.run.id,claim.run.generation);},signal:qaAbort.signal,save:async state=>{spool.qaExecution=state;await this.save(spool);}});
+        const requiredQa=await captureRequiredLocalQa(cwd,{policy:sameQaPolicy(currentQaPolicy,claim.run.qaPolicySnapshot)?claim.run.qaPolicySnapshot:undefined,resources:this.config.qaResources??{},dataDirectory:path.join(this.config.dataDir,'qa'),state:spool.qaExecution,authorize:async()=>{await client.authorizeQaEffect(claim.run.id,claim.run.generation);},signal:runAbort.signal,save:async state=>{spool.qaExecution=state;await this.save(spool);}});
         spool.qaInFlight=false;await this.save(spool);
         spool.artifacts.push({kind:'qa',revision,data:{...requiredQa,revision},requestId:`required-qa:${claim.run.id}:${claim.run.generation}`});
       }
       if (requiresLocalWorktree(claim.run.kind)) {
-        const revision = diffRevision(await createDiff(cwd,baseRevision));
-        const candidateFingerprint=await fingerprint(cwd);
+        const revision = diffRevision(await createDiff(cwd,baseRevision,gitOptions));
+        const candidateFingerprint=await fingerprint(cwd,gitOptions);
         const reviewModified = claim.run.kind === 'review' && before !== candidateFingerprint;
         const stale = reviewModified || result.checks.some(check => !check.testedRevision || check.testedRevision !== candidateFingerprint);
         spool.artifacts.push({kind:'qa',revision,data:{checks:result.checks,capturedAt:new Date().toISOString(),revision,candidateFingerprint,stale,verification:result.checks.length===0?'unknown':stale?'stale':'current',review:claim.run.kind==='review'?result.text:undefined},requestId:`qa:${claim.run.id}:${claim.run.generation}`});
         if(reviewModified) throw new Error('Review modified immutable candidate');
       }
+      runAbort.signal.throwIfAborted();
       spool.completion={threadId:result.threadId}; await this.save(spool); await this.flush(spool);
     } catch (error) {
+      if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);throw error;}
       if(spool.qaInFlight){
         if(!spool.qaExecution||!await stopQaExecution(spool.qaExecution)){await this.save(spool);throw new Error('Fixed QA stop is unconfirmed; preserve the Work reservation for operator reconciliation');}
         assertQaResourcePolicy(spool.qaExecution,claim.run.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);spool.qaInFlight=false;await this.save(spool);
@@ -332,7 +344,7 @@ export class ConnectorRunner {
       try {await this.flush(spool);} catch { /* Durable spool is replayed on restart; no unsafe re-execution. */ }
       throw error;
     } finally {
-      this.qaAborts.delete(qaAbort);
+      this.runAborts.delete(runAbort);
       if(timer) clearInterval(timer);
       await monitorPromise;
       await native.stop();
