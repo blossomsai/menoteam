@@ -454,6 +454,40 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('This legacy Work continues on its recorded Connector and native thread.'); expect(host.textContent).not.toContain('Execution is blocked'); expect(host.textContent).not.toContain('Connector unavailable');
   });
 
+  it('uses the authorized legacy runtime provider when the entire execution snapshot is absent', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=legacy-work');
+    const work = { id: 'legacy-work', projectId: project.id, title: 'Legacy Work', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const run = { id: 'legacy-run-private-id', projectId: project.id, workId: work.id, prompt: 'Continue', kind: 'implementation' as const, model: 'gpt-6-luna', reasoning: 'medium', status: 'running' as const, generation: 1, connectorId: runtime.connectorId, threadId: 'legacy-thread-private-id', createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
+    await mount({ ...snapshot(owner), works: [work], runs: [run] });
+    const details = host.querySelector('details')!;
+    expect(details.open).toBe(false);
+    const collapsedSummary = host.textContent?.replace(details.textContent ?? '', '') ?? '';
+    expect(collapsedSummary).toContain('OpenAI'); expect(collapsedSummary).toContain('gpt-6-luna'); expect(collapsedSummary).toContain('historical affinity');
+    expect(collapsedSummary).not.toContain('Provider not recorded'); expect(collapsedSummary).not.toContain('unavailable');
+    expect(collapsedSummary).not.toContain('legacy-run-private-id'); expect(collapsedSummary).not.toContain(runtime.connectorId); expect(collapsedSummary).not.toContain('legacy-thread-private-id');
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    expect(details.textContent).toContain('legacy-run-private-id'); expect(details.textContent).toContain(runtime.connectorId); expect(details.textContent).toContain('legacy-thread-private-id');
+    details.open = true;
+    expect(details.open).toBe(true);
+    expect(details.textContent).toContain('legacy-thread-private-id');
+  });
+
+  it('keeps unknown provider metadata neutral and reports an unavailable legacy runtime', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=unknown-provider-work');
+    const work = { id: 'unknown-provider-work', projectId: project.id, title: 'Unknown Provider Work', overview: '', status: 'paused' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const run = { id: 'unknown-provider-run', projectId: project.id, workId: work.id, prompt: 'Continue', kind: 'implementation' as const, model: 'gpt-6-luna', reasoning: 'medium', status: 'paused' as const, generation: 1, connectorId: runtime.connectorId, threadId: 'unknown-provider-thread', createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
+    const unknownRuntime = { ...runtime, provider: undefined, available: false } as unknown as Snapshot['runtimeProviders'][number];
+    await mount({ ...snapshot(owner), runtimeProviders: [unknownRuntime], works: [work], runs: [run] });
+    const details = host.querySelector('details')!;
+    const collapsedSummary = host.textContent?.replace(details.textContent ?? '', '') ?? '';
+    expect(collapsedSummary).toContain('Provider not recorded');
+    expect(collapsedSummary).toContain('historical ID recorded · unavailable');
+    expect(collapsedSummary).not.toContain('historical affinity');
+    const alert = host.querySelector('[role="alert"]');
+    expect(alert?.closest('details')).toBeNull();
+    expect(alert?.textContent).toContain('historical Connector identity is recorded, but that Connector is currently unavailable.');
+  });
+
   it('keeps readable handoff summary and actual failures visible while IDs stay in collapsed diagnostics', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=handoff-work');
     const work = { id: 'handoff-work', projectId: project.id, title: 'Handoff Work', overview: '', status: 'failed' as const, revision: 2, profileId: 'profile-private-id', connectionId: providerSetting.id, sources: [], createdAt: '', updatedAt: '' };
