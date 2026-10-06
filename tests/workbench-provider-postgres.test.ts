@@ -370,8 +370,9 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const implementation = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Create review candidate', workId: work.id, requestId: `review-candidate-${suffix}` })).run;
     const implementationClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['implementation'] } } }));
     expect(implementationClaim.run.id).toBe(implementation.id);
-    const diff = await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${implementation.id}/artifacts`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: implementationClaim.run.generation, kind: 'diff', revision: `candidate-${suffix}`, data: { files: [{ path: 'src/example.ts', added: 1, removed: 0 }] }, requestId: `review-diff-${suffix}` } });
-    checked(diff);
+    const diff = await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${implementation.id}/artifacts`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: implementationClaim.run.generation, kind: 'diff', revision: `candidate-${suffix}`, data: { files: [{ path: 'src/example.ts', added: 1, removed: 0 }], candidateRevision: 'a'.repeat(40) }, requestId: `review-diff-${suffix}` } });
+    const diffArtifact=checked(diff);
+    const qaArtifact=checked(await app.inject({method:'POST',url:`/api/workbench/connector/runs/${implementation.id}/artifacts`,headers:{authorization:`Bearer ${host.token}`},payload:{generation:implementationClaim.run.generation,kind:'qa',revision:`candidate-${suffix}`,data:{candidateFingerprint:'b'.repeat(64),stale:false,checks:[]},requestId:`review-qa-${suffix}`}}));
     checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${implementation.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: implementationClaim.run.generation, threadId: `review-candidate-thread-${suffix}` } }));
 
     const masterClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['master'] } } }));
@@ -389,6 +390,7 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
 
     await sql`UPDATE wb_connectors SET capabilities=${sql.json({ codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['master', 'review'] })} WHERE id=${host.connectorId}`;
     const review = checked(await tool('review', `review-request-accepted-${suffix}`));
+    expect(review.reviewBinding).toMatchObject({candidateRunId:implementation.id,commitSha:'a'.repeat(40),candidateFingerprint:'b'.repeat(64),diffArtifactId:diffArtifact.id,diffRevision:`candidate-${suffix}`,qaArtifactIds:[qaArtifact.id]});
     expect(review).toMatchObject({ kind: 'review', workId: work.id, targetConnectorId: host.connectorId, execution: { connectionId: connection.id, connectorId: host.connectorId } });
     checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${master.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: masterClaim.run.generation } }));
     const reviewClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['review'] } } }));
@@ -432,7 +434,8 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
       const headers = { authorization: `Bearer ${host.token}` };
       const claim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol'], runKinds: ['implementation'] } } }));
       expect(claim.run.id).toBe(implementation.id);
-      checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${implementation.id}/artifacts`, headers, payload: { generation: claim.run.generation, kind: 'diff', revision: `cross-kind-candidate-${mode}-${suffix}`, data: { files: [{ path: 'src/implementation.ts', added: 1, removed: 0 }] }, requestId: `cross-kind-diff-${mode}-${suffix}` } }));
+      const diffArtifact=checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${implementation.id}/artifacts`, headers, payload: { generation: claim.run.generation, kind: 'diff', revision: `cross-kind-candidate-${mode}-${suffix}`, data: { files: [{ path: 'src/implementation.ts', added: 1, removed: 0 }],candidateRevision:'c'.repeat(40) }, requestId: `cross-kind-diff-${mode}-${suffix}` } }));
+      const qaArtifact=checked(await app.inject({method:'POST',url:`/api/workbench/connector/runs/${implementation.id}/artifacts`,headers,payload:{generation:claim.run.generation,kind:'qa',revision:`cross-kind-candidate-${mode}-${suffix}`,data:{candidateFingerprint:'d'.repeat(64),stale:false,checks:[]},requestId:`cross-kind-qa-${mode}-${suffix}`}}));
 
       // Simulate a valid frozen historical record through the test-store boundary;
       // public profile settings intentionally reject configurable tools.
@@ -460,6 +463,7 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
         payload: { generation: masterClaim.run.generation, action: 'dispatch', input: { workId: work.id, kind: 'review', model: 'gpt-6.1-sol', reasoning: 'high', prompt: 'Review the recorded candidate with review settings' }, requestId: `cross-kind-review-${mode}-${suffix}` }
       }));
 
+      expect(review.reviewBinding).toMatchObject({candidateRunId:implementation.id,commitSha:'c'.repeat(40),candidateFingerprint:'d'.repeat(64),diffArtifactId:diffArtifact.id,diffRevision:`cross-kind-candidate-${mode}-${suffix}`,qaArtifactIds:[qaArtifact.id]});
       expect(review).toMatchObject({ kind: 'review', workId: work.id, model: 'gpt-6.1-sol', reasoning: 'high', targetRevision: `cross-kind-candidate-${mode}-${suffix}`, targetRunId: implementation.id, targetConnectorId: host.connectorId, execution: { provider: 'openai', method: 'codex-host', connectorId: host.connectorId, model: 'gpt-6.1-sol', skills: [], tools: [] } });
       expect(review.threadId).toBeUndefined();
       expect(review.execution.connectionId).toBe(legacy ? undefined : connection.id);

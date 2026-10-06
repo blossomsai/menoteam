@@ -749,9 +749,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     it('real HTTP client -> Fastify -> PostgreSQL freezes explicit generic QA policy and denies changed, forged and revoked captures',async()=>{
         const serverUrl=await app.listen({port:0,host:'127.0.0.1'});
         const browser=async(method:string,path:string,body?:unknown,status=200)=>{const response=await fetch(`${serverUrl}/api/workbench${path}`,{method,headers:{cookie,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const value=await response.json();expect(response.status).toBe(status);return value as any;};
-        const p=await browser('POST','/projects',{name:'Explicit generic QA contract',repositoryUrl:'https://github.com/example/generic'}),w=await browser('POST',`/projects/${p.id}/works`,{title:'Capture authorized project QA'});
+        const p=await browser('POST','/projects',{name:'Explicit generic QA contract',repositoryUrl:'https://github.com/example/generic'});
         const owner=await browser('GET','/me'),enrolled=await browser('POST','/connectors',{id:`qa-http-${randomUUID()}`,projectIds:[p.id]});
         const client=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},fetch,['gpt-6-luna','gpt-6.1-sol']);
+        expect(await client.claim([])).toBeUndefined();
+        const connection=await browser('POST','/settings',{kind:'provider',name:'Generic QA host',data:{provider:'openai',method:'codex-host',connectorId:enrolled.id,enabled:true}});
+        const w=await browser('POST',`/projects/${p.id}/works`,{title:'Capture authorized project QA',connectionId:connection.id});
         const reference=qaPolicyFixture(p.id,p.repositoryUrl);reference.coverage='project/v1';reference.resource=undefined;reference.requirements=[{id:'generic-tests',category:'tests',commands:[{executable:'node',args:['test.cjs','{reportFile}'],timeoutMs:10_000}],report:'vitest-json'}];
         const policy=await browser('POST','/settings',{projectId:p.id,kind:'connection',name:'Generic QA',data:{provider:'qa',purpose:'qa',url:p.repositoryUrl,coverage:reference.coverage,requirements:reference.requirements}});
         const requested=await browser('POST',`/projects/${p.id}/messages`,{workId:w.id,text:'Bounded implementation',requestId:randomUUID()});
@@ -767,7 +770,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await browser('PATCH',`/settings/${policy.id}`,{expectedUpdatedAt:policy.updatedAt,data:{enabled:false}});
         await expect(client.authorizeQaEffect(r.id,r.generation)).rejects.toMatchObject({status:409});
         await browser('POST',`/runs/${r.id}/cancel`,{});await expect(client.authorizeQaEffect(r.id,r.generation)).rejects.toMatchObject({status:409});await client.stopped(r.id,r.generation);
-        const seededMaster=await browser('POST',`/projects/${p.id}/messages`,{text:'Verify QA policy authorization',requestId:randomUUID()});
+        const seededMaster=await browser('POST',`/projects/${p.id}/messages`,{text:'Verify QA policy authorization',connectionId:connection.id,requestId:randomUUID()});
         expect(seededMaster.run.kind).toBe('master');
         const masterClaim=await client.claim(['master']);
         expect(masterClaim).toBeDefined();
@@ -780,10 +783,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const serverUrl=await app.listen({port:0,host:'127.0.0.1'});
         const browser=async(method:string,path:string,body?:unknown,status=200)=>{const response=await fetch(`${serverUrl}/api/workbench${path}`,{method,headers:{cookie,'content-type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});const value=await response.json();expect(response.status,JSON.stringify(value)).toBe(status);return value as any;};
         const p=await browser('POST','/projects',{name:'Real HTTP merge proof',repositoryUrl:'https://github.com/org/repo'});
-        const w=await browser('POST',`/projects/${p.id}/works`,{title:'HTTP typed review merge'});
         const owner=await browser('GET','/me');
         const enrolled=await browser('POST','/connectors',{id:`merge-http-${randomUUID()}`,projectIds:[p.id]});
-        const client=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},fetch,['gpt-6.1-sol']);
+        const client=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},fetch,['gpt-6-luna','gpt-6.1-sol']);
+        expect(await client.claim([])).toBeUndefined();
+        const connection=await browser('POST','/settings',{kind:'provider',name:'Merge proof host',data:{provider:'openai',method:'codex-host',connectorId:enrolled.id,enabled:true}});
+        const w=await browser('POST',`/projects/${p.id}/works`,{title:'HTTP typed review merge',connectionId:connection.id});
         const template=mergeClaim(),op=template.run.operation!,stamp=new Date().toISOString();
         const candidate:Run={...template.run,id:randomUUID(),projectId:p.id,workId:w.id,requestedBy:owner.id,kind:'implementation',operation:undefined,status:'completed',connectorId:enrolled.id,createdAt:stamp,updatedAt:stamp};
         const diff:Artifact={id:randomUUID(),projectId:p.id,workId:w.id,runId:candidate.id,kind:'diff',revision:op.artifactRevision,data:{candidateRevision:op.commitSha,baseRevision:op.baseRevision},createdAt:stamp};
@@ -794,7 +799,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const prior:Run={...template.run,id:randomUUID(),projectId:p.id,workId:w.id,requestedBy:owner.id,status:'completed',targetConnectorId:enrolled.id,connectorId:enrolled.id,createdAt:stamp,updatedAt:stamp,operation:{...op,action:'create_draft_pr',actorId:owner.id,candidateRunId:candidate.id,phase:'pr_created',integrationBaseSha:undefined,policySnapshot:undefined,mergeMethod:undefined,external:{...op.external}}};
         for(const [kind,item] of [['run',candidate],['artifact',diff],['artifact',qa],['run',prior]] as const)await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${item.id},${kind},${p.id},${sql.json(item as never)})`;
         const policy=await browser('POST','/settings',{projectId:p.id,kind:'connection',name:'Fixed merge policy',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',enabled:true,allowDraftPr:true,allowMergePr:true,baseBranch:'main',mergeMethod:'merge',requiredChecks:['Menoteam CI']}});
-        await browser('POST',`/projects/${p.id}/messages`,{text:'Assign typed review',requestId:randomUUID()});
+        await browser('POST',`/projects/${p.id}/messages`,{text:'Assign typed review',connectionId:connection.id,requestId:randomUUID()});
         const master=(await client.claim(['master']))!.run;
         const review=await client.tool(master.id,master.generation,'dispatch',{workId:w.id,prompt:'Review frozen candidate',kind:'review',model:'gpt-6.1-sol'},randomUUID()) as Run;
         expect(review.reviewBinding).toMatchObject({candidateRunId:candidate.id,diffArtifactId:diff.id,qaArtifactIds:[qa.id]});
@@ -887,11 +892,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
  it('freezes a candidate review binding and accepts only one typed review over scoped grants and PostgreSQL',async()=>{
   const p=checkedJson(await user('POST','/projects',{name:'Typed review PG proof',repositoryUrl:'https://github.com/example/typed-review'})) as Project;
-  const w=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Review exact candidate'})) as Work;
   const owner=checkedJson(await user('GET','/me'));
-  const enrolled=checkedJson(await user('POST','/connectors',{id:`typed-review-${randomUUID()}`,projectIds:[p.id]}));
+  const enrolled=await enrollProvider(`typed-review-${randomUUID()}`,[p.id]);
+  const w=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Review exact candidate',connectionId:fixtureConnections.get(enrolled.id)})) as Work;
   const connectorAuth={authorization:`Bearer ${enrolled.token}`};
-  const connectorRequest=(path:string,payload:unknown)=>app.inject({method:'POST',url:`/api/workbench/connector${path}`,headers:connectorAuth,payload:payload as never});
+  const connectorRequest=(path:string,payload:unknown)=>app.inject({method:'POST',url:`/api/workbench/connector${path}`,headers:connectorAuth,payload:connectorFixturePayload(path,payload) as never});
   const candidateId=randomUUID(),commit='a'.repeat(40),base='b'.repeat(40),revision='diff-typed-review',fingerprint='c'.repeat(64);
   const candidate:Run={id:candidateId,projectId:p.id,workId:w.id,prompt:'candidate',requestedBy:owner.id,kind:'implementation',model:'gpt-6-luna',reasoning:'medium',status:'completed',connectorId:enrolled.id,generation:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
   const diff:Artifact={id:'typed-diff',projectId:p.id,workId:w.id,runId:candidateId,kind:'diff',revision,data:{candidateRevision:commit,baseRevision:base},createdAt:new Date().toISOString()};
