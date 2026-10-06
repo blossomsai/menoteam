@@ -6,6 +6,7 @@ import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from '../src/db/migrate.js';
 import { createWorkbenchApp } from '../src/workbench/app.js';
+import { bytesHash, gitBlobHash, sealBundle } from '../src/workbench/skill-bundle.js';
 
 // This destructive-capable integration suite is opt-in. It only writes to a
 // dedicated loopback *_test database after an operator explicitly serializes it.
@@ -484,9 +485,28 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${source.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: sourceClaim.run.generation, threadId: nativeThread } }));
     const sourceBefore = (await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data;
 
+    const beforeReject = await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`;
+    const unsupportedModel = await user('POST', `/projects/${project.id}/messages`, { text: 'Reject an unknown model', workId: work.id, handoff: { fromRunId: source.id, model: 'not-advertised-model', reasoning: advertisedEffort }, requestId: `handoff-unknown-model-${suffix}` });
+    expect(unsupportedModel.statusCode).toBe(409);
     const unsupported = await user('POST', `/projects/${project.id}/messages`, { text: 'Reject an invented effort', workId: work.id, handoff: { fromRunId: source.id, model: 'fixture-model', reasoning: 'not-advertised' }, requestId: `handoff-unsupported-${suffix}` });
     expect(unsupported.statusCode).toBe(409);
-    const handedOff = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Continue with selected model', workId: work.id, handoff: { fromRunId: source.id, model: 'fixture-model', reasoning: advertisedEffort }, requestId: `handoff-success-${suffix}` })).run;
+    expect(await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`).toEqual(beforeReject);
+    for (const requestId of [`handoff-unknown-model-${suffix}`, `handoff-unsupported-${suffix}`])
+      expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`message:${project.id}`} AND request_id=${requestId}`).toHaveLength(0);
+
+    const handoffPayload = { text: 'Continue with selected model', workId: work.id, handoff: { fromRunId: source.id, model: 'fixture-model', reasoning: advertisedEffort } };
+    const outcomes = await Promise.all([
+      user('POST', `/projects/${project.id}/messages`, { ...handoffPayload, requestId: `handoff-race-a-${suffix}` }),
+      user('POST', `/projects/${project.id}/messages`, { ...handoffPayload, requestId: `handoff-race-b-${suffix}` })
+    ]);
+    expect(outcomes.map(response => response.statusCode).sort()).toEqual([200, 409]);
+    const successIndex = outcomes.findIndex(response => response.statusCode === 200);
+    const successfulRequestId = `handoff-race-${successIndex === 0 ? 'a' : 'b'}-${suffix}`;
+    const handedOff = checked(outcomes[successIndex]!).run;
+    const rowsAfterSuccess = await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`;
+    const retry = checked(await user('POST', `/projects/${project.id}/messages`, { ...handoffPayload, requestId: successfulRequestId }));
+    expect(retry.run.id).toBe(handedOff.id);
+    expect(await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`).toEqual(rowsAfterSuccess);
     expect(handedOff).toMatchObject({ workId: work.id, threadId: nativeThread, handoffFromRunId: source.id, handoffRequestedBy: ownerEmail, model: 'fixture-model', reasoning: advertisedEffort, execution: { connectionId: connection.id, connectorId: host.connectorId, provider: 'openai', method: 'codex-host', profileId: profile.id, model: 'fixture-model' } });
     expect(handedOff.execution.profile).toEqual(source.execution.profile);
     expect(handedOff.execution.skills).toEqual(source.execution.skills);
@@ -494,6 +514,105 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     expect((await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data).toEqual(sourceBefore);
     const staleSource = await user('POST', `/projects/${project.id}/messages`, { text: 'Cannot hand off from a superseded run', workId: work.id, handoff: { fromRunId: source.id, model: 'gpt-6-luna', reasoning: 'medium' }, requestId: `handoff-stale-${suffix}` });
     expect(staleSource.statusCode).toBe(409);
+  });
+
+  it('rejects handoffs with an active or unresolved reservation, revoked authority, or disabled connection without partial writes', async () => {
+    const project = await makeProject('Handoff refusal boundaries');
+    const host = await enrollFixtureConnector('handoff-refusal', project.id, ['gpt-6-luna', 'fixture-model']);
+    const connection = await addConnection(host.connectorId, 'Handoff refusal Codex');
+    const advertisedEffort = 'fixture-advertised-effort';
+    await sql`UPDATE wb_connectors SET capabilities=${sql.json({ codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'fixture-model'], modelReasoningEfforts: { 'fixture-model': [advertisedEffort] }, runKinds: ['implementation'] })} WHERE id=${host.connectorId}`;
+    const work = checked(await user('POST', `/projects/${project.id}/works`, { title: 'Refusal boundaries', connectionId: connection.id }));
+    const source = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Prepare handoff source', workId: work.id, requestId: `handoff-refusal-source-${suffix}` })).run;
+    const claim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities: { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'fixture-model'], modelReasoningEfforts: { 'fixture-model': [advertisedEffort] }, runKinds: ['implementation'] } } }));
+    checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${source.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: claim.run.generation, threadId: `handoff-refusal-thread-${suffix}` } }));
+    const handoff = { text: 'Attempt guarded handoff', workId: work.id, handoff: { fromRunId: source.id, model: 'fixture-model', reasoning: advertisedEffort } };
+    async function expectRejectedWithoutWrites(status: number, label: string, cookie = ownerCookie) {
+      const requestId = `handoff-refusal-${label}-${suffix}`;
+      const before = await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`;
+      const response = await user('POST', `/projects/${project.id}/messages`, { ...handoff, requestId }, cookie);
+      expect(response.statusCode, response.body).toBe(status);
+      expect(await sql`SELECT id,kind,data FROM wb_records WHERE project_id=${project.id} ORDER BY id`).toEqual(before);
+      expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`message:${project.id}`} AND request_id=${requestId}`).toHaveLength(0);
+    }
+
+    for (const status of ['running', 'interrupted', 'paused', 'cancelled'] as const) {
+      const reservationId = `handoff-reservation-${status}-${suffix}`;
+      const reservation = { id: reservationId, projectId: project.id, workId: work.id, prompt: 'Reserved Work execution', kind: 'review', model: 'gpt-6-luna', reasoning: 'medium', status, generation: 1, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...(status === 'interrupted' ? { stoppedAt: undefined } : {}) };
+      runIds.push(reservationId);
+      await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${reservationId},'run',${project.id},${sql.json(reservation)})`;
+      await expectRejectedWithoutWrites(409, `reservation-${status}`);
+      await sql`DELETE FROM wb_records WHERE id=${reservationId} AND kind='run'`;
+      runIds.splice(runIds.indexOf(reservationId), 1);
+    }
+
+    checked(await user('PATCH', `/settings/${connection.id}`, { data: { enabled: false } }));
+    await expectRejectedWithoutWrites(409, 'disabled-connection');
+    checked(await user('PATCH', `/settings/${connection.id}`, { data: { enabled: true } }));
+    await sql`UPDATE wb_connectors SET project_ids='[]'::jsonb WHERE id=${host.connectorId}`;
+    await expectRejectedWithoutWrites(403, 'revoked-connector-grant');
+    await sql`UPDATE wb_connectors SET project_ids=${sql.json([project.id])},last_seen=now() WHERE id=${host.connectorId}`;
+
+    const email = `handoff-member-${suffix}@test.invalid`;
+    userEmails.push(email);
+    const invite = checked(await user('POST', '/invites', { email, projectId: project.id, role: 'member' }));
+    const memberPassword = `handoff-member-${randomUUID()}-Password`;
+    checked(await app.inject({ method: 'POST', url: '/api/workbench/invites/accept', payload: { token: invite.token, name: 'Handoff member', password: memberPassword } }));
+    const login = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email, password: memberPassword } });
+    const memberCookie = String(login.headers['set-cookie']).split(';')[0]!;
+    expect(login.statusCode).toBe(200);
+    checked(await user('DELETE', `/projects/${project.id}/members/${(await sql`SELECT id FROM wb_users WHERE email=${email}`).at(0)?.id}`, undefined));
+    await expectRejectedWithoutWrites(403, 'revoked-membership', memberCookie);
+  });
+
+  it('keeps frozen skill bundles and tool authorization through ordinary continuation and explicit handoff, including legacy identity', async () => {
+    const project = await makeProject('Handoff snapshot continuity');
+    const host = await enrollFixtureConnector('handoff-snapshot', project.id, ['gpt-6-luna', 'gpt-6.1-sol', 'fixture-model']);
+    const connection = await addConnection(host.connectorId, 'Snapshot original connection');
+    const replacementHost = await enrollFixtureConnector('handoff-default', project.id, ['gpt-6-luna', 'gpt-6.1-sol']);
+    const replacementConnection = await addConnection(replacementHost.connectorId, 'Snapshot replacement default');
+    const advertisedEffort = 'fixture-advertised-effort';
+    const capabilities = { codexAppServer: true, localWorktrees: true, models: ['gpt-6-luna', 'gpt-6.1-sol', 'fixture-model'], modelReasoningEfforts: { 'fixture-model': [advertisedEffort] }, runKinds: ['implementation'] };
+    await sql`UPDATE wb_connectors SET capabilities=${sql.json(capabilities)} WHERE id=${host.connectorId}`;
+    const skillText = `Pinned skill content ${suffix}`;
+    const skillBytes = Buffer.from(skillText);
+    const bundle = sealBundle('', 'a'.repeat(40), [{ path: 'SKILL.md', mode: '100644', encoding: 'base64', data: skillBytes.toString('base64'), bytes: skillBytes.length, sha256: bytesHash(skillBytes), sourceBlobSha: gitBlobHash(skillBytes) }]);
+    const skill = checked(await user('POST', '/settings', { kind: 'skill', name: `Pinned handoff skill ${suffix}`, data: { content: skillText, bundle } }));
+    settingIds.push(skill.id);
+    const profile = checked(await user('POST', '/settings', { kind: 'profile', name: `Pinned handoff profile ${suffix}`, data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [skill.id], tools: [] } }));
+    settingIds.push(profile.id);
+    const work = checked(await user('POST', `/projects/${project.id}/works`, { title: 'Pinned handoff snapshot', profileId: profile.id, connectionId: connection.id }));
+    const source = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Start with frozen profile', workId: work.id, requestId: `handoff-snapshot-source-${suffix}` })).run;
+    const firstClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities, runKinds: ['implementation'] } }));
+    const enrichedSource = { ...firstClaim.run, execution: { ...firstClaim.run.execution, tools: ['read_context'] } };
+    await sql`UPDATE wb_records SET data=${sql.json(enrichedSource)} WHERE id=${source.id} AND kind='run'`;
+    checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${source.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: firstClaim.run.generation, threadId: `handoff-snapshot-thread-${suffix}` } }));
+    const sourceBefore = (await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data;
+
+    checked(await user('PATCH', `/settings/${profile.id}`, { data: { model: 'gpt-6.1-sol', reasoning: 'high', skillIds: [], tools: [] } }));
+    checked(await user('PATCH', `/settings/${replacementConnection.id}`, { data: { default: true } }));
+    const ordinary = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Ordinary continuation retains frozen settings', workId: work.id, requestId: `handoff-snapshot-ordinary-${suffix}` })).run;
+    expect(ordinary).toMatchObject({ threadId: sourceBefore.threadId, model: 'gpt-6-luna', reasoning: 'medium', execution: { connectionId: connection.id, connectorId: host.connectorId, model: 'gpt-6-luna', profile: { data: { model: 'gpt-6-luna', reasoning: 'medium' } }, tools: ['read_context'] } });
+    expect(ordinary.execution.skills).toEqual(sourceBefore.execution.skills);
+    expect(ordinary.execution.skills[0]?.bundle).toEqual(bundle);
+    const ordinaryClaim = checked(await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${host.token}` }, payload: { capabilities, runKinds: ['implementation'] } }));
+    checked(await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${ordinary.id}/complete`, headers: { authorization: `Bearer ${host.token}` }, payload: { generation: ordinaryClaim.run.generation, threadId: sourceBefore.threadId } }));
+    const completedOrdinary = (await sql`SELECT data FROM wb_records WHERE id=${ordinary.id} AND kind='run'`).at(0)?.data;
+    const legacySource = { ...completedOrdinary, connectorId: host.connectorId, targetConnectorId: host.connectorId, execution: { ...completedOrdinary.execution, legacy: true, connectionId: undefined, connectorId: undefined, model: undefined } };
+    delete legacySource.execution.connectionId;
+    delete legacySource.execution.connectorId;
+    delete legacySource.execution.model;
+    await sql`UPDATE wb_records SET data=data-'connectionId' WHERE id=${work.id} AND kind='work'`;
+    await sql`UPDATE wb_records SET data=${sql.json(legacySource)} WHERE id=${ordinary.id} AND kind='run'`;
+    const legacyBefore = (await sql`SELECT data FROM wb_records WHERE id=${ordinary.id}`).at(0)?.data;
+    const handoff = checked(await user('POST', `/projects/${project.id}/messages`, { text: 'Explicit handoff from proven legacy binding', workId: work.id, handoff: { fromRunId: ordinary.id, model: 'fixture-model', reasoning: advertisedEffort }, requestId: `handoff-snapshot-legacy-${suffix}` })).run;
+    expect(handoff).toMatchObject({ threadId: legacyBefore.threadId, targetConnectorId: host.connectorId, handoffFromRunId: ordinary.id, model: 'fixture-model', reasoning: advertisedEffort, execution: { legacy: true, connectorId: host.connectorId, model: 'fixture-model', tools: ['read_context'] } });
+    expect(handoff.execution.connectionId).toBeUndefined();
+    expect(handoff.execution.profile).toEqual(legacyBefore.execution.profile);
+    expect(handoff.execution.skills).toEqual(legacyBefore.execution.skills);
+    expect(handoff.execution.skills[0]?.bundle).toEqual(bundle);
+    expect((await sql`SELECT data FROM wb_records WHERE id=${ordinary.id}`).at(0)?.data).toEqual(legacyBefore);
+    expect((await sql`SELECT data FROM wb_records WHERE id=${source.id}`).at(0)?.data).toEqual(sourceBefore);
   });
 
   it('requires Worktree capability for review request, claim, lease renewal, and live reads', async () => {
