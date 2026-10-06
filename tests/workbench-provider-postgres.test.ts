@@ -60,11 +60,12 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
     expect(failedLedger.map(row => row.version)).toEqual(legacyMigrationFiles);
     const indexesAfterFailure = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
-      WHERE schemaname='public' AND indexname=ANY(${sql.array(providerIndexes, 'text')})
+      WHERE schemaname='public' AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
       ORDER BY indexname`;
     expect(indexesAfterFailure).toHaveLength(0);
     const preservedAfterFailure = await sql<{ id: string; connector_id: string }[]>`
-      SELECT id,data->'data'->>'connectorId' AS connector_id FROM wb_records WHERE id=ANY(${sql.array(fixtureIds, 'text')}) ORDER BY id`;
+      SELECT id,data->'data'->>'connectorId' AS connector_id FROM wb_records
+      WHERE id=${fixtureIds[0]} OR id=${fixtureIds[1]} ORDER BY id`;
     expect(preservedAfterFailure).toHaveLength(2);
     expect(preservedAfterFailure.map(row => row.connector_id)).toEqual([duplicateConnectorId, duplicateConnectorId]);
 
@@ -82,26 +83,27 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
     expect(upgradedLedger.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql']);
     const indexesAfterSuccess = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
-      WHERE schemaname='public' AND indexname=ANY(${sql.array(providerIndexes, 'text')})
+      WHERE schemaname='public' AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
       ORDER BY indexname`;
     expect(indexesAfterSuccess.map(row => row.indexname)).toEqual([...providerIndexes].sort());
     await expect(migrate(databaseUrl, legacyDir)).rejects.toThrow('Database schema 006_workbench_provider_connections.sql is newer than this application');
 
     const preservedAfterOldMigrator = await sql<{ id: string }[]>`
-      SELECT id FROM wb_records WHERE id=ANY(${sql.array(fixtureIds, 'text')}) ORDER BY id`;
+      SELECT id FROM wb_records WHERE id=${fixtureIds[0]} OR id=${fixtureIds[1]} ORDER BY id`;
     expect(preservedAfterOldMigrator.map(row => row.id)).toEqual([...fixtureIds].sort());
     const ledgerAfterOldMigrator = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
     expect(ledgerAfterOldMigrator.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql']);
     const indexesAfterOldMigrator = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
-      WHERE schemaname='public' AND indexname=ANY(${sql.array(providerIndexes, 'text')})
+      WHERE schemaname='public' AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
       ORDER BY indexname`;
     expect(indexesAfterOldMigrator.map(row => row.indexname)).toEqual([...providerIndexes].sort());
   } finally {
     try {
       const hasRecordsTable = await sql<{ present: boolean }[]>`SELECT to_regclass('public.wb_records') IS NOT NULL AS present`;
-      if (hasRecordsTable[0]?.present && insertedFixtureIds.length)
-        await sql`DELETE FROM wb_records WHERE id=ANY(${sql.array(insertedFixtureIds, 'text')})`;
+      if (hasRecordsTable[0]?.present) {
+        for (const id of insertedFixtureIds) await sql`DELETE FROM wb_records WHERE id=${id}`;
+      }
     } finally {
       await sql.end();
       await rm(legacyDir, { recursive: true, force: true });
