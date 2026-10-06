@@ -1,3 +1,4 @@
+import { withRecoveryState } from './helpers/connector-recovery.js';
 import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -53,7 +54,7 @@ describe('Integrated connector lifecycle',()=>{
         addArtifact:async(_id:string,_generation:number,artifact:unknown)=>{artifacts.push(artifact);},
         complete:async()=>{completed=true;},
       } as unknown as WorkbenchConnectorClient;
-      runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+      runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
       execution=runner.run().finally(()=>{executionSettled=true;});
       await bounded(execution);
       const diagnosticFiles=await readdir(path.join(dataDir,'diagnostics')).catch((error:NodeJS.ErrnoException)=>error.code==='ENOENT'?[]:Promise.reject(error));
@@ -122,7 +123,7 @@ describe('Integrated connector lifecycle',()=>{
       onEvent({type:'agent_message',text:'Plan recorded',threadId:thread});return{threadId:thread,text:'Plan recorded',checks:[]};
     }} as unknown as CodexAppServer;
     const client={claim:async()=>{if(claimed){if(order.includes('complete'))await runner.stop();return undefined;}claimed=true;return claim();},createBridgeToken:async()=>({token:'run-scoped-token',expiresAt:'later'}),appendEvents:async(_id:string,_g:number,events:unknown[])=>{order.push('events');expect(events).toHaveLength(1);},complete:async()=>{order.push('complete');},readRun:async()=>claim().run} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
     try{await runner.run();expect(order.indexOf('complete')).toBeGreaterThan(order.indexOf('events'));expect(order.slice(0,order.indexOf('complete'))).toContain('stop');expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);expect(await readdir(path.join(dataDir,'bridge'))).toEqual([]);}finally{await rm(dataDir,{recursive:true,force:true});}
   });
   it('cleans up a pre-turn pause without inventing unsent evidence',async()=>{
@@ -132,7 +133,7 @@ describe('Integrated connector lifecycle',()=>{
     let resolveAcknowledged!:()=>void;const ack=new Promise<void>(resolve=>{resolveAcknowledged=resolve;});
     const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>{stopped=false;return{pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'};},stop:async()=>{stopped=true;},run:async()=>{nativeRunCalls++;throw new Error('A paused run must not enter the native turn');}} as unknown as CodexAppServer;
     const client={claim:async()=>{if(!claimed){claimed=true;return claim();}await ack;await runner.stop();return undefined;},createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>({...claim().run,status:'paused'}),stopped:async()=>{expect(stopped).toBe(true);acknowledged=true;resolveAcknowledged();},complete:async()=>{throw new Error('Cancelled turn must not complete');}} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
     try{
       await runner.run();
       expect(nativeRunCalls).toBe(0);
@@ -160,7 +161,7 @@ describe('Integrated connector lifecycle',()=>{
       stopped:async()=>{expect(processStopped).toBe(true);order.push('cancellation-ack');acknowledged=true;acknowledgeResolve();},
       complete:async()=>{throw new Error('Cancelled turn must not complete');}
     } as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
     const execution=runner.run();
     try{
       await bounded(runEntered);
@@ -204,7 +205,7 @@ describe('Integrated connector lifecycle',()=>{
     let runner:ConnectorRunner;
     const native={start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer;
     const client={readRun:async()=>({...claim().run,status:'completed'}),claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
     try {await runner.run();const files=await readdir(path.join(dataDir,'unsent-evidence'));expect(files).toHaveLength(1);expect(JSON.parse(await readFile(path.join(dataDir,'unsent-evidence',files[0]!),'utf8'))).toEqual(spool);expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);}
     finally{await rm(dataDir,{recursive:true,force:true});}
   });
@@ -220,7 +221,7 @@ describe('Integrated connector lifecycle',()=>{
       complete:async()=>({}),
     } as unknown as WorkbenchConnectorClient;
     const log=vi.spyOn(console,'error').mockImplementation(()=>{});
-    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
     try{
       await runner.run();
       expect(log).toHaveBeenCalledWith('Connector HTTP failure method=POST route=connector.runs.bridge-token status=429 retryAfterSeconds=37');
@@ -238,7 +239,7 @@ describe('Integrated connector lifecycle',()=>{
     const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{},run:async()=>{throw Object.assign(new Error('private raw native cause secret-token'),{nativeStage:'thread-resume',nativeCategory:'rpc-failure',nativeCode:-32602});}} as unknown as CodexAppServer;
     const client={claim:async()=>{if(!claimed){claimed=true;return claim();}if(completed)await runner.stop();return undefined;},createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>claim().run,complete:async(_id:string,_gen:number,value:{error?:string})=>{expect(value.error).not.toContain('secret-token');completed=true;}} as unknown as WorkbenchConnectorClient;
     const log=vi.spyOn(console,'error').mockImplementation(()=>{});
-    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>withRecoveryState(client)});
     try{
       await runner.run();
       expect(log).toHaveBeenCalledWith('Native execution failure stage=thread-resume category=rpc-failure code=-32602');
@@ -255,7 +256,7 @@ describe('Integrated connector lifecycle',()=>{
     const failure=new GitCommandError(Object.assign(new Error('private raw git cause secret-token'),{code:'ETIMEDOUT'}),diagnostic);
     const native={start:async()=>{throw failure;},stop:async()=>{}} as unknown as CodexAppServer;
     const client={createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>claim().run,complete:async()=>{}} as unknown as WorkbenchConnectorClient;
-    const runner=new ConnectorRunner({serverUrl:'http://127.0.0.1:3200',token:'enrollment-secret',connectorId:'one',dataDir,projects:{}},{native:()=>native,client:()=>client});
+    const runner=new ConnectorRunner({serverUrl:'http://127.0.0.1:3200',token:'enrollment-secret',connectorId:'one',dataDir,projects:{}},{native:()=>native,client:()=>withRecoveryState(client)});
     (runner as unknown as {client:WorkbenchConnectorClient}).client=client;
     const log=vi.spyOn(console,'error').mockImplementation(()=>{});
     try{

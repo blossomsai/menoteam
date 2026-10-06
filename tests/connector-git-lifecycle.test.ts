@@ -1,3 +1,4 @@
+import { withRecoveryState } from './helpers/connector-recovery.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
@@ -109,7 +110,7 @@ it.each(['remote-cancel', 'connector-stop'])('stops Git preparation on %s and ne
   const discovery = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer;
   const worker = { start: workerStart, run: workerRun, stop: async () => {} } as unknown as CodexAppServer; let nativeCount = 0;
   const client = { claim: async () => { if (!claimed) { claimed = true; return claim; } if (acknowledged) await runner.stop(); return undefined; }, readRun: async () => ({ ...claim.run, status: paused ? 'cancelled' : 'running' }), renew: async () => { renewals++; }, stopped: async () => { stopped((await readyFile(f.ready)).pid); acknowledged = true; }, complete: async () => { throw new Error('Cancelled preparation must not complete'); } } as unknown as WorkbenchConnectorClient;
-  runner = new ConnectorRunner(f.config, { native: () => nativeCount++ === 0 ? discovery : worker, client: () => client });
+  runner = new ConnectorRunner(f.config, { native: () => nativeCount++ === 0 ? discovery : worker, client:()=>withRecoveryState(client)});
   const execution = runner.run();
   try {
     const identity = await readyFile(f.ready);
@@ -127,7 +128,7 @@ it('retains an unconfirmed Git reservation during recovery even when old native 
   await writeSecureJson(spoolPath, spool);
   const native = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer;
   const acknowledge = vi.fn(); const client = { claim: async () => { await runner.stop(); return undefined; }, readRun: async () => { throw new Error('Unconfirmed Git cannot be released through native proof'); }, stopped: acknowledge } as unknown as WorkbenchConnectorClient;
-  runner = new ConnectorRunner(f.config, { native: () => native, client: () => client }); await runner.run();
+  runner = new ConnectorRunner(f.config, { native: () => native, client:()=>withRecoveryState(client)}); await runner.run();
   expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(spool); expect(acknowledge).not.toHaveBeenCalled();
 });
 
@@ -141,7 +142,7 @@ it('stops active native on remote cancel even when its Git fingerprint group can
   const discovery = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer; let count = 0;
   const complete = vi.fn(); const acknowledge = vi.fn();
   const client = { claim: async () => { if (!claimed) { claimed = true; return claim; } await exiting; return undefined; }, readRun: async () => ({ ...claim.run, status: paused ? 'cancelled' : 'running' }), renew: async () => {}, complete, stopped: acknowledge } as unknown as WorkbenchConnectorClient;
-  const runner = new ConnectorRunner(f.config, { native: () => count++ === 0 ? discovery : worker, client: () => client });
+  const runner = new ConnectorRunner(f.config, { native: () => count++ === 0 ? discovery : worker, client:()=>withRecoveryState(client)});
   const originalKill = process.kill.bind(process);
   const kill = vi.spyOn(process, 'kill').mockImplementation((target, value) => target === -pid && (value === 'SIGKILL' || value === 'SIGTERM') ? true : originalKill(target, value));
   const execution = runner.run(); const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey('run', '1')}.json`);
@@ -165,7 +166,7 @@ it.each(['missing-identity', 'unverifiable-identity'])('retains a crashed checkp
   const native = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer;
   const acknowledge = vi.fn(); const complete = vi.fn();
   const client = { claim: async () => { await runner.stop(); return undefined; }, readRun: async () => ({ generation: 1, status: 'cancelled' }), stopped: acknowledge, complete } as unknown as WorkbenchConnectorClient;
-  runner = new ConnectorRunner(f.config, { native: () => native, client: () => client }); await runner.run();
+  runner = new ConnectorRunner(f.config, { native: () => native, client:()=>withRecoveryState(client)}); await runner.run();
   expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(spool); expect(acknowledge).not.toHaveBeenCalled(); expect(complete).not.toHaveBeenCalled();
 });
 
@@ -187,7 +188,7 @@ await checkpoint(${JSON.stringify(f.repo)},'candidate',{processTracking:{intent:
     const persisted = JSON.parse(await readFile(spoolPath, 'utf8')); expect(Object.values(persisted.gitProcesses)).toEqual([null]);
     const native = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer; const acknowledge = vi.fn(); const complete = vi.fn();
     const client = { claim: async () => { await runner!.stop(); return undefined; }, readRun: async () => ({ generation: 1, status: 'cancelled' }), stopped: acknowledge, complete } as unknown as WorkbenchConnectorClient;
-    runner = new ConnectorRunner(f.config, { native: () => native, client: () => client }); await runner.run();
+    runner = new ConnectorRunner(f.config, { native: () => native, client:()=>withRecoveryState(client)}); await runner.run();
     expect(process.kill(-gitPid, 0)).toBe(true); expect(acknowledge).not.toHaveBeenCalled(); expect(complete).not.toHaveBeenCalled(); expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(persisted);
   } finally { parent.kill('SIGKILL'); await closed; if (gitPid) process.kill(-gitPid, 'SIGKILL'); await runner?.stop(); }
 });

@@ -1336,6 +1336,22 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         });
         return claimed ?? reply.code(204).send();
     });
+    app.post('/api/workbench/connector/runs/:id/recovery-state', async req => store.transaction(`run:${(req.params as {id:string}).id}`, async tx => {
+        const c = await connector(req);
+        const {generation} = z.object({generation:z.number().int().positive()}).strict().parse(req.body);
+        const r = await store.get<Run>('run',(req.params as {id:string}).id,tx);
+        if(!r || r.connectorId!==c.id || !c.projectIds.includes(r.projectId))fail(403,'Run denied');
+        if(r!.generation!==generation)fail(409,'Recovery generation mismatch');
+        // Original-owned stop control survives actor revocation; full reads/tools do not.
+        return {id:r!.id,generation:r!.generation,status:r!.status,
+            ...(r!.stoppedAt?{stoppedAt:r!.stoppedAt}:{}),
+            preEffectStaging:isPreEffectStagingRun(r!),stagingRetired:Boolean(r!.operation?.stagingRetired),
+            merged:r!.kind==='delivery'&&r!.operation?.action==='merge_pr'&&r!.operation.phase==='merged',
+            ...(r!.qaPolicySnapshot?{qaResourcePolicy:{
+                ...(r!.qaPolicySnapshot.resource?{resource:r!.qaPolicySnapshot.resource}:{}),
+                ...(r!.qaPolicySnapshot.providerResource?{providerResource:r!.qaPolicySnapshot.providerResource}:{})
+            }}:{})};
+    }));
     app.get("/api/workbench/connector/runs/:id", async (req) => {
         const c = await connector(req);
         const r = await store.get<Run>("run", (req.params as {

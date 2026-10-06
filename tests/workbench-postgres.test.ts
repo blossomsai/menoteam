@@ -862,6 +862,41 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             } finally { app = await createWorkbenchApp({ sql, sourceFetcher: (...args) => sourceFetch(...args) }); }
         }
     });
+    it('keeps revoked actor context private while original Connector/generation can read minimal stop control',async()=>{
+        const p=checkedJson(await user('POST','/projects',{name:'Revoked recovery control'}));
+        const enrolled=await enrollProvider(`recovery-control-${randomUUID()}`,[p.id]);
+        const invite=checkedJson(await user('POST','/invites',{email:`recovery-${randomUUID()}@test.example`,projectId:p.id,role:'member'}));
+        const member=checkedJson(await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invite.token,name:'Recovery member',password:'recovery-test-password'}}));
+        const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:member.email,password:'recovery-test-password'}});
+        const memberCookie=String(login.headers['set-cookie']).split(';')[0]!;
+        const request=await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:memberCookie},payload:{text:'Private recovery prompt',requestId:randomUUID()}});
+        expect(request.statusCode).toBe(200);
+        const headers={authorization:`Bearer ${enrolled.token}`};
+        const claim=checkedJson(await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{capabilities:fixtureCapabilities}})).run as Run;
+        expect(claim.id).toBe(request.json().run.id);expect(claim.requestedBy).toBe(member.id);
+        const send=(suffix:string,generation=claim.generation)=>app.inject({method:'POST',url:`/api/workbench/connector/runs/${claim.id}/${suffix}`,headers,payload:{generation}});
+        const policy=qaPolicyFixture(p.id); // Contract-only snapshot; not execution evidence.
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{qaPolicySnapshot}',${sql.json(policy as never)}) WHERE id=${claim.id}`;
+        checkedJson(await user('DELETE',`/projects/${p.id}/members/${member.id}`));
+        expect((await app.inject({method:'GET',url:`/api/workbench/connector/runs/${claim.id}`,headers})).statusCode).toBe(403);
+        expect((await send('renew')).statusCode).toBe(403);
+        expect((await send('bridge-token')).statusCode).toBe(403);
+        expect((await send('complete')).statusCode).toBe(403);
+        expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${claim.id}/tools`,headers,payload:{generation:claim.generation,action:'read_context',input:{},requestId:randomUUID()}})).statusCode).toBe(403);
+        const control=await send('recovery-state');expect(control.statusCode).toBe(200);
+        expect(control.json()).toEqual({id:claim.id,generation:claim.generation,status:'running',preEffectStaging:false,stagingRetired:false,merged:false,qaResourcePolicy:{resource:policy.resource}});
+        expect((await send('recovery-state',claim.generation+1)).statusCode).toBe(409);
+        const otherProject=checkedJson(await user('POST','/projects',{name:'Other control project'}));
+        const other=await enrollProvider(`other-control-${randomUUID()}`,[p.id,otherProject.id]);
+        expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${claim.id}/recovery-state`,headers:{authorization:`Bearer ${other.token}`},payload:{generation:claim.generation}})).statusCode).toBe(403);
+        const restricted=await enrollProvider(`restricted-control-${randomUUID()}`,[otherProject.id]);
+        expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${claim.id}/recovery-state`,headers:{authorization:`Bearer ${restricted.token}`},payload:{generation:claim.generation}})).statusCode).toBe(403);
+        expect((await send('stopped',claim.generation+1)).statusCode).toBe(403);
+        const stopped=checkedJson(await send('stopped'));expect(stopped.stoppedAt).toBeTruthy();
+        expect(checkedJson(await send('recovery-state'))).toEqual({...control.json(),status:'interrupted',stoppedAt:stopped.stoppedAt});
+        await sql`UPDATE wb_connectors SET project_ids=${[otherProject.id]} WHERE id=${enrolled.id}`;
+        expect((await send('recovery-state')).statusCode).toBe(403);
+    });
     it('requires connector stop proof before browser reconciliation',async()=>{
         const p=(await user('POST','/projects',{name:'Recovery proof'})).json();
         const credential=(await enrollProvider('recovery-connector',[p.id])).token;

@@ -216,8 +216,11 @@ export class ConnectorRunner {
     await mkdir(directory,{recursive:true,mode:0o700});
     for (const file of await readdir(directory)) {
       if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
+      try {
       const spool = await readJson<Spool>(path.join(directory,file));
       if (!spool || this.activeRuns.has(spool.runId)) continue;
+      const remote = await this.client!.recoveryState(spool.runId,spool.generation);
+      if(remote.generation!==spool.generation)continue; // Never stop/release another execution.
       if(spool.stagingReceipt){try{await this.flush(spool);}catch{/* Durable receipt remains for the next pass. */}continue;}
       if(spool.stagingIntent&&spool.completion&&!spool.stagingProcessIdentity&&spool.deliveryExecutor?.stage==='completion'){
         try{await this.flush(spool);}catch{/* Durable completion remains for the next pass. */}continue;
@@ -228,8 +231,6 @@ export class ConnectorRunner {
         if(executor.pid===process.pid){if(activeDeliveryExecutors.has(executor.executionId))continue;executorStopped=true;}
         else{try{process.kill(executor.pid,0);continue;}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')executorStopped=true;else continue;}}
         if(!executorStopped)continue;
-        const remote=await this.client!.readRun(spool.runId);
-        if(remote.generation!==spool.generation)continue;
         if(spool.stagingProcessIdentity){
           const gone=await waitProcessGroup(spool.stagingProcessIdentity.processGroupId,1);
           if(!gone&&!await (this.dependencies?.staging?.stopProcess??stopStagingProcess)(spool.stagingProcessIdentity).catch(()=>false))continue;
@@ -248,8 +249,6 @@ export class ConnectorRunner {
         if(!this.reportedRecovery.has(spool.runId))console.error('Git process group stop remains unconfirmed; manual Connector recovery is required');
         this.reportedRecovery.add(spool.runId);continue; // Native stop proof cannot release an unconfirmed Git group.
       }
-      const remote = await this.client!.readRun(spool.runId);
-      if (remote.generation !== spool.generation) continue; // Never reconcile a different execution.
       if(Object.keys(spool.gitProcesses??{}).length){
         if(spool.gitExecutorPid!==process.pid){
           if(!Number.isSafeInteger(spool.gitExecutorPid)||spool.gitExecutorPid!<=1)continue;
@@ -268,11 +267,11 @@ export class ConnectorRunner {
       // PID reuse/permission errors and legacy spools without executor identity fail closed.
       if(spool.qaInFlight){
         if(!spool.qaExecution||!qaExecutorStopped(spool.qaExecution)||!await stopQaExecution(spool.qaExecution))continue;
-        try{assertQaResourcePolicy(spool.qaExecution,remote.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);}catch{continue;}
+        try{assertQaResourcePolicy(spool.qaExecution,remote.qaResourcePolicy);await releaseQaResource(spool.qaExecution);}catch{continue;}
         spool.qaExecution.phase='stopped';spool.qaInFlight=false;spool.stopped=true;await this.save(spool);
       }
-      if(isPreEffectStagingRun(remote)&&!spool.stagingIntent&&!spool.stagingDiscoveryStopped)continue;
-      if(remote.status==='failed'&&isPreEffectStagingRun(remote)&&!remote.operation?.stagingRetired&&spool.stagingDiscoveryStopped&&!spool.stagingIntent){
+      if(remote.preEffectStaging&&!spool.stagingIntent&&!spool.stagingDiscoveryStopped)continue;
+      if(remote.status==='failed'&&remote.preEffectStaging&&!remote.stagingRetired&&spool.stagingDiscoveryStopped&&!spool.stagingIntent){
         if(!spool.completion)spool.stopped=true;await this.save(spool);await this.flush(spool);continue;
       }
       if (['completed','failed'].includes(remote.status)) {
@@ -300,7 +299,7 @@ export class ConnectorRunner {
         if(!terminated)continue;
         spool.deliveryProcessIdentity=undefined;await this.save(spool);
       }
-      if(spool.deliveryProgress?.phase==='merged'||(spool.completion&&remote.kind==='delivery'&&remote.operation?.phase==='merged')){
+      if(spool.deliveryProgress?.phase==='merged'||(spool.completion&&remote.merged)){
         // A proven completed HTTP effect is replayed through the scoped receipt exception,
         // even after lease expiry/revocation; it never starts another external effect.
         spool.stopped=false;spool.completion={};await this.save(spool);await this.flush(spool);continue;
@@ -323,6 +322,10 @@ export class ConnectorRunner {
       }
       if(!this.reportedRecovery.has(spool.runId)) console.error('Old native process identity cannot be verified; manual Connector recovery is required');
       this.reportedRecovery.add(spool.runId);
+      } catch (error) {
+        // Keep this spool/reservation intact; it must not block unrelated authorized Work.
+        console.error(error instanceof ConnectorHttpError ? error.safeSummary : 'Scoped recovery failed; preserved spool and reservation');
+      }
     }
   }
 

@@ -1,3 +1,4 @@
+import { withRecoveryState } from './helpers/connector-recovery.js';
 import {describe,it,expect} from 'vitest';
 import { mkdtemp,writeFile,rm,readFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
@@ -21,7 +22,7 @@ describe('generic authorized fixed-parent QA (real subprocesses, no network)',()
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-qa-recovery-'));let stopped=0,runner:ConnectorRunner;
     const file=path.join(dataDir,'spool',`${stateKey('qa-run','1')}.json`),spool={runId:'qa-run',generation:1,events:[],artifacts:[],qaInFlight:true};
     const client={readRun:async()=>({id:'qa-run',generation:1,status:'interrupted'}),stopped:async()=>{stopped++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir,projects:{},pollIntervalMs:1},{client:()=>withRecoveryState(client),native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
     try{await writeSecureJson(file,spool);await runner.run();expect(stopped).toBe(0);expect(JSON.parse(await readFile(file,'utf8'))).toEqual(spool);}finally{await rm(dataDir,{recursive:true,force:true});}
   });
   it('captures a valid non-Menoteam repository and proves real child credential isolation',async()=>fixture(async (cwd,f)=>{

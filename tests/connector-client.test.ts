@@ -99,3 +99,17 @@ it('validates QA authorization envelopes and keeps rejection scoped to the fixed
   const forged=new WorkbenchConnectorClient(auth,async()=>Response.json({authorized:true,command:'model-selected'}));
   await expect(forged.authorizeQaEffect('assigned-run',2)).rejects.toThrow();
 });
+
+it('accepts only minimal recovery control for the exact requested run/generation',async()=>{
+  const state={id:'assigned-run',generation:2,status:'interrupted',stoppedAt:'now',preEffectStaging:false,stagingRetired:false,merged:false};
+  const fetcher=vi.fn(async(_url:URL|RequestInfo,_init?:RequestInit)=>Response.json(state));
+  const client=new WorkbenchConnectorClient(auth,fetcher as typeof fetch);
+  await expect(client.recoveryState('assigned-run',2)).resolves.toEqual(state);
+  expect(String(fetcher.mock.calls[0]?.[0])).toContain('/assigned-run/recovery-state');
+  expect(fetcher.mock.calls[0]?.[1]?.method).toBe('POST');
+  expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toEqual({generation:2});
+  for(const payload of [{...state,id:'other-run'},{...state,generation:1},{...state,prompt:'private'},{...state,qaResourcePolicy:{requirements:[]}}]){
+    await expect(new WorkbenchConnectorClient(auth,async()=>Response.json(payload)).recoveryState('assigned-run',2)).rejects.toThrow();
+  }
+  await expect(new WorkbenchConnectorClient(auth,async()=>Response.json({message:'denied'},{status:403})).recoveryState('assigned-run',2)).rejects.toMatchObject({status:403,routeCategory:'connector.runs.recovery-state'});
+});

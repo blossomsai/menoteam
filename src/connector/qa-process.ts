@@ -28,7 +28,7 @@ function assertResourceSet(state:QaExecution):void {
 function singleResourceState(state:QaExecution,lock:{directory:string;owner:string}):QaExecution {
   return {...state,resourceLocks:undefined,resourceLock:lock,expectedResourceDirectories:[lock.directory]};
 }
-export function assertQaResourcePolicy(state:QaExecution,policy?:QaPolicy):void {
+export function assertQaResourcePolicy(state:QaExecution,policy?:Pick<QaPolicy,'resource'|'providerResource'>):void {
   assertResourceSet(state);
   if(!policy){
     if(state.resourceLocks!==undefined||(state.expectedResourceDirectories?.length??0)>0)throw new Error('Frozen QA resource policy unavailable; retain reservations');

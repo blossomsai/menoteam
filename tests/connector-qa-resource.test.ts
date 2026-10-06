@@ -1,3 +1,4 @@
+import { withRecoveryState } from './helpers/connector-recovery.js';
 import {describe,it,expect,vi,beforeEach,afterEach} from 'vitest';
 import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import os from 'node:os';
@@ -125,7 +126,7 @@ describe('QA resource authorization and conservative startup recovery',()=>{
     const file=path.join(directory,'spool',`${stateKey('qa-run','1')}.json`);await writeSecureJson(file,spool);
     let acknowledgements=0,runner:ConnectorRunner;
     const client={readRun:async()=>({id:'qa-run',generation:1,status:'interrupted',qaPolicySnapshot:policy}),stopped:async()=>{acknowledgements++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>withRecoveryState(client),native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
     await runner.run();expect(acknowledgements).toBe(1);await expect(readFile(file)).rejects.toMatchObject({code:'ENOENT'});
     const next=state(directory);await acquireQaResource(next,policy);await claimQaResource(next,policy);await releaseQaResource(next);
   }));
@@ -137,7 +138,7 @@ describe('QA resource authorization and conservative startup recovery',()=>{
     const spool={runId:'qa-run',generation:1,events:[],artifacts:[],qaInFlight:true,qaExecution:execution},file=path.join(directory,'spool',`${stateKey('qa-run','1')}.json`);
     await writeSecureJson(file,spool);let acknowledgements=0,runner:ConnectorRunner;
     const client={readRun:async()=>({id:'qa-run',generation:1,status:'interrupted',qaPolicySnapshot:policy}),stopped:async()=>{acknowledgements++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>withRecoveryState(client),native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
     try{
       expect(qaExecutorStopped(execution)).toBe(false);await runner.run();expect(acknowledgements).toBe(0);expect(await readFile(file,'utf8')).toContain('qaInFlight');
       expect(JSON.parse(await readFile(path.join(execution.resourceLock!.directory,'owner.json'),'utf8')).owner).toBe(execution.nonce);
@@ -172,12 +173,27 @@ describe('QA resource authorization and conservative startup recovery',()=>{
     try{await expect(withQaOwnership(execution,async()=>{throw Error('must not GO');})).rejects.toThrow('unknown guard');await expect(releaseQaResource(execution)).rejects.toThrow('unknown guard');}
     finally{await rm(guard,{recursive:true});await releaseQaResource(execution);} // Only this test's deliberately injected guard.
   }));
+  it('a failed stop control read retains proven-dead QA ownership without attempting release',async()=>fixture(async directory=>{
+    const execution=state(directory),policy=resource();await acquireQaResource(execution,policy);await claimQaResource(execution,policy);
+    const dead={...executor,pid:424242,processGroupId:424242};execution.executor=dead;
+    const ownerFile=path.join(execution.resourceLock!.directory,'owner.json');
+    await writeSecureJson(ownerFile,{owner:execution.nonce,executionDirectory:execution.directory,executor:dead});
+    const spool={runId:'qa-run',generation:1,events:[],artifacts:[],qaInFlight:true,qaExecution:execution};
+    const file=path.join(directory,'spool',`${stateKey('qa-run','1')}.json`);await writeSecureJson(file,spool);
+    const saved=await readFile(file,'utf8'),owner=await readFile(ownerFile,'utf8');
+    const kill=vi.spyOn(process,'kill').mockImplementation(()=>{throw Object.assign(Error('gone'),{code:'ESRCH'});});
+    let runner:ConnectorRunner;const acknowledgements=vi.fn();
+    const client={recoveryState:async()=>{throw Error('Stop control unavailable');},stopped:acknowledgements,claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
+    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+    try{await runner.run();expect(kill).not.toHaveBeenCalled();expect(acknowledgements).not.toHaveBeenCalled();expect(await readFile(file,'utf8')).toBe(saved);expect(await readFile(ownerFile,'utf8')).toBe(owner);}
+    finally{kill.mockRestore();execution.executor=executor;await writeSecureJson(ownerFile,{owner:execution.nonce,executionDirectory:execution.directory,executor});await releaseQaResource(execution);}
+  }));
   it('reads and validates remote generation before any recovery stop/release',async()=>fixture(async directory=>{
     const execution=state(directory),policy=resource();await acquireQaResource(execution,policy);await claimQaResource(execution,policy);
     const spool={runId:'qa-run',generation:1,events:[],artifacts:[],qaInFlight:true,qaExecution:execution},file=path.join(directory,'spool',`${stateKey('qa-run','1')}.json`);await writeSecureJson(file,spool);
     const kill=vi.spyOn(process,'kill');let acknowledgements=0,runner:ConnectorRunner;
     const client={readRun:async()=>({id:'qa-run',generation:2,status:'interrupted',qaPolicySnapshot:policy}),stopped:async()=>{acknowledgements++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
-    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+    runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>withRecoveryState(client),native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
     try{await runner.run();expect(acknowledgements).toBe(0);expect(kill).not.toHaveBeenCalled();expect(JSON.parse(await readFile(file,'utf8'))).toEqual(spool);}
     finally{kill.mockRestore();await releaseQaResource(execution);}
   }));

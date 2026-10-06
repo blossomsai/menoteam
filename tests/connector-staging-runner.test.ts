@@ -1,3 +1,4 @@
+import { withRecoveryState } from './helpers/connector-recovery.js';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -69,7 +70,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
   const fakeTransport = async (_target: unknown, request: StagingRequest, tracking?:StagingTracking) => transport(request,tracking);
   runner = new ConnectorRunner(config, {
     native: () => native,
-    client: () => client,
+    client:()=>withRecoveryState(client),
     staging: { transport: fakeTransport as never, provenanceVerifier: options.provenanceVerifier??attestation, targetValidator: async () => {}, ...(options.stopProcess?{stopProcess:options.stopProcess as never}:{}),...(options.buildDiscovery?{buildDiscovery:options.buildDiscovery}:{}) },
   });
   if(options.recovery)await writeSecureJson(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`),{runId,generation:1,events:[],artifacts:[],stagingIntent:{targetId:'staging',commitSha,imageDigest,expectedCurrentDeploymentId:null},stagingTransportStarted:true,stagingTransportStopped:!options.recoveryIdentity,...(options.recoveryIdentity?{stagingProcessIdentity:identity}:{}),deliveryExecutor:{pid:process.pid,executionId:'crashed-fixture',stage:'staging'}});

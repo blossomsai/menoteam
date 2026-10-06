@@ -1,3 +1,4 @@
+import { withRecoveryState } from './helpers/connector-recovery.js';
 import {describe,it,expect} from 'vitest';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -15,7 +16,7 @@ function resource(){const policy=qaPolicyFixture();policy.resource!.database=`co
 const descendantScript=`const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});require('node:fs').writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,descendant:child.pid}));setInterval(()=>{},1000);`;
 async function recovery(directory:string,qaPolicySnapshot:ReturnType<typeof qaPolicyFixture>){let acknowledgements=0,runner:ConnectorRunner;
   const client={readRun:async()=>({id:'qa-run',generation:1,status:'interrupted',qaPolicySnapshot}),stopped:async()=>{acknowledgements++;},claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
-  runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>client,native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+  runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>withRecoveryState(client),native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
   await runner.run();return acknowledgements;
 }
 describe('controlled REAL child process and cross-process resource proofs (operator process access required)',()=>{

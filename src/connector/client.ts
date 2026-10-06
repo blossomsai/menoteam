@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { verifyExecutionSkills, verifyBundle, type SkillBundle } from '../workbench/skill-bundle.js';
-import type { Artifact, Run } from '../workbench/types.js';
+import type { Artifact, Run, RunRecoveryState } from '../workbench/types.js';
+import { qaResource } from '../workbench/local-qa.js';
 import type { ClaimedRun, ConnectorEvent, ConnectorConfig, UploadArtifact } from './types.js';
 import { z } from 'zod';
 
@@ -21,7 +22,7 @@ export class ConnectorHttpError extends Error {
 
 function routeCategory(path: string): string {
   if (path === '/api/workbench/connector/claim') return 'connector.claim';
-  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress|staging-authorize|staging-progress|staging-build-status|staging-build-receipt)$/u)?.[1];
+  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|recovery-state|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress|staging-authorize|staging-progress|staging-build-status|staging-build-receipt)$/u)?.[1];
   if (route) return `connector.runs.${route}`;
   if (/^\/api\/workbench\/connector\/runs\/[^/]+$/u.test(path)) return 'connector.runs.read';
   return 'unknown';
@@ -82,6 +83,12 @@ export class WorkbenchConnectorClient {
 
   readRun(runId: string): Promise<Run> {
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}`, { method: 'GET' });
+  }
+
+  async recoveryState(runId:string,generation:number):Promise<RunRecoveryState> {
+    const state=await this.request<RunRecoveryState>(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/recovery-state`,{method:'POST',body:{generation}});
+    if(state.id!==runId||state.generation!==generation)throw new Error('Recovery identity mismatch');
+    return state;
   }
 
   appendEvents(runId: string, generation: number, events: ConnectorEvent[]): Promise<{ accepted: boolean }> {
@@ -169,6 +176,7 @@ const executionSchema = z.object({
 }).strict();
 
 function validateResponse(path: string, value: unknown): unknown {
+  if(path.endsWith('/recovery-state'))return z.object({id:z.string().min(1),generation:z.number().int().positive(),status:z.enum(['queued','running','paused','cancelled','interrupted','completed','failed']),stoppedAt:z.string().optional(),preEffectStaging:z.boolean(),stagingRetired:z.boolean(),merged:z.boolean(),qaResourcePolicy:z.object({resource:qaResource.optional(),providerResource:qaResource.optional()}).strict().optional()}).strict().parse(value);
   if (path.endsWith('/claim')) {
     const claim = z.object({ run: z.object({ id: z.string(), generation: z.number(), model: z.string(), reasoning: z.string(), kind: z.enum(['master','implementation','review','delivery']), status: z.string(), execution: executionSchema.optional() }).passthrough(), execution: executionSchema.optional(), project: z.object({ id: z.string(), repositoryUrl: z.string().optional() }).passthrough(), messages: z.array(z.object({ id: z.string(), role: z.string(), speaker: z.string(), text: z.string(), createdAt: z.string() }).passthrough()), settings: z.array(z.object({ id: z.string(), kind: z.string(), name: z.string(), data: z.record(z.string(), z.unknown()) }).passthrough()) }).parse(value);
     if (claim.run.execution) verifyExecutionSkills(claim.run.execution.skills);

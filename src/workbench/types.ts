@@ -199,6 +199,18 @@ export interface RuntimeProvider {
     verifiedAt?: string;
 }
 
+/** Stop/recovery control only: never execution context or an effect grant. */
+export interface RunRecoveryState {
+    id: string;
+    generation: number;
+    status: Run['status'];
+    stoppedAt?: string;
+    preEffectStaging: boolean;
+    stagingRetired: boolean;
+    merged: boolean;
+    qaResourcePolicy?: Pick<QaPolicy, 'resource' | 'providerResource'>;
+}
+
 /** Pre-effect retirement cannot resolve an ambiguous staging mutation. */
 export function isPreEffectStagingRun(run: Run): boolean {
     const op = run.operation;
