@@ -244,7 +244,9 @@ Provider candidate `ccadd5fdc4c38967b5fb9e39936328198640d4f2` was operator-teste
 
 The local main checkout at `9042b0c` contains the current Merge source bytes and has typecheck/build evidence, but has not passed a full integrated operator suite or received typed-review approval. Do not treat the separate `dd824` candidate’s suite as proof for these integrated bytes.
 
-The Marketplace Work (ID prefix `156…`) has a dispatched implementation run (`33f26f3c`) but no operator acceptance or integration yet. Provider connection management and Marketplace/plugin import remain full-app requirements, not deferred scope. No merge or deployment is claimed; A14 and A16 remain Partial.
+The Marketplace Work (ID prefix `156…`) has a dispatched implementation run (`33f26f3c`). Provider connection management and Marketplace/plugin import remain full-app requirements, not deferred scope. No merge or deployment is claimed; A14 and A16 remain Partial.
+
+The Marketplace candidate `6acab75fc3f0a72444fac70208aa3c5cc05aa31a` was operator-tested in an isolated snapshot at that exact SHA: **352/352 across 36 files, zero skips** (`/private/tmp/menoteam-marketplace-6acab75-full-vitest.json`). This older base contains two PostgreSQL suites, not the later Provider suite: repository 2/2 and Workbench 29/29, run serially against separate disposable `menoteam_workbench_6acab75_test` and `menoteam_provider_6acab75_test` databases. The zero-skip gate passed. The local UI typecheck passed, but backend and Workbench UI typechecks and the server build were blocked by `TS1005: '>' expected` at `src/workbench/types.ts:125:531`: the `ExecutionContext.skills` `Array<...>` type is missing its closing `>` before the semicolon. Both isolated Vite builds (Local UI and Workbench) passed; Vite transpilation does not replace typechecking. The snapshot stayed at the same SHA with no tracked changes. This is operator evidence only: the candidate has not received native acceptance or been integrated, and no browser acceptance is claimed.
 
 ### A16 — Dual-PostgreSQL integrated checkpoint `307fca0` (2026-10-06)
 
