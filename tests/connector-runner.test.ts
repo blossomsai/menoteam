@@ -278,6 +278,11 @@ describe('Integrated connector lifecycle',()=>{
       if(req.url?.endsWith('/bridge-token')){send({token:'scoped-token-long-enough-for-validation-123',expiresAt:'later'});return;}
       if(req.url?.endsWith('/events')){for(const event of body.events)ids.add(event.id);if(!lostEvent){lostEvent=true;res.destroy();}else send({accepted:true});return;}
       if(req.url?.endsWith('/complete')){completed=true;res.destroy();return;}
+      if(req.method==='POST'&&req.url?.endsWith('/recovery-state')){
+        expect(body).toEqual({generation:claim().run.generation});
+        send({id:claim().run.id,generation:claim().run.generation,status:completed?'completed':'running',preEffectStaging:false,stagingRetired:false,merged:false});
+        if(completed)void runner.stop();return;
+      }
       if(req.method==='GET'){send({...claim().run,status:completed?'completed':'running'});if(completed)void runner.stop();return;}
       send(claim().run);
     });

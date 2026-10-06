@@ -868,16 +868,21 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const invite=checkedJson(await user('POST','/invites',{email:`recovery-${randomUUID()}@test.example`,projectId:p.id,role:'member'}));
         const member=checkedJson(await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invite.token,name:'Recovery member',password:'recovery-test-password'}}));
         const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:member.email,password:'recovery-test-password'}});
+        expect(login.statusCode).toBe(200);
         const memberCookie=String(login.headers['set-cookie']).split(';')[0]!;
+        const me=await app.inject({method:'GET',url:'/api/workbench/me',headers:{cookie:memberCookie}});
+        expect(me.statusCode).toBe(200);
+        const actor=checkedJson(me);expect(actor.role).toBe('member');expect(actor.email).toBe(member.email);
+        expect(actor.id).toEqual(expect.any(String));expect(actor.id.length).toBeGreaterThan(0);
         const request=await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:memberCookie},payload:{text:'Private recovery prompt',requestId:randomUUID()}});
         expect(request.statusCode).toBe(200);
         const headers={authorization:`Bearer ${enrolled.token}`};
         const claim=checkedJson(await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{capabilities:fixtureCapabilities}})).run as Run;
-        expect(claim.id).toBe(request.json().run.id);expect(claim.requestedBy).toBe(member.id);
+        expect(claim.id).toBe(request.json().run.id);expect(claim.requestedBy).toBe(actor.id);
         const send=(suffix:string,generation=claim.generation)=>app.inject({method:'POST',url:`/api/workbench/connector/runs/${claim.id}/${suffix}`,headers,payload:{generation}});
         const policy=qaPolicyFixture(p.id); // Contract-only snapshot; not execution evidence.
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{qaPolicySnapshot}',${sql.json(policy as never)}) WHERE id=${claim.id}`;
-        checkedJson(await user('DELETE',`/projects/${p.id}/members/${member.id}`));
+        checkedJson(await user('DELETE',`/projects/${p.id}/members/${actor.id}`));
         expect((await app.inject({method:'GET',url:`/api/workbench/connector/runs/${claim.id}`,headers})).statusCode).toBe(403);
         expect((await send('renew')).statusCode).toBe(403);
         expect((await send('bridge-token')).statusCode).toBe(403);
