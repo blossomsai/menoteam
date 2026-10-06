@@ -51,42 +51,44 @@ function parseSkillMarkdown(content: string, directoryName: string | undefined) 
 function sha256(value: string) { return createHash('sha256').update(value).digest('hex'); }
 export async function registerSourceRoutes(app: FastifyInstance, store: WorkbenchStore, options: SourceOptions) {
     const fetcher = options.fetcher ?? fetch;
-    async function githubJson<T>(url: string, maxBytes = MAX_SOURCE_BYTES): Promise<T> {
-        const response = await fetcher(url, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'menoteam-workbench', ...(options.githubToken ? { authorization: `Bearer ${options.githubToken}` } : {}) }, redirect: 'error', signal: AbortSignal.timeout(15000) });
-        if (!response.ok) fail(502, `GitHub catalog source unavailable (${response.status})`);
+    async function githubJson<T>(url: string, maxBytes = MAX_SOURCE_BYTES, signal?: AbortSignal): Promise<T> {
+        let response: Response;
+        try { response = await fetcher(url, { headers: { accept: 'application/vnd.github+json', 'user-agent': 'menoteam-workbench', ...(options.githubToken ? { authorization: `Bearer ${options.githubToken}` } : {}) }, redirect: 'error', signal: signal ?? AbortSignal.timeout(15000) }); }
+        catch (error) { fail(502, error instanceof Error && error.name === 'TimeoutError' ? 'GitHub source request timed out' : 'GitHub source request failed'); }
+        if (!response.ok) fail(502, `GitHub source unavailable (${response.status})`);
         const reader = response.body?.getReader();
         if (!reader) fail(502, 'GitHub response has no readable body');
         const chunks: Uint8Array[] = []; let size = 0;
         try {
             if (Number(response.headers.get('content-length')) > maxBytes) { await reader.cancel('GitHub response exceeds the supported size').catch(() => undefined); fail(400, 'GitHub response exceeds the supported size'); }
-            while (true) {
+            try { while (true) {
                 const next = await reader.read(); if (next.done) break;
                 size += next.value.byteLength;
                 if (size > maxBytes) { await reader.cancel('GitHub response exceeds the supported size').catch(() => undefined); fail(400, 'GitHub response exceeds the supported size'); }
                 chunks.push(next.value);
-            }
+            } } catch (error) { if ((error as { statusCode?: number }).statusCode) throw error; fail(502, signal?.aborted ? 'GitHub source request timed out' : 'GitHub source response failed'); }
         } finally { reader.releaseLock(); }
         let raw: string;
         try { raw = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); } catch { fail(400, 'GitHub response is not valid UTF-8'); }
         try { return JSON.parse(raw) as T; } catch { return fail(400, 'GitHub response is not valid JSON'); }
     }
-    async function resolveCommit(owner: string, repo: string, ref: string) {
+    async function resolveCommit(owner: string, repo: string, ref: string, signal?: AbortSignal) {
         if (!ref || ref.length > 255 || /[\0\r\n]/u.test(ref)) fail(400, 'Invalid GitHub ref');
-        const result = await githubJson<{ sha?: string }>(`https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`);
+        const result = await githubJson<{ sha?: string }>(`https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`, MAX_SOURCE_BYTES, signal);
         if (!/^[a-f0-9]{40}$/u.test(result.sha ?? '') || (/^[a-f0-9]{40}$/u.test(ref) && result.sha !== ref)) fail(502, 'GitHub did not return the requested immutable commit SHA');
         return result.sha!;
     }
-    async function gitTree(owner: string, repo: string, commit: string) {
-        const tree = await githubJson<{ truncated?: boolean; tree?: Array<{ path: string; type: string; mode?: string; sha: string; size?: number }> }>(`https://api.github.com/repos/${owner}/${repo}/git/trees/${commit}?recursive=1`, 8_000_000);
+    async function gitTree(owner: string, repo: string, commit: string, signal?: AbortSignal) {
+        const tree = await githubJson<{ truncated?: boolean; tree?: Array<{ path: string; type: string; mode?: string; sha: string; size?: number }> }>(`https://api.github.com/repos/${owner}/${repo}/git/trees/${commit}?recursive=1`, 8_000_000, signal);
         if (tree.truncated !== false || !Array.isArray(tree.tree) || tree.tree.length > 100_000) fail(400, 'GitHub tree is truncated or too large');
         const entries = z.array(z.object({ path: z.string().min(1).max(1000), type: z.enum(['blob', 'tree', 'commit']), mode: z.string().regex(/^(040000|100644|100755|120000|160000)$/u), sha: z.string().regex(/^[a-f0-9]{40}$/u), size: z.number().int().nonnegative().optional() }).passthrough()).parse(tree.tree);
         const names = new Set<string>();
         for (const item of entries) { if (safeRepoPath(item.path) !== item.path || names.has(item.path.toLowerCase())) fail(400, 'Duplicate or ambiguous repository path'); names.add(item.path.toLowerCase()); }
         return entries;
     }
-    async function gitBytes(owner: string, repo: string, blob: string, limit = MAX_SOURCE_BYTES) {
+    async function gitBytes(owner: string, repo: string, blob: string, limit = MAX_SOURCE_BYTES, signal?: AbortSignal) {
         if (!/^[a-f0-9]{40}$/u.test(blob)) fail(400, 'GitHub returned an invalid blob identifier');
-        const result = await githubJson<{ encoding?: string; content?: string; size?: number }>(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${blob}`, limit * 2);
+        const result = await githubJson<{ encoding?: string; content?: string; size?: number }>(`https://api.github.com/repos/${owner}/${repo}/git/blobs/${blob}`, limit * 2, signal);
         if (result.encoding !== 'base64' || typeof result.content !== 'string' || typeof result.size !== 'number' || result.size > limit) fail(400, 'Repository file is invalid or exceeds the supported size');
         const base64 = result.content.replace(/\s/gu, '');
         if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(base64)) fail(400, 'GitHub returned invalid base64 content');
@@ -97,6 +99,29 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
     async function gitText(owner: string, repo: string, blob: string, limit = MAX_SOURCE_BYTES) {
         const bytes = await gitBytes(owner, repo, blob, limit);
         try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return fail(400, 'Repository file must contain complete UTF-8 text'); }
+    }
+    async function publicGitBytes(owner: string, repo: string, commit: string, entry: { path: string; sha: string; size?: number }, limit: number, signal: AbortSignal) {
+        if (!Number.isSafeInteger(entry.size) || entry.size! > limit) fail(400, 'Repository file exceeds the supported size');
+        const path = entry.path.split('/').map(encodeURIComponent).join('/');
+        let response: Response;
+        try { response = await fetcher(`https://raw.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${commit}/${path}`, { redirect: 'error', signal }); }
+        catch (error) { fail(502, error instanceof Error && error.name === 'TimeoutError' ? 'GitHub raw source request timed out' : 'GitHub raw source request failed'); }
+        if (!response.ok) fail(502, `GitHub raw source unavailable (${response.status})`);
+        const reader = response.body?.getReader(); if (!reader) fail(502, 'GitHub raw response has no readable body');
+        const chunks: Uint8Array[] = []; let size = 0;
+        try { try { while (true) { const next = await reader.read(); if (next.done) break; size += next.value.byteLength; if (size > Math.min(entry.size!, limit)) { await reader.cancel().catch(() => undefined); fail(400, 'Repository file exceeds its immutable tree size'); } chunks.push(next.value); } } catch (error) { if ((error as { statusCode?: number }).statusCode) throw error; fail(502, signal.aborted ? 'GitHub raw source request timed out' : 'GitHub raw source response failed'); } } finally { reader.releaseLock(); }
+        const bytes = Buffer.concat(chunks);
+        if (bytes.length !== entry.size || gitBlobHash(bytes) !== entry.sha) fail(400, 'Git blob is incomplete or does not match immutable tree');
+        return bytes;
+    }
+    async function repoInfo(owner: string, repo: string, signal: AbortSignal, visibility: Map<string, { private: boolean; default_branch?: string }>) {
+        const key = `${owner.toLowerCase()}/${repo.toLowerCase()}`;
+        if (visibility.has(key)) return visibility.get(key)!;
+        const result = await githubJson<{ private?: boolean; default_branch?: string }>(`https://api.github.com/repos/${owner}/${repo}`, MAX_SOURCE_BYTES, signal);
+        if (typeof result.private !== 'boolean') fail(502, 'GitHub did not confirm repository visibility');
+        const info = { private: result.private, default_branch: result.default_branch };
+        visibility.set(key, info);
+        return info;
     }
     function parseCatalogUrl(value: string) {
         const url = new URL(value); const parts = url.pathname.split('/').filter(Boolean);
@@ -109,12 +134,14 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         if (path !== '.agents/plugins/marketplace.json' && path !== '.claude-plugin/marketplace.json' && path !== 'marketplace.json') fail(400, 'URL must point to a supported marketplace.json');
         return { owner, repo, ref, path };
     }
-    async function marketplacePreview(catalogUrl: string) {
-        const catalog = parseCatalogUrl(catalogUrl); const commit = await resolveCommit(catalog.owner, catalog.repo, catalog.ref); const tree = await gitTree(catalog.owner, catalog.repo, commit);
+    async function marketplacePreview(catalogUrl: string, deadline = AbortSignal.timeout(45_000), visibility = new Map<string, { private: boolean; default_branch?: string }>()) {
+        const catalog = parseCatalogUrl(catalogUrl);
+        const privateRepo = (await repoInfo(catalog.owner, catalog.repo, deadline, visibility)).private;
+        const commit = await resolveCommit(catalog.owner, catalog.repo, catalog.ref, deadline); const tree = await gitTree(catalog.owner, catalog.repo, commit, deadline);
         const catalogFile = tree.find(item => item.path === catalog.path && item.type === 'blob' && item.mode !== '120000');
         if (!catalogFile || (catalogFile.size ?? MAX_CATALOG_BYTES + 1) > MAX_CATALOG_BYTES) fail(400, 'Marketplace file is missing or too large');
         let data: { name?: unknown; plugins?: unknown };
-        try { data = JSON.parse(await gitText(catalog.owner, catalog.repo, catalogFile.sha, MAX_CATALOG_BYTES)) as typeof data; } catch { return fail(400, 'Marketplace JSON is invalid'); }
+        try { const bytes = !privateRepo ? await publicGitBytes(catalog.owner, catalog.repo, commit, catalogFile, MAX_CATALOG_BYTES, deadline) : await gitBytes(catalog.owner, catalog.repo, catalogFile.sha, MAX_CATALOG_BYTES, deadline); data = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as typeof data; } catch (error) { if ((error as { statusCode?: number }).statusCode) throw error; return fail(400, 'Marketplace JSON is invalid'); }
         if (typeof data.name !== 'string' || !data.name.trim() || data.name.length > 120 || !Array.isArray(data.plugins) || data.plugins.length > 300) fail(400, 'Marketplace metadata is invalid');
         const plugins = data.plugins.map((raw, index) => {
             const itemResult = z.object({ name: z.string().min(1).max(120), category: z.string().min(1).max(80), policy: z.unknown(), source: z.unknown() }).passthrough().safeParse(raw);
@@ -154,13 +181,15 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         if (new Set(plugins.map(plugin => plugin.name)).size !== plugins.length) fail(400, 'Marketplace plugin names must be unique');
         return { name: data.name, catalogUrl, catalogCommit: commit, plugins };
     }
-    async function inspectPlugin(plugin: Awaited<ReturnType<typeof marketplacePreview>>['plugins'][number]) {
+    async function inspectPlugin(plugin: Awaited<ReturnType<typeof marketplacePreview>>['plugins'][number], selectedPaths: string[] = [], deadline = AbortSignal.timeout(45_000), visibility = new Map<string, { private: boolean; default_branch?: string }>(), expectedCommit?: string) {
         if (plugin.unsupportedReason) fail(400, plugin.unsupportedReason);
-        const repository = plugin.requestedRef ? undefined : await githubJson<{ default_branch?: string }>(`https://api.github.com/repos/${plugin.owner}/${plugin.repo}`);
-        const requestedRef = plugin.requestedRef || repository?.default_branch;
+        const repository = await repoInfo(plugin.owner!, plugin.repo!, deadline, visibility);
+        const privateRepo = repository.private;
+        const requestedRef = plugin.requestedRef || repository.default_branch;
         if (!requestedRef) fail(502, 'GitHub did not return a default branch');
-        const commit = await resolveCommit(plugin.owner!, plugin.repo!, requestedRef);
-        const tree = await gitTree(plugin.owner!, plugin.repo!, commit); const prefix = plugin.pluginPath ? `${plugin.pluginPath}/` : '';
+        const commit = await resolveCommit(plugin.owner!, plugin.repo!, requestedRef, deadline);
+        if (expectedCommit && expectedCommit !== commit) fail(409, 'Catalog or plugin source changed after preview; preview again before importing');
+        const tree = await gitTree(plugin.owner!, plugin.repo!, commit, deadline); const prefix = plugin.pluginPath ? `${plugin.pluginPath}/` : '';
         const entries = tree.filter(item => item.path.startsWith(prefix));
         const paths = entries.filter(item => item.type === 'blob' && item.mode !== '120000');
         const manifestPath = `${prefix}plugin.json`; const manifestFile = paths.find(item => item.path === manifestPath);
@@ -169,9 +198,12 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         if ([manifestFile, codexManifestFile].some(file => file && (file.size ?? MAX_SOURCE_BYTES + 1) > MAX_SOURCE_BYTES)) fail(400, `Plugin ${plugin.name} manifest is too large`);
         const readManifest = async (file: typeof manifestFile) => {
             if (!file) return undefined;
-            try { return JSON.parse(await gitText(plugin.owner!, plugin.repo!, file.sha)) as Record<string, unknown>; } catch { return fail(400, `Plugin ${plugin.name} manifest JSON is invalid`); }
+            try { const bytes = !privateRepo ? await publicGitBytes(plugin.owner!, plugin.repo!, commit, file, MAX_SOURCE_BYTES, deadline) : await gitBytes(plugin.owner!, plugin.repo!, file.sha, MAX_SOURCE_BYTES, deadline); return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as Record<string, unknown>; } catch (error) { if ((error as { statusCode?: number }).statusCode) throw error; return fail(400, `Plugin ${plugin.name} manifest JSON is invalid`); }
         };
-        const [portable, codex] = await Promise.all([readManifest(manifestFile), readManifest(codexManifestFile)]);
+        const manifests = await Promise.allSettled([readManifest(manifestFile), readManifest(codexManifestFile)]);
+        const manifestFailure = manifests.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (manifestFailure) throw manifestFailure.reason;
+        const [portable, codex] = manifests.map(result => (result as PromiseFulfilledResult<Record<string, unknown> | undefined>).value);
         const pluginManifest = z.object({ $schema: z.literal('https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'), name: z.string().min(1).max(64).regex(/^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u), version: z.string().optional(), description: z.string().optional(), author: z.object({ name: z.string().optional(), email: z.string().optional(), url: z.string().optional() }).strict().optional(), homepage: z.string().optional(), repository: z.string().optional(), license: z.string().optional(), keywords: z.array(z.string()).optional(), extensions: z.record(z.string(), z.record(z.string(), z.unknown())).optional() }).strict();
         const codexPluginManifest = z.object({ name: z.string().min(1).max(64).regex(/^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u), version: z.string().optional(), description: z.string().optional(), apps: z.union([z.string(), z.array(z.string())]).optional(), skills: z.union([z.string(), z.array(z.string())]).optional(), hooks: z.unknown().optional(), mcpServers: z.unknown().optional(), agents: z.unknown().optional(), commands: z.unknown().optional(), interface: z.record(z.string(), z.unknown()).optional() }).passthrough();
         if (portable && !pluginManifest.safeParse(portable).success) fail(400, `Plugin ${plugin.name} portable manifest is invalid`);
@@ -195,19 +227,23 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         const skillFiles = entries.filter(item => item.path.startsWith(`${prefix}skills/`) && item.path.endsWith('/SKILL.md'));
         if (skillFiles.length > MAX_SKILLS) fail(400, 'Plugin exceeds supported skill count');
         const skills: Array<{ name: string; description: string; license?: string; sourcePath: string; content: string; bundle?: Awaited<ReturnType<typeof collectSkillBundle>>; dependencyError?: string; contentSha256: string; sourceContentSha256?: string }> = [];
+        const readResource = async (entry: typeof tree[number]) => !privateRepo
+            ? publicGitBytes(plugin.owner!, plugin.repo!, commit, entry, SKILL_BOUNDS.fileBytes, deadline)
+            : gitBytes(plugin.owner!, plugin.repo!, entry.sha, SKILL_BOUNDS.fileBytes, deadline);
         for (const file of skillFiles) {
             const sourcePath = file.path;
             const root = sourcePath.slice(0, -'/SKILL.md'.length);
+            const name = root.split('/').at(-1)!;
+            if (selectedPaths.length && !selectedPaths.includes(sourcePath)) { skills.push({ name, description: '', sourcePath, content: '', contentSha256: bytesHash('') }); continue; }
             let bundle: Awaited<ReturnType<typeof collectSkillBundle>> | undefined;
-            let dependencyError: string | undefined;
-            let content = ''; let metadata = { name: root.split('/').at(-1)!, description: '', license: undefined as string | undefined };
+            let content = ''; let metadata = { name, description: '', license: undefined as string | undefined };
             try {
-                bundle = await collectSkillBundle(tree, root, commit, entry => gitBytes(plugin.owner!, plugin.repo!, entry.sha, SKILL_BOUNDS.fileBytes));
+                bundle = await collectSkillBundle(tree, root, commit, readResource);
                 content = skillMarkdown(bundle);
-                const parsed = parseSkillMarkdown(content, root.split('/').at(-1)!);
+                const parsed = parseSkillMarkdown(content, name);
                 metadata = { name: parsed.name, description: parsed.description, license: parsed.license };
-            } catch (error) { dependencyError = error instanceof Error ? error.message : 'Skill bundle is invalid'; }
-            skills.push({ ...metadata, sourcePath, content, bundle, dependencyError, contentSha256: bytesHash(content), sourceContentSha256: bundle?.sha256 });
+            } catch (error) { if ((error as { statusCode?: number }).statusCode === 502) throw error; if (deadline.aborted) fail(502, 'GitHub source request timed out'); fail(400, error instanceof Error ? error.message : 'Skill bundle is invalid'); }
+            skills.push({ ...metadata, sourcePath, content, bundle, contentSha256: bytesHash(content), sourceContentSha256: bundle?.sha256 });
         }
         // Skill regular files are supported bytes; plugin-level components remain uninstalled.
         unsupported.push(...entries.filter(item => item.type !== 'tree' && !skills.some(skill => item.path.startsWith(`${skill.sourcePath.slice(0, -'/SKILL.md'.length)}/`)) && item.path !== manifestPath && item.path !== codexManifestPath && !item.path.endsWith('/README.md') && !item.path.endsWith('/LICENSE')).map(item => item.path));
@@ -217,10 +253,14 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         if (value.scope === 'project' && !value.projectId) context.addIssue({ code: 'custom', message: 'Project scope requires a project ID' });
         if (value.scope === 'workspace' && value.projectId) context.addIssue({ code: 'custom', message: 'Workspace scope cannot include a project ID' });
     });
-    async function getPluginPreview(catalogUrl: string, pluginName: string) {
-        const catalog = await marketplacePreview(catalogUrl); const plugin = catalog.plugins.find(item => item.name === pluginName);
+    async function getPluginPreview(catalogUrl: string, pluginName: string, selectedPaths: string[] = [], expected?: { pluginCommit: string; catalogCommit: string }) {
+        const deadline = AbortSignal.timeout(45_000);
+        const visibility = new Map<string, { private: boolean; default_branch?: string }>();
+        const catalog = await marketplacePreview(catalogUrl, deadline, visibility);
+        if (expected && expected.catalogCommit !== catalog.catalogCommit) fail(409, 'Catalog or plugin source changed after preview; preview again before importing');
+        const plugin = catalog.plugins.find(item => item.name === pluginName);
         if (!plugin) fail(400, 'Plugin is not present in this marketplace');
-        const inspected = await inspectPlugin(plugin);
+        const inspected = await inspectPlugin(plugin, selectedPaths, deadline, visibility, expected?.pluginCommit);
         return { catalog, ...inspected };
     }
     app.post('/api/workbench/skills/catalog', async req => {
@@ -230,15 +270,15 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
     });
     app.post('/api/workbench/skills/catalog/preview', async req => {
         const input = catalogRequest.parse(req.body); await options.authorize(req, input.projectId, input.scope === 'project');
-        const body = z.object({ scope: z.enum(['project', 'workspace']), projectId: z.string().min(1).optional(), catalogUrl: z.string().url().max(2000), pluginName: z.string().min(1).max(120) }).strict().parse(req.body);
-        const result = await getPluginPreview(body.catalogUrl, body.pluginName); await options.authorize(req, input.projectId, input.scope === 'project');
-        return { catalog: { name: result.catalog.name, url: result.catalog.catalogUrl, commit: result.catalog.catalogCommit }, plugin: { name: result.plugin.name, description: result.plugin.description, commit: result.commit, version: result.manifest.version ?? null }, unsupported: result.unsupported, skills: result.skills.map(skill => ({ name: skill.name, description: skill.description, license: skill.license ?? null, path: skill.sourcePath, content: skill.content, includedReferences: [], bundleFiles: skill.bundle?.files.map(({ path, mode, bytes, sha256 }) => ({ path, mode, bytes, sha256 })) ?? [], bundleSha256: skill.bundle?.sha256, unsupportedDependency: skill.dependencyError, contentSha256: skill.contentSha256 })) };
+        const body = z.object({ scope: z.enum(['project', 'workspace']), projectId: z.string().min(1).optional(), catalogUrl: z.string().url().max(2000), pluginName: z.string().min(1).max(120), selectedPaths: z.array(z.string().min(1).max(500)).max(MAX_SKILLS).default([]) }).strict().parse(req.body);
+        const result = await getPluginPreview(body.catalogUrl, body.pluginName, body.selectedPaths); await options.authorize(req, input.projectId, input.scope === 'project');
+        return { catalog: { name: result.catalog.name, url: result.catalog.catalogUrl, commit: result.catalog.catalogCommit }, plugin: { name: result.plugin.name, description: result.plugin.description, commit: result.commit, version: result.manifest.version ?? null }, unsupported: result.unsupported, skills: result.skills.map(skill => ({ name: skill.name, description: skill.description, license: skill.license ?? null, path: skill.sourcePath, ...(skill.bundle ? { content: skill.content, includedReferences: [], bundleFiles: skill.bundle.files.map(({ path, mode, bytes, sha256 }) => ({ path, mode, bytes, sha256 })), bundleSha256: skill.bundle.sha256, contentSha256: skill.contentSha256 } : skill.dependencyError ? { unsupportedDependency: skill.dependencyError } : {}) })) };
     });
     app.post('/api/workbench/skills/catalog/import', async req => {
         const base = catalogRequest.parse(req.body); await options.authorize(req, base.projectId, true);
         const input = z.object({ scope: z.enum(['project', 'workspace']), projectId: z.string().min(1).optional(), catalogUrl: z.string().url().max(2000), pluginName: z.string().min(1).max(120), selectedPaths: z.array(z.string().min(1).max(500)).min(1).max(MAX_SKILLS), previewCommit: z.string().regex(/^[a-f0-9]{40}$/u), previewCatalogCommit: z.string().regex(/^[a-f0-9]{40}$/u) }).strict().parse(req.body);
         if (new Set(input.selectedPaths).size !== input.selectedPaths.length) fail(400, 'Duplicate selected skills are not allowed');
-        const result = await getPluginPreview(input.catalogUrl, input.pluginName);
+        const result = await getPluginPreview(input.catalogUrl, input.pluginName, input.selectedPaths, { pluginCommit: input.previewCommit, catalogCommit: input.previewCatalogCommit });
         if (input.previewCommit !== result.commit || input.previewCatalogCommit !== result.catalog.catalogCommit) fail(409, 'Catalog or plugin source changed after preview; preview again before importing');
         const selected = result.skills.filter(skill => input.selectedPaths.includes(skill.sourcePath));
         if (selected.length !== input.selectedPaths.length) fail(400, 'One or more selected skills are unavailable or invalid');

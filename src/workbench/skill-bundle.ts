@@ -51,7 +51,7 @@ export function skillMarkdown(bundle: SkillBundle): string {
     try { return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(f.data, 'base64')); }
     catch { return fail('SKILL.md must be complete UTF-8'); }
 }
-export async function collectSkillBundle(tree: SkillTreeEntry[], root: string, commit: string, read: (entry: SkillTreeEntry) => Promise<Uint8Array>): Promise<SkillBundle> {
+export async function collectSkillBundle(tree: SkillTreeEntry[], root: string, commit: string, read: (entry: SkillTreeEntry) => Promise<Uint8Array>, concurrency = 4): Promise<SkillBundle> {
     if (root !== '') bundlePath(root);
     const names = new Set<string>();
     for (const entry of tree) {
@@ -72,12 +72,18 @@ export async function collectSkillBundle(tree: SkillTreeEntry[], root: string, c
         total += e.size!;
     }
     if (total > SKILL_BOUNDS.totalBytes || !entries.some(e => e.path === `${prefix}SKILL.md`)) fail('Skill bundle is oversized or SKILL.md missing');
-    const files: SkillFile[] = [];
-    for (const e of entries) {
-        const bytes = await read(e);
-        if (bytes.length !== e.size || gitBlobHash(bytes) !== e.sha) fail('Git blob is incomplete or does not match immutable tree');
-        files.push({ path: e.path.slice(prefix.length), mode: e.mode as SkillFile['mode'], encoding: 'base64', data: Buffer.from(bytes).toString('base64'), bytes: bytes.length, sha256: bytesHash(bytes), sourceBlobSha: e.sha });
-    }
+    const files: SkillFile[] = new Array(entries.length); let cursor = 0;
+    const workers = Array.from({ length: Math.max(1, Math.min(4, concurrency, entries.length)) }, async () => {
+        while (cursor < entries.length) {
+            const index = cursor++; const e = entries[index]!;
+            const bytes = await read(e);
+            if (bytes.length !== e.size || gitBlobHash(bytes) !== e.sha) fail('Git blob is incomplete or does not match immutable tree');
+            files[index] = { path: e.path.slice(prefix.length), mode: e.mode as SkillFile['mode'], encoding: 'base64', data: Buffer.from(bytes).toString('base64'), bytes: bytes.length, sha256: bytesHash(bytes), sourceBlobSha: e.sha };
+        }
+    });
+    const results = await Promise.allSettled(workers);
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failed) throw failed.reason;
     return sealBundle(root, commit, files);
 }
 export function editBundleMarkdown(input: unknown, content: string): SkillBundle {

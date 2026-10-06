@@ -18,7 +18,10 @@ async function fixture() {
     ['skills/two/scripts/check',Buffer.from('#!/bin/sh\nprintf LOCAL_MARKER\n')],
     ['skills/two/assets/icon.bin',Buffer.from([0,255,128,13,10,0])],
   ]);
-  const state={denied:false,truncated:false,symlink:false,failWrite:0,writes:0};
+  const state={denied:false,authCalls:0,revokeAtAuth:0,truncated:false,symlink:false,publicRepo:false,rawStatus:200,rawFailurePath:'',rawTimeout:false,rawCorrupt:false,failWrite:0,writes:0,activeRaw:0,maxRaw:0};
+  const requests:string[]=[];
+  const rawAuthorization:string[]=[]; const apiAuthorization:string[]=[];
+  const rawRedirects:string[]=[];
   let records:Setting[]=[];
   const store=new WorkbenchStore(null as unknown as Sql);
   vi.spyOn(store,'list').mockImplementation(async()=>structuredClone(records));
@@ -26,21 +29,24 @@ async function fixture() {
   vi.spyOn(store,'transaction').mockImplementation(async(_scope,fn)=>{ const before=structuredClone(records); try{return await fn(null as unknown as Sql);}catch(e){records=before;throw e;} });
   const app=Fastify();
   await registerSourceRoutes(app,store,{
-    authorize:async()=>{if(state.denied)throw Object.assign(new Error('Denied'),{statusCode:403});},
-    fetcher:async input=>{
-      const url=new URL(String(input)); const catalog=url.pathname.includes('/catalog/');
+    authorize:async()=>{state.authCalls++;if(state.denied||state.authCalls===state.revokeAtAuth)throw Object.assign(new Error('Denied'),{statusCode:403});},
+    githubToken:'fixture-token', fetcher:async (input,init)=>{
+      const url=new URL(String(input)); requests.push(url.href); const catalog=url.pathname.includes('/catalog/');
+      const authorization=new Headers(init?.headers).get('authorization'); if(url.hostname==='raw.githubusercontent.com'){rawAuthorization.push(authorization??'');rawRedirects.push(String(init?.redirect));}else apiAuthorization.push(authorization??'');
+      if(url.pathname.startsWith('/repos/') && !/\/(commits|git)\//u.test(url.pathname))return Response.json({private:!state.publicRepo});
       if(url.pathname.includes('/commits/'))return Response.json({sha:catalog?catalogCommit:commit});
       if(url.pathname.includes('/git/trees/'))return Response.json({truncated:state.truncated,tree:[...files].filter(([p])=>catalog?p==='marketplace.json':p!=='marketplace.json').map(([p,b])=>({path:p,type:'blob',mode:state.symlink&&p.endsWith('scripts/check')?'120000':p.endsWith('scripts/check')?'100755':'100644',sha:gitBlobHash(b),size:b.length}))});
       if(url.pathname.includes('/git/blobs/')){const b=[...files.values()].find(b=>gitBlobHash(b)===url.pathname.split('/').at(-1));if(b)return Response.json({encoding:'base64',content:b.toString('base64'),size:b.length});}
+      if(url.hostname==='raw.githubusercontent.com'){state.activeRaw++;state.maxRaw=Math.max(state.maxRaw,state.activeRaw);await new Promise(resolve=>setTimeout(resolve,1));const path=decodeURIComponent(url.pathname.split('/').slice(4).join('/'));if(state.rawTimeout&&(!state.rawFailurePath||state.rawFailurePath===path)){state.activeRaw--;throw Object.assign(new Error('timed out'),{name:'TimeoutError'});}const original=files.get(path);const body=original&&state.rawCorrupt&&path.startsWith('skills/one/')?Buffer.from(original):original;if(body&&body!==original)body[0]=(body[0]??0)^1;const response=state.rawStatus!==200&&(!state.rawFailurePath||state.rawFailurePath===path)?new Response(null,{status:state.rawStatus}):new Response(body??null);state.activeRaw--;return response;}
       return new Response(null,{status:404});
     },
   });
   const payload={scope:'project',projectId:'p',catalogUrl:'https://github.com/example/catalog/blob/fixed/marketplace.json',pluginName:'fixture',previewCommit:commit,previewCatalogCommit:catalogCommit,selectedPaths:['skills/one/SKILL.md','skills/two/SKILL.md']};
-  return {app,state,files,payload,records:()=>records};
+  return {app,state,files,payload,requests,rawAuthorization,rawRedirects,apiAuthorization,records:()=>records};
 }
 it('imports exact full regular-file bundles through production preview/import and direct GitHub routes',async()=>{
   const f=await fixture();try{
-    const preview=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture'}});
+    const preview=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/two/SKILL.md']}});
     expect(preview.statusCode).toBe(200);expect(preview.json().skills[1].bundleFiles).toHaveLength(4);
     const result=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:f.payload});
     expect(result.statusCode).toBe(200);expect(f.records()).toHaveLength(2);
@@ -53,6 +59,7 @@ it('imports exact full regular-file bundles through production preview/import an
     expect((await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:f.payload})).statusCode).toBe(409);expect(f.records()).toHaveLength(3);
     const pinnedMismatch=await f.app.inject({method:'POST',url:'/api/workbench/projects/p/skills/import',payload:{url:`https://github.com/example/plugin/blob/${'c'.repeat(40)}/skills/two/SKILL.md`}});
     expect(pinnedMismatch.statusCode).toBe(502);expect(f.records()).toHaveLength(3);
+    expect(f.rawAuthorization).toEqual([]);expect(f.apiAuthorization.every(value=>value==='Bearer fixture-token')).toBe(true);
   }finally{await f.app.close();}
 });
 it('rejects whole multiselection on incomplete/unsafe files, permission denial and second-write failure',async()=>{
@@ -61,6 +68,67 @@ it('rejects whole multiselection on incomplete/unsafe files, permission denial a
     f.state.failWrite=2;
     const failed=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:f.payload});expect(failed.statusCode).toBe(500);expect(f.records()).toEqual([]);
   }finally{await f.app.close();}
+});
+
+it('lists metadata without skill reads and hydrates only the selected public 71-file skill from pinned raw bytes',async()=>{
+  const f=await fixture();
+  try {
+    for(let index=0;index<70;index++) f.files.set(`skills/one/references/${index}.md`,Buffer.from(`reference ${index}`));
+    f.state.publicRepo=true;
+    const metadata=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture'}});
+    expect(metadata.statusCode).toBe(200); expect(metadata.json().skills).toHaveLength(2);
+    expect(metadata.json().skills[0]).not.toHaveProperty('bundleSha256');
+    expect(f.requests.some(url=>url.includes('/git/blobs/'))).toBe(false);
+    const original=f.app;
+    // The fixture fetcher returns raw bytes; enforce and observe its bounded concurrency through the request list.
+    const hydrated=await original.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
+    expect(hydrated.statusCode).toBe(200); expect(hydrated.json().skills[0].bundleFiles).toHaveLength(71);
+    expect(f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/'))).toHaveLength(73); // catalog, plugin manifest, then 71 selected files
+    expect(f.state.maxRaw).toBeLessThanOrEqual(4);
+    expect(f.rawRedirects.every(value=>value==='error')).toBe(true);
+    expect(f.records()).toEqual([]);
+    const imported=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:{...f.payload,selectedPaths:['skills/one/SKILL.md']}});
+    expect(imported.statusCode).toBe(200); expect(f.records()).toHaveLength(1);
+    expect(f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/') && url.includes('/skills/one/'))).toHaveLength(142);
+    expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/') && url.includes('/skills/two/'))).toBe(false);
+  } finally { await f.app.close(); }
+});
+
+it('reports public raw 403 and never forwards the configured token to raw hosts',async()=>{
+  const f=await fixture();
+  try {
+    f.state.publicRepo=true;
+    f.state.rawStatus=403;
+    f.state.rawFailurePath='skills/one/SKILL.md';
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
+    expect(response.statusCode).toBe(502); expect(response.json().message).toContain('403');
+    expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/')&&url.endsWith('/skills/one/SKILL.md'))).toBe(true);
+    expect(f.rawAuthorization.every(value=>value==='')); expect(f.apiAuthorization.every(value=>value==='Bearer fixture-token')).toBe(true);
+    f.state.rawStatus=200; f.state.rawTimeout=true;
+    const timeout=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
+    expect(timeout.statusCode).toBe(502); expect(timeout.json().message).toMatch(/timed out/u); expect(f.records()).toEqual([]); expect(f.state.activeRaw).toBe(0);
+    f.state.rawTimeout=false; f.state.rawStatus=403;
+    const failedImport=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:{...f.payload,selectedPaths:['skills/one/SKILL.md']}});
+    expect(failedImport.statusCode).toBe(502); expect(f.records()).toEqual([]);
+  } finally { await f.app.close(); }
+});
+
+it('rechecks authorization inside the transaction after selected hydration and writes nothing after revocation',async()=>{
+  const f=await fixture();
+  try {
+    f.state.revokeAtAuth=2;
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:{...f.payload,selectedPaths:['skills/one/SKILL.md']}});
+    expect(response.statusCode).toBe(403); expect(f.records()).toEqual([]);
+  } finally { await f.app.close(); }
+});
+
+it('rejects public raw bytes that do not match the immutable Git tree hash',async()=>{
+  const f=await fixture();
+  try {
+    f.state.publicRepo=true; f.state.rawCorrupt=true;
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
+    expect(response.statusCode).toBe(400); expect(response.json().message).toMatch(/Git blob.*immutable tree/u); expect(f.records()).toEqual([]);
+  } finally { await f.app.close(); }
 });
 
 async function codexLocalFixture(options: { path?: string; dual?: boolean; identityConflict?: boolean; components?: boolean; airtableProducts?: unknown; installation?: unknown; authentication?: unknown; unknownPolicyField?: boolean } = {}) {
@@ -91,6 +159,7 @@ async function codexLocalFixture(options: { path?: string; dual?: boolean; ident
     authorize:async()=>{if(state.denied)throw Object.assign(new Error('Denied'),{statusCode:403});},
     fetcher:async input=>{
       const url=new URL(String(input));requests.push(url.href);
+      if(url.pathname.startsWith('/repos/') && !/\/(commits|git)\//u.test(url.pathname))return Response.json({private:true});
       if(url.pathname.includes('/commits/'))return Response.json({sha:state.commitMismatch?'c'.repeat(40):commit});
       if(url.pathname.includes('/git/trees/'))return Response.json({truncated:state.truncated,tree:[...files].map(([path,bytes])=>({path,type:'blob',mode:'100644',sha:gitBlobHash(bytes),size:bytes.length}))});
       if(url.pathname.includes('/git/blobs/')){const bytes=[...files.values()].find(bytes=>gitBlobHash(bytes)===url.pathname.split('/').at(-1));if(bytes)return Response.json({encoding:'base64',content:bytes.toString('base64'),size:bytes.length});}
@@ -109,6 +178,7 @@ it('resolves the official same-repository local catalog entry at its immutable c
     expect(preview.json().catalog.commit).toBe('5fd93af4cd0c623e020d0cc7e9ce178b4ac1f70f');
     expect(preview.json().plugin).toMatchObject({name:'airtable',commit:f.payload.previewCommit,version:'6.0.1'});
     expect(preview.json().skills.map((skill:{path:string})=>skill.path)).toEqual(f.payload.selectedPaths);
+    expect(f.requests.filter(url=>new URL(url).pathname==='/repos/openai/plugins')).toHaveLength(1);
     expect(preview.json().unsupported).toEqual(expect.arrayContaining(['.codex-plugin/plugin.json:apps','plugins/airtable/.app.json','plugins/airtable/.mcp.json']));
     expect(f.requests.every(url=>new URL(url).pathname.startsWith('/repos/openai/plugins/'))).toBe(true);
     expect(f.requests.some(url=>url.includes('/commits/5fd93af4cd0c623e020d0cc7e9ce178b4ac1f70f'))).toBe(true);
@@ -204,4 +274,9 @@ it('rejects local path escape and conflicting dual-manifest identity before impo
     const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
     expect(response.statusCode).toBe(502);expect(response.json().message).toMatch(/immutable commit SHA/u);
   }finally{await f.app.close();}
+  const changed=await codexLocalFixture();try{
+    changed.state.commitMismatch=true;
+    const response=await changed.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:changed.payload});
+    expect(response.statusCode).toBe(409);expect(response.json().message).toMatch(/changed after preview/u);expect(changed.records()).toEqual([]);
+  }finally{await changed.app.close();}
 });
