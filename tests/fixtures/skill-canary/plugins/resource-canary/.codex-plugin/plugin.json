@@ -1,0 +1,6 @@
+{
+  "name": "resource-canary",
+  "version": "0.1.0",
+  "description": "A harmless fixture plugin containing one resource-bundle canary skill.",
+  "skills": "./skills/"
+}
