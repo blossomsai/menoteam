@@ -27,15 +27,15 @@ async function waitForFile(file: string): Promise<string> {
   }
   throw new Error(`File was not created: ${file}`);
 }
-const treeScript = (exitParent: boolean) => `
+const treeScript = (exitParent: boolean, childStartupDelayMs = 0) => `
 const { spawn } = require('node:child_process');
-const { writeFileSync } = require('node:fs');
+const { existsSync, writeFileSync } = require('node:fs');
 const { join } = require('node:path');
 process.stdin.resume();
 const heartbeat = join(process.cwd(), 'heartbeat');
-const child = spawn(process.execPath, ['-e', "const fs=require('node:fs'); process.on('SIGTERM',()=>{}); setInterval(()=>fs.appendFileSync(process.argv[1],'x'),20)", heartbeat], { stdio:'ignore' });
+const child = spawn(process.execPath, ['-e', ${exitParent ? `"const fs=require('node:fs'); process.on('SIGTERM',()=>{}); setTimeout(()=>{fs.appendFileSync(process.argv[1],'x'); setInterval(()=>fs.appendFileSync(process.argv[1],'x'),20)},Number(process.argv[2]))"` : `"const fs=require('node:fs'); process.on('SIGTERM',()=>{}); setInterval(()=>fs.appendFileSync(process.argv[1],'x'),20)"`}, heartbeat, '${childStartupDelayMs}'], { stdio:'ignore' });
 writeFileSync(join(process.cwd(),'child-pid'), String(child.pid));
-${exitParent ? "setTimeout(()=>process.exit(0),100);" : "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"}
+${exitParent ? "const deadline=Date.now()+5000; const waitForReady=()=>{if(existsSync(heartbeat)) return process.exit(0); if(Date.now()>=deadline) return process.exit(2); setTimeout(waitForReady,10)}; waitForReady();" : "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);"}
 `;
 
 describe('local Codex executable runner', () => {
@@ -83,8 +83,8 @@ let input=''; process.stdin.on('data',c=>input+=c); process.stdin.on('end',()=>{
     expect(await readFile(heartbeat, 'utf8')).toBe(stopped);
   }, 12_000);
 
-  it('cleans up a leaked child after the parent exits successfully', async () => {
-    const { handle, folder } = await fake(treeScript(true));
+  it('waits for delayed child startup, then cleans up the leaked child after parent exit', async () => {
+    const { handle, folder } = await fake(treeScript(true, 250));
     const heartbeat = join(folder, 'heartbeat'); await waitForFile(heartbeat);
     await expect(handle.result).resolves.toEqual({ output: '' });
     const stopped = await readFile(heartbeat, 'utf8');
