@@ -7,8 +7,9 @@ import { z } from "zod";
 import type { Sql } from "postgres";
 import { registerSourceRoutes } from "./sources.js";
 import { WorkbenchStore } from "./store.js";
+import { requiresLocalWorktree } from "./execution-capabilities.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
-import type { Member, Project, Work, Message, Run, Artifact, Setting, RunEvent } from "./types.js";
+import { isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type Artifact, type Setting, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
@@ -194,7 +195,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     });
     async function runtimeProviders(projectIds: string[]) {
         if (!projectIds.length) return [];
-        const connectors = await sql`SELECT id, capabilities, last_seen FROM wb_connectors WHERE project_ids ?| ${projectIds}`;
+        const connectors = await sql`SELECT id, capabilities, last_seen, project_ids FROM wb_connectors WHERE project_ids ?| ${projectIds}`;
         return Promise.all(connectors.map(async c => {
             const evidence = await sql`SELECT r.id,r.data->>'updatedAt' AS verified_at FROM wb_records r
                 WHERE r.kind='run' AND r.project_id IN ${sql(projectIds)}
@@ -203,12 +204,63 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 AND EXISTS(SELECT 1 FROM wb_records m WHERE m.kind='message' AND m.project_id=r.project_id
                     AND m.data->>'runId'=r.id AND m.data->>'role' IN ('master','agent','subagent'))
                 ORDER BY r.updated_at DESC LIMIT 1`;
-            return {provider:'openai',method:'codex-host',connectorId:c.id,
+            return {provider:'openai',method:'codex-host',connectorId:c.id,projectIds:(c.project_ids as string[]).filter(pid=>projectIds.includes(pid)),runKinds:c.capabilities?.runKinds,codexAppServer:c.capabilities?.codexAppServer,localWorktrees:c.capabilities?.localWorktrees,
                 available:!!c.last_seen && Date.now()-new Date(c.last_seen).getTime()<120000,
                 models:Array.isArray(c.capabilities?.models)?c.capabilities.models:[],
                 lastSeen:c.last_seen?new Date(c.last_seen).toISOString():'',
                 ...(evidence[0]?{verifiedRunId:evidence[0].id,verifiedAt:evidence[0].verified_at}:{})};
         }));
+    }
+    async function providerConnections(projectIds:string[]) {
+        const runtime=await runtimeProviders(projectIds);
+        return (await store.list<Setting>('setting')).filter(s=>s.kind==='provider'&&!s.projectId).map(s=>{
+            const endpoint=runtime.find(c=>c.connectorId===s.data.connectorId);
+            const reason=!endpoint?undefined:endpoint.codexAppServer!==true?'Codex capability unavailable':endpoint.localWorktrees!==true?'Local Worktree capability unavailable':!endpoint.models.length?'Connector models have not been discovered':undefined;
+            const status=s.data.enabled===false?'disabled':!s.data.connectorId?'unbound':!endpoint?'disconnected':!endpoint.available?'offline':reason?'capability_unavailable':'available';
+            return {id:s.id,name:s.name,connectorId:s.data.connectorId,default:s.data.default===true,enabled:s.data.enabled!==false,status,reason,localWorktrees:endpoint?.localWorktrees,models:endpoint?.models??[],projectIds:endpoint?.projectIds??[],runKinds:endpoint?.runKinds};
+        });
+    }
+    async function validateSelection(projectId:string, connectorId:string, model:string|undefined, kind:Run['kind']|undefined, tx:Sql, connectionId?:string, legacy=false) {
+        if(connectionId){
+            const connection=await store.get<Setting>('setting',connectionId,tx);
+            if(!connection||connection.kind!=='provider'||connection.projectId||connection.data.connectorId!==connectorId||connection.data.enabled===false)fail(409,'Selected provider connection is unavailable or disabled');
+        }
+        const rows=await tx`SELECT project_ids,capabilities,last_seen FROM wb_connectors WHERE id=${connectorId}`;
+        const endpoint=rows[0];
+        if(!endpoint||(endpoint.project_ids as string[]).includes(projectId)===false)fail(403,'Selected Connector project grant is unavailable');
+        if(!endpoint!.last_seen||Date.now()-new Date(endpoint!.last_seen).getTime()>=120000)fail(409,'Selected Connector is offline');
+        const caps=endpoint!.capabilities;
+        if(caps?.codexAppServer===false||!legacy&&caps?.codexAppServer!==true)fail(409,'Selected Connector Codex capability is unavailable');
+        if(model&&(!Array.isArray(caps?.models)||!caps.models.includes(model)))fail(409,'Selected Connector model is unavailable');
+        // runKinds is current scheduler capacity (an active Master removes master), not revoked Codex capability.
+        if(requiresLocalWorktree(kind)&&(caps?.localWorktrees===false||!legacy&&caps?.localWorktrees!==true))fail(409,'Selected Connector local Worktree capability is unavailable');
+    }
+    async function validateFrozenRunIdentity(run:Run,tx:Sql){
+        const selected=run.execution?.connectorId??run.targetConnectorId??run.connectorId;
+        if(!selected)fail(409,'Historical Connector identity is unavailable');
+        if(run.connectorId&&run.connectorId!==selected||run.targetConnectorId&&run.targetConnectorId!==selected)fail(409,'Frozen Connector identity mismatch');
+        if(run.execution?.model&&run.execution.model!==run.model)fail(409,'Frozen model mismatch');
+        if(run.execution&&(run.execution.provider!=='openai'||run.execution.method!=='codex-host'))fail(409,'Unsupported frozen provider method');
+        if(run.execution?.profile&&run.execution.profile.id!==run.execution.profileId)fail(409,'Frozen profile identity mismatch');
+        if(run.execution?.connectionId){
+            const connection=await store.get<Setting>('setting',run.execution.connectionId,tx);
+            if(!connection||connection.kind!=='provider'||connection.projectId||connection.data.connectorId!==selected)fail(409,'Frozen connection identity mismatch');
+        }
+        if(run.workId){
+            const work=await store.get<Work>('work',run.workId,tx);
+            if(!work||work.projectId!==run.projectId)fail(409,'Historical Work scope mismatch');
+            if(work!.profileId&&run.execution?.profileId&&work!.profileId!==run.execution.profileId)fail(409,'Frozen Work profile identity mismatch');
+            if(work!.connectionId){
+                if(run.execution?.connectionId&&work!.connectionId!==run.execution.connectionId)fail(409,'Frozen Work connection identity mismatch');
+                const connection=await store.get<Setting>('setting',work!.connectionId,tx);
+                if(!connection||connection.kind!=='provider'||connection.projectId||connection.data.connectorId!==selected)fail(409,'Frozen Work Connector identity mismatch');
+            }
+        }
+        return selected!;
+    }
+    async function validateRunSelection(run:Run,tx:Sql){
+        const selected=await validateFrozenRunIdentity(run,tx);
+        await validateSelection(run.projectId,selected,run.model,run.kind,tx,run.execution?.connectionId,!run.execution?.connectionId);
     }
     app.get("/api/workbench/snapshot", async (req) => {
         const user = await member(req);
@@ -222,10 +274,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             projects: (await store.list<Project>("project")).filter(p => ids.includes(p.id)),
             works: await store.scopedList<Work>("work", ids),
             messages: await store.scopedList<Message>("message", ids),
-            runs: await store.scopedList<Run>("run", ids),
+            runs: (await store.scopedList<Run>('run',ids)).map(run=>run.status==='queued'&&run.kind!=='delivery'&&!run.execution?.connectorId&&!run.targetConnectorId&&!run.connectorId?{...run,error:run.error??'Historical Connector identity is unresolved; this queued run cannot be dispatched or silently migrated'}:run),
             artifacts: await store.artifactMetadata(ids),
             settings: scoped(await store.list<Setting>("setting")),
-            runtimeProviders: await runtimeProviders(ids)
+            runtimeProviders: await runtimeProviders(ids),
+            providerConnections: await providerConnections(ids)
         };
     });
     app.post("/api/workbench/projects", async (req) => {
@@ -273,16 +326,23 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             title: text,
             overview: z.string().max(32000).default(""),
             profileId: z.string().default(""),
+            connectionId: z.string().min(1).optional(),
             sources: z.array(z.string()).max(100).default([])
         }).parse(input);
         if(b.profileId) {
             const profile=await store.get<Setting>('setting',b.profileId,tx);
             if(!profile || profile.kind!=='profile' || (profile.projectId && profile.projectId!==projectId))fail(400,'Agent profile is unavailable in this project');
         }
+        const connectionId=b.connectionId??(await store.list<Setting>('setting',undefined,tx)).find(s=>s.kind==='provider'&&!s.projectId&&s.data.default===true&&typeof s.data.connectorId==='string')?.id;
+        if(!connectionId)fail(409,'Select an available provider connection before creating Work');
+        const connection=await store.get<Setting>('setting',connectionId!,tx);
+        if(!connection||connection.kind!=='provider'||connection.projectId||typeof connection.data.connectorId!=='string')fail(400,'Invalid provider connection');
+        await validateSelection(projectId,String(connection!.data.connectorId),b.profileId?String((await store.get<Setting>('setting',b.profileId,tx))!.data.model):'gpt-6-luna','implementation',tx,connectionId);
         const work: Work = {
             id: id("work"),
             projectId,
             ...b,
+            connectionId,
             status: "queued",
             revision: 1,
             createdAt: now(),
@@ -301,6 +361,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     }
     async function makeRun(projectId: string, input: {
         workId?: string;
+        connectionId?: string;
         prompt: string;
         kind: Run["kind"];
         requestedBy?: string;
@@ -309,25 +370,51 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         model?: string;
         reasoning?: string;
     }, tx = sql) {
+        if(!await actorAuthorized({projectId,requestedBy:input.requestedBy,sourceIds:input.sourceIds},tx))fail(403,'Run requester project authorization is unavailable');
         if (input.workId) {
             const w = await store.get<Work>("work", input.workId, tx);
             if (w?.projectId !== projectId)
                 fail(403, "Work scope mismatch");
         }
         const priorRuns = await store.list<Run>("run", projectId, tx);
-        const previous = priorRuns.filter(x => x.workId === input.workId && x.kind === input.kind && x.threadId).at(-1);
+        const sameKindHistory = priorRuns.filter(x => x.workId === input.workId && x.kind === input.kind && !isCausalMasterWake(x) && (x.threadId || x.execution?.connectorId || x.connectorId || x.targetConnectorId)).at(-1);
+        const previous = sameKindHistory?.threadId ? sameKindHistory : undefined;
         const candidate = input.kind === "review" ? (await store.list<Artifact>("artifact", projectId, tx)).filter(a => a.workId === input.workId && a.kind === "diff").at(-1) : undefined;
         if (input.kind === "review" && !candidate)
             fail(409, "Review requires recorded candidate diff");
         if(candidate){const assigned=(await store.list<Run>('run',projectId,tx)).find(item=>item.id===candidate.runId);if(!assigned||assigned.kind!=='implementation'||assigned.status!=='completed'||assigned.workId!==input.workId)fail(409,'Review candidate is not a completed implementation run');}
         const targetWork = input.workId ? await store.get<Work>("work", input.workId, tx) : undefined;
-        const profile = targetWork?.profileId ? await store.get<Setting>("setting", targetWork.profileId, tx) : undefined;
-        if(targetWork?.profileId && !profile)fail(400,"Agent profile missing");
+        const crossKindHistory = !sameKindHistory
+            ? priorRuns.filter(r => r.workId === input.workId && r.kind !== input.kind && !isCausalMasterWake(r) && (r.execution?.connectorId || r.connectorId || r.targetConnectorId)).at(-1)
+            : undefined;
+        const historical = sameKindHistory ?? crossKindHistory;
+        // Validate recorded identity before choosing a profile or copying its native thread.
+        // Availability is checked below for the new execution kind, not the old kind.
+        if(historical)await validateFrozenRunIdentity(historical,tx);
+        // Full configuration is frozen only within the same run kind. Cross-kind
+        // history supplies identity affinity, never another kind's model/settings.
+        const snapshotRun = sameKindHistory;
+        const firstCrossKindReview = input.kind === 'review' && historical !== undefined && historical.kind !== input.kind;
+        const frozenProfile=snapshotRun?.execution?.profile;
+        const profile = frozenProfile?{...frozenProfile,kind:'profile' as const,updatedAt:snapshotRun!.createdAt}:snapshotRun||firstCrossKindReview?undefined:targetWork?.profileId ? await store.get<Setting>("setting", targetWork.profileId, tx) : undefined;
+        if(targetWork?.profileId && !profile && !snapshotRun && !firstCrossKindReview)fail(400,"Agent profile missing");
         if (profile && (profile.kind !== "profile" || (profile.projectId && profile.projectId !== projectId)))
             fail(400, "Invalid agent profile");
-        const skills = profile ? (await resolveProfileSkills(profile, tx))
+        const skills = snapshotRun?.execution?structuredClone(snapshotRun.execution.skills):profile ? (await resolveProfileSkills(profile, tx))
             .filter(skill => skill.data.enabled !== false)
             .map(skill => ({id: skill.id, name: skill.name, content: String(skill.data.content)})) : [];
+        if(snapshotRun&&input.model&&input.model!==snapshotRun.model)fail(409,'Frozen model cannot change');
+        const model=snapshotRun?.model??input.model ?? (input.kind==='implementation'&&profile?String(profile.data.model):input.kind==='implementation'?'gpt-6-luna':'gpt-6.1-sol');
+        const frozenConnectionId=historical?.execution?.connectionId??targetWork?.connectionId;
+        if(input.connectionId&&(targetWork||historical)&&input.connectionId!==frozenConnectionId)fail(409,'Existing Work or native thread provider connection cannot change');
+        const connectionId=frozenConnectionId??(!targetWork&&!historical?input.connectionId??(await store.list<Setting>('setting',undefined,tx)).find(s=>s.kind==='provider'&&!s.projectId&&s.data.default===true&&s.data.connectorId)?.id:undefined);
+        const connection=connectionId?await store.get<Setting>('setting',connectionId,tx):undefined;
+        const connectorId=historical?.execution?.connectorId??historical?.connectorId??historical?.targetConnectorId??(typeof connection?.data.connectorId==='string'?connection.data.connectorId:undefined);
+        if(!connectorId)fail(409,'No historical Connector identity is available; create a new Work with an explicit provider connection');
+        const candidateRun=candidate?priorRuns.find(r=>r.id===candidate.runId):undefined;
+        const candidateConnector=candidateRun?await validateFrozenRunIdentity(candidateRun,tx):undefined;
+        if(candidateConnector&&candidateConnector!==connectorId)fail(409,'Candidate Connector is incompatible with selected connection');
+        await validateSelection(projectId,connectorId!,model,input.kind,tx,connectionId,!connectionId);
         const run: Run = {
             ...(candidate ? {
                 targetRevision: candidate.revision,
@@ -338,13 +425,15 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 threadId: previous.threadId,
                 targetConnectorId: previous.connectorId
             } : {}),
-            execution: {provider:'openai',method:'codex-host',...(profile?{profileId:profile.id}:{}),skills,
+            execution: snapshotRun?.execution?structuredClone(snapshotRun.execution):{provider:'openai',method:'codex-host',connectionId,connectorId,model,...(!connectionId?{legacy:true}:{}),...(profile?{profileId:profile.id,profile:{id:profile.id,name:profile.name,data:structuredClone(profile.data)}}:{}),skills,
                 tools:profile && Array.isArray(profile.data.tools)?profile.data.tools as string[]:[]},
             id: id("run"),
             projectId,
             ...input,
-            model: input.model ?? (input.kind === "implementation" && profile ? String(profile.data.model) : input.kind === "implementation" ? "gpt-6-luna" : "gpt-6.1-sol"),
-            reasoning: input.reasoning ?? (profile ? String(profile.data.reasoning) : "medium"),
+            model: model,
+            ...(snapshotRun?.threadId&&snapshotRun.execution?{execution:{...structuredClone(snapshotRun.execution),connectionId: snapshotRun.execution.connectionId,connectorId: snapshotRun.execution.connectorId??snapshotRun.connectorId??snapshotRun.targetConnectorId,model:snapshotRun.execution.model??snapshotRun.model,...(!snapshotRun.execution.connectionId&&snapshotRun.execution.legacy?{legacy:true}:{})}}:{}),
+            targetConnectorId: connectorId,
+            reasoning: snapshotRun?.reasoning??input.reasoning ?? (profile ? String(profile.data.reasoning) : "medium"),
             status: "queued",
             generation: 0,
             createdAt: now(),
@@ -501,7 +590,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             id: string;
         }).id;
         await grant(await member(req), pid);
-        return makeWork(pid, req.body);
+        return store.transaction('work-create',async tx=>{await grant(await member(req),pid);return makeWork(pid,req.body,tx);});
     });
     app.post('/api/workbench/works/:id/delivery',async req=>{
         const user=await member(req);const workId=(req.params as {id:string}).id;
@@ -560,6 +649,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const b = z.object({
             text,
             workId: z.string().optional(),
+            connectionId: z.string().min(1).max(200).optional(),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
         return store.transaction(`message:${pid}:${b.requestId}`, async (tx) => {
@@ -568,6 +658,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 return previous[0].result;
             const run = await makeRun(pid, {
                 workId: b.workId,
+                connectionId: b.connectionId,
                 prompt: b.text,
                 requestedBy: u.id,
                 kind: b.workId ? "implementation" : "master"
@@ -644,6 +735,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             provider: z.object({
                 provider: z.literal("openai").default("openai"),
                 method: z.literal("codex-host").default("codex-host"),
+                connectorId: z.string().min(1),
+                enabled: z.boolean().default(true),
                 default: z.boolean().default(false)
             }).strict(),
             skill: z.object({
@@ -681,6 +774,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         }
         return skills;
     }
+    async function clearProviderDefaults(tx:Sql,except?:string){
+        for(const setting of await store.list<Setting>('setting',undefined,tx))if(setting.kind==='provider'&&!setting.projectId&&setting.id!==except&&setting.data.default===true){setting.data.default=false;setting.updatedAt=now();await store.put('setting',setting,tx);}
+    }
     async function writeSetting(input: unknown, tx = sql, actorId?: string) {
         const b = z.object({
             kind: z.enum(["profile", "provider", "skill", "connection"]),
@@ -692,7 +788,21 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (b.kind === 'connection' && ['delivery','qa'].includes(String(b.data.purpose))) b.data.configuredBy = actorId;
         if(b.kind==='connection'&&b.data.purpose==='qa'&&!b.projectId)fail(400,'QA policy requires a project');
         if (b.kind === 'profile') await resolveProfileSkills(b, tx);
-        if(b.kind==='provider'&&!b.projectId){const existing=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.kind==='provider'&&!s.projectId);b.data.default=existing.length===0;}
+        if(b.kind==='provider'){
+            if(b.projectId)fail(400,'Provider connections belong to the workspace');
+            const endpoint=await tx`SELECT project_ids,capabilities FROM wb_connectors WHERE id=${String(b.data.connectorId)}`;
+            if(!endpoint[0])fail(400,'Choose an enrolled Connector');
+            const actorRows=await tx`SELECT id,email,name,role FROM wb_users WHERE id=${actorId??''}`;
+            const accessible=actorRows[0]?await visible(actorRows[0] as unknown as Member):[];
+            const projectId=(endpoint[0]!.project_ids as string[]).find(pid=>accessible.includes(pid));
+            if(!projectId)fail(403,'Connector is outside accessible projects');
+            await validateSelection(projectId!,String(b.data.connectorId),undefined,'implementation',tx);
+            if(!Array.isArray(endpoint[0]?.capabilities?.models)||!endpoint[0]?.capabilities.models.length)fail(409,'Connector models have not been discovered');
+            const existing=(await store.list<Setting>('setting',undefined,tx)).filter(s=>s.kind==='provider'&&!s.projectId&&s.data.connectorId);
+            if(existing.some(s=>s.data.connectorId===b.data.connectorId))fail(409,'Connector already has a provider connection');
+            b.data.default=b.data.enabled!==false&&(b.data.default===true||existing.length===0);
+            if(b.data.default)await clearProviderDefaults(tx);
+        }
         const s: Setting = {
             id: id("setting"),
             ...b,
@@ -726,6 +836,24 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         else if (!['owner', 'admin'].includes(actor.role)) fail(403, 'Workspace administrator required');
         if (change.expectedUpdatedAt && change.expectedUpdatedAt !== setting!.updatedAt)
             fail(409, 'Setting changed; reload before updating');
+        if(setting!.kind==='provider'&&change.data){
+            if(change.data.enabled===true||change.data.default===true){
+                const cid=setting!.data.connectorId;
+                if(typeof cid!=='string')fail(409,'Unbound provider metadata cannot be enabled; add a real Connector connection');
+                const endpoints=await tx`SELECT project_ids,capabilities FROM wb_connectors WHERE id=${String(cid)}`;
+                const accessible=await visible(actor);
+                const pid=(endpoints[0]?.project_ids as string[]|undefined)?.find(pid=>accessible.includes(pid));
+                if(!pid)fail(403,'Selected Connector is outside accessible projects');
+                await validateSelection(pid!,String(cid),undefined,'implementation',tx);
+                if(!Array.isArray(endpoints[0]?.capabilities?.models)||!endpoints[0]?.capabilities.models.length)fail(409,'Connector models have not been discovered');
+            }
+            if(Object.hasOwn(change.data,'connectorId')&&change.data.connectorId!==setting!.data.connectorId)fail(409,'Provider Connector identity cannot change; add a new connection');
+            if(change.data.enabled===false&&change.data.default===undefined)change.data.default=false;
+            if(change.data.default===true){
+                if(change.data.enabled===false||setting!.data.enabled===false&&change.data.enabled!==true)fail(409,'Disabled connection cannot become default');
+                await clearProviderDefaults(tx,sid);
+            }
+        }
         if (change.data) {
             setting!.data = settingData(setting!.kind, { ...setting!.data, ...change.data });
             if (setting!.kind === 'connection' && ['delivery','qa'].includes(String(setting!.data.purpose))) setting!.data.configuredBy = actor.id;
@@ -769,14 +897,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             projectIds: rows[0]!.project_ids as string[]
         };
     }
-    async function actorAuthorized(run:Run,tx=sql):Promise<boolean>{
+    async function actorAuthorized(run:Pick<Run,'projectId'|'requestedBy'|'sourceIds'>,tx=sql):Promise<boolean>{
         const users=await tx`SELECT role FROM wb_users WHERE id=${run.requestedBy??''}`;
         if(!users[0])return false;
         if(users[0]!.role!=='owner'){const memberships=await tx`SELECT role FROM wb_memberships WHERE user_id=${run.requestedBy!} AND project_id=${run.projectId}`;if(!memberships[0])return false;}
         if(run.sourceIds?.length){const p=await store.get<Project>('project',run.projectId,tx);if(!p?.feedbackIntake?.enabled||p.feedbackIntake.actorId!==run.requestedBy)return false;}
         return true;
     }
-    async function leased(req: FastifyRequest, tx: Sql, allowBridge=false, reconciliation=false) {
+    async function leased(req: FastifyRequest, tx: Sql, allowBridge=false, reconciliation=false, requireExecution=true) {
         let c: {id:string;projectIds:string[]};
         if(allowBridge){
             const raw=req.headers.authorization?.replace(/^Bearer /,'')??'';
@@ -802,6 +930,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(409, "Lease lost; stop and reconcile execution");
         if(reconciliation&&(r!.kind!=='delivery'||r!.operation?.action!=='merge_pr'||!['merge_intent','merged'].includes(r!.operation.phase)))fail(403,'Only saved merge intent permits read-only effect recording');
         if(!reconciliation&&!await actorAuthorized(r!,tx))fail(403,'Run authorization revoked; stop execution');
+        if(!reconciliation&&requireExecution&&r!.kind!=='delivery')await validateRunSelection(r!,tx);
         return r!;
     }
     app.post('/api/workbench/connector/runs/:id/qa-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
@@ -833,6 +962,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const claimed = await store.transaction("workbench:claim", async (tx) => {
             const runs = await store.list<Run>("run", undefined, tx);
             for (const r of runs) {
+                if(!c.projectIds.includes(r.projectId))continue;
                 if(r.status==='queued'&&!(r.kind==='delivery'&&r.operation?.action==='merge_pr'&&r.operation.phase==='merge_intent')&&!await actorAuthorized(r,tx)){r.status='cancelled';r.stoppedAt=now();r.error='Run authorization revoked';await store.put('run',r,tx);}
                 if (r.status === "running" && Date.parse(r.leaseUntil ?? "") < Date.now()) {
                     r.status = "interrupted";
@@ -841,9 +971,18 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                     await store.put("run", r, tx);
                 }
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&!!r.operation&&body.capabilities.deliveryActions.includes(r.operation.action) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (!r.targetConnectorId || r.targetConnectorId === c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(Date.parse(active.createdAt)===Date.parse(r.createdAt)&&active.id<r.id))))));
+            for(const queued of runs.filter(r=>r.status==='queued'&&r.kind!=='delivery'&&c.projectIds.includes(r.projectId))){
+                const selected=queued.execution?.connectorId??queued.targetConnectorId??queued.connectorId;
+                if(selected)try{await validateRunSelection(queued,tx);}catch(error){queued.status='failed';queued.error=error instanceof Error?error.message:'Selected connection unavailable';queued.updatedAt=now();await store.put('run',queued,tx);}
+            }
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&!!r.operation&&body.capabilities.deliveryActions.includes(r.operation.action) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (r.kind==='delivery'?(!r.targetConnectorId||r.targetConnectorId===c.id):(r.execution?.connectorId??r.targetConnectorId??r.connectorId)===c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(Date.parse(active.createdAt)===Date.parse(r.createdAt)&&active.id<r.id))))));
             if (!r)
                 return undefined;
+            if(r.kind!=='delivery'){
+                const selected=r.execution?.connectorId??r.targetConnectorId??r.connectorId;
+                if(selected!==c.id)fail(409,'Selected Connector claim mismatch');
+                try{await validateRunSelection(r,tx);}catch(error){r.status='failed';r.error=error instanceof Error?error.message:'Selected connection unavailable';r.updatedAt=now();await store.put('run',r,tx);return undefined;}
+            }
             r.status = "running";
             r.connectorId = c.id;
             r.generation++;
@@ -868,6 +1007,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         }).id);
         if (!r || !c.projectIds.includes(r.projectId) || r.connectorId !== c.id)
             fail(403, "Run denied");
+        if(!await actorAuthorized(r!))fail(403,'Run authorization revoked');
+        if(r!.status==='running'&&r!.kind!=='delivery')await validateRunSelection(r!,sql);
         return r;
     });
     app.post("/api/workbench/connector/runs/:id/renew", async (req) => store.transaction(`run:${(req.params as {
@@ -882,7 +1023,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.post("/api/workbench/connector/runs/:id/events", async (req) => store.transaction(`run:${(req.params as {
         id: string;
     }).id}`, async (tx) => {
-        const r = await leased(req, tx);
+        const r = await leased(req, tx,false,false,false);
         const b = z.object({
             generation: z.number(),
             events: z.array(z.object({
@@ -933,7 +1074,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.post("/api/workbench/connector/runs/:id/artifacts", async (req) => store.transaction(`run:${(req.params as {
         id: string;
     }).id}`, async (tx) => {
-        const r = await leased(req, tx);
+        const r = await leased(req, tx,false,false,false);
         const b = z.object({
             generation: z.number(),
             kind: z.enum(["diff", "qa", "delivery", "source"]),
@@ -1025,7 +1166,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(403, "Run denied");
         if (["completed", "failed"].includes(existing!.status))
             return existing;
-        const r = await leased(req, tx, false, existing!.kind==='delivery'&&existing!.operation?.phase==='merged');
+        const r = await leased(req, tx, false, existing!.kind==='delivery'&&existing!.operation?.phase==='merged', false);
         const b = z.object({
             generation: z.number(),
             threadId: z.string().optional(),
@@ -1037,11 +1178,16 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         r.updatedAt = now();
         await store.put("run", r, tx);
         if (r.kind !== "master") {
-            await makeRun(r.projectId, {
-                prompt: `Assigned ${r.kind} run ${r.id} finished with status ${r.status}. Read recorded messages and artifacts, coordinate next steps, and explain current progress. Do not claim unverified delivery.`,
-                kind: "master",
-                requestedBy: r.requestedBy,allowedActions:r.allowedActions,sourceIds:r.sourceIds
-            }, tx);
+            const prompt=`Assigned ${r.kind} run ${r.id} finished with status ${r.status}. Read recorded messages and artifacts, coordinate next steps, and explain current progress. Do not claim unverified delivery.`;
+            try{
+                await makeRun(r.projectId,{prompt,kind:'master',requestedBy:r.requestedBy,allowedActions:r.allowedActions,sourceIds:r.sourceIds},tx);
+            }catch(error){
+                if(!(error instanceof Error)||!('statusCode' in error)||Number(error.statusCode)>=500)throw error;
+                // Valid fenced completion must not roll back when Master cannot execute.
+                // Keep the worker as the causal source, but never use this diagnostic as Master affinity.
+                const failedWake:Run={id:id('run'),projectId:r.projectId,prompt,kind:'master',causedByRunId:r.id,requestedBy:r.requestedBy,allowedActions:r.allowedActions,sourceIds:r.sourceIds,model:'gpt-6.1-sol',reasoning:'medium',status:'failed',generation:0,createdAt:now(),updatedAt:now(),error:`Master wake was not dispatched: ${error instanceof Error?error.message:'Selected connection unavailable'}`};
+                await store.put('run',failedWake,tx);
+            }
         }
         return r;
     }));
@@ -1099,7 +1245,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 messages: await store.scopedList<Message>("message", [r.projectId], 500, tx),
                 runs: await store.scopedList<Run>("run", [r.projectId], 500, tx),
                 artifacts: await store.artifactMetadata([r.projectId],tx),
-                settings: (await store.list<Setting>('setting',undefined,tx)).filter(setting=>!setting.projectId || setting.projectId===r.projectId)
+                settings: (await store.list<Setting>('setting',undefined,tx)).filter(setting=>!setting.projectId || setting.projectId===r.projectId),
+                runtimeProviders: await runtimeProviders([r.projectId]),
+                providerConnections: (await providerConnections([r.projectId])).filter(connection=>connection.projectIds.includes(r.projectId))
             };
         else if (b.action === "read_work") {
             const w = await store.get<Work>("work", String(b.input.workId), tx);
@@ -1198,6 +1346,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const {settingId,...change}=input;
                 const setting=await store.get<Setting>('setting',settingId,tx);
                 const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','allowMergePr','mergeMethod','requiredChecks','baseBranch','configuredBy','coverage','requirements','resource'];
+                if(setting?.kind==='provider')fail(403,'Master cannot change workspace provider connections');
                 if(setting?.kind==='connection'&&change.data&&protectedConnectionKeys.some(key=>Object.hasOwn(change.data!,key)))fail(403,'Master cannot change connection or delivery authorization policy');
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);
             } else {
@@ -1228,6 +1377,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             if (r!.status !== "interrupted")
                 fail(409, "Only interrupted runs require reconciliation");
             if (!r!.stoppedAt) fail(409,'Connector must verify the old process stopped before resuming');
+            if(r!.kind!=='delivery')await validateRunSelection(r!,tx);
             r!.status = "queued";
             r!.updatedAt = now();
             r!.stoppedAt = undefined;
@@ -1377,6 +1527,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             await grant(u, r!.projectId);
             if (r!.status !== "paused" || !r!.stoppedAt)
                 fail(409, "Paused execution must confirm stopped before resume");
+            if(r!.kind!=='delivery')await validateRunSelection(r!,tx);
             r!.status = "queued";
             r!.updatedAt = now();
             r!.stoppedAt = undefined;

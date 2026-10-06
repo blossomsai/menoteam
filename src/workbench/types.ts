@@ -22,6 +22,7 @@ export interface Work {
     status: 'queued' | 'in_progress' | 'paused' | 'done';
     revision: number;
     profileId: string;
+    connectionId?: string;
     sources: string[];
     createdAt: string;
     updatedAt: string;
@@ -45,6 +46,7 @@ export interface Run {
     allowedActions?: string[];
     sourceIds?: string[];
     execution?: ExecutionContext;
+    causedByRunId?: string;
     kind: 'master' | 'implementation' | 'review' | 'delivery';
     operation?: {
         action: 'create_draft_pr' | 'merge_pr';
@@ -90,6 +92,10 @@ export interface Run {
     updatedAt: string;
     error?: string;
 }
+export function isCausalMasterWake(run: Run): boolean {
+    return run.kind === 'master' && run.status === 'failed' && run.generation === 0 && !run.threadId &&
+        (Boolean(run.causedByRunId) || run.error?.startsWith('Master wake was not dispatched:') === true);
+}
 export interface Artifact {
     id: string;
     projectId: string;
@@ -120,6 +126,11 @@ export interface Setting {
 
 export interface ExecutionContext {
     profileId?: string;
+    profile?: {id:string;name:string;data:Record<string,unknown>};
+    connectionId?: string;
+    connectorId?: string;
+    model?: string;
+    legacy?: boolean;
     provider: 'openai';
     method: 'codex-host';
     skills: Array<{id:string;name:string;content:string}>;
@@ -130,6 +141,10 @@ export interface RuntimeProvider {
     method: 'codex-host';
     connectorId: string;
     available: boolean;
+    projectIds?: string[];
+    runKinds?: string[];
+    codexAppServer?: boolean;
+    localWorktrees?: boolean;
     models: string[];
     lastSeen: string;
     verifiedRunId?: string;

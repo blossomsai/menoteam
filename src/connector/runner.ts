@@ -5,6 +5,8 @@ import { CodexAppServer, readGitProcessIdentity, terminateVerifiedGitProcessGrou
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
 import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
+import { assertExecutionSelection } from './selection.js';
+import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
 import { createDraftPullRequest } from './github-draft-pr.js';
 import { captureRequiredLocalQa } from './local-qa.js';
 import { bindQaExecutor,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
@@ -210,12 +212,13 @@ export class ConnectorRunner {
       finally { monitoring = false; }
     };
     try {
+      assertExecutionSelection(claim.run,this.config.connectorId);
       timer = setInterval(()=>{if(!monitoring)monitorPromise=monitor();},this.config.leaseRenewIntervalMs ?? 10000);
       // Keep Master shell/filesystem access away from enrollment configuration, spool and bridge grants.
       let cwd = path.join(path.dirname(path.resolve(this.config.dataDir)),`menoteam-master-${stateKey(this.config.connectorId,claim.run.projectId)}`);
       await mkdir(cwd,{recursive:true,mode:0o700});
       let baseRevision = '';
-      if (claim.run.kind !== 'master') {
+      if (requiresLocalWorktree(claim.run.kind)) {
         if (!claim.run.workId) throw new Error('Worker run requires Work identity');
         const worktree = await ensureWorktree(this.config,claim.run.projectId,claim.run.workId);
         cwd = worktree.path; baseRevision = worktree.baseRevision;
@@ -240,6 +243,12 @@ export class ConnectorRunner {
       await this.save(spool);
       const before = claim.run.kind === 'review' ? await fingerprint(cwd) : '';
       stage='native-run';
+      // Read immediately before turn start: settings, grants and model discovery may
+      // have changed while the isolated Worktree/native process was prepared.
+      const authorized = await client.readRun(claim.run.id);
+      assertExecutionSelection(authorized,this.config.connectorId);
+      if(authorized.status!=='running'||authorized.generation!==claim.run.generation||JSON.stringify(authorized.execution)!==JSON.stringify(claim.run.execution)||authorized.model!==claim.run.model||authorized.threadId!==claim.run.threadId||authorized.reasoning!==claim.run.reasoning||authorized.projectId!==claim.run.projectId||authorized.workId!==claim.run.workId||authorized.kind!==claim.run.kind)
+        throw new Error('Frozen native execution authorization changed');
       const result = await native.run(claim,cwd,buildRunPrompt(claim),claim.run.threadId,event => {
         const entry:ConnectorEvent = {id:randomUUID(),...event,text:event.text.slice(0,60000)};
         eventWrites = eventWrites.then(async()=>{
@@ -267,7 +276,7 @@ export class ConnectorRunner {
         spool.qaInFlight=false;await this.save(spool);
         spool.artifacts.push({kind:'qa',revision,data:{...requiredQa,revision},requestId:`required-qa:${claim.run.id}:${claim.run.generation}`});
       }
-      if (claim.run.kind !== 'master') {
+      if (requiresLocalWorktree(claim.run.kind)) {
         const revision = diffRevision(await createDiff(cwd,baseRevision));
         const candidateFingerprint=await fingerprint(cwd);
         const reviewModified = claim.run.kind === 'review' && before !== candidateFingerprint;

@@ -10,7 +10,7 @@ import { ConnectorHttpError, type WorkbenchConnectorClient } from '../src/connec
 import { stateKey,writeSecureJson } from '../src/connector/state.js';
 import type { ClaimedRun,ConnectorConfig } from '../src/connector/types.js';
 function claim():ClaimedRun {
-  return {run:{id:'run-one',projectId:'project-one',requestedBy:'owner',kind:'master',prompt:'Plan work',model:'gpt-6.1-sol',reasoning:'medium',status:'running',generation:1,createdAt:'now',updatedAt:'now',threadId:'persistent-thread',execution:{provider:'openai',method:'codex-host',skills:[{id:'skill-one',name:'Evidence',content:'Verify first'}],tools:[]}},project:{id:'project-one',name:'Dogfood',instructions:'Stay scoped',repositoryUrl:'',deliveryAuthorization:'',createdAt:'now'},messages:[],settings:[]};
+  return {run:{id:'run-one',connectorId:'one',projectId:'project-one',requestedBy:'owner',kind:'master',prompt:'Plan work',model:'gpt-6.1-sol',reasoning:'medium',status:'running',generation:1,createdAt:'now',updatedAt:'now',threadId:'persistent-thread',execution:{provider:'openai',method:'codex-host',skills:[{id:'skill-one',name:'Evidence',content:'Verify first'}],tools:[]}},project:{id:'project-one',name:'Dogfood',instructions:'Stay scoped',repositoryUrl:'',deliveryAuthorization:'',createdAt:'now'},messages:[],settings:[]};
 }
 describe('Integrated connector lifecycle',()=>{
   it('resumes native thread, streams idempotent events, keeps only scoped bridge token, stops before completion',async()=>{
@@ -26,14 +26,76 @@ describe('Integrated connector lifecycle',()=>{
     runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
     try{await runner.run();expect(order.indexOf('complete')).toBeGreaterThan(order.indexOf('events'));expect(order.slice(0,order.indexOf('complete'))).toContain('stop');expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);expect(await readdir(path.join(dataDir,'bridge'))).toEqual([]);}finally{await rm(dataDir,{recursive:true,force:true});}
   });
-  it('acknowledges cancellation only after the native process has stopped',async()=>{
-    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-cancel-'));
-    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'unused',connectorId:'one',dataDir,projects:{},pollIntervalMs:1,leaseRenewIntervalMs:5};
-    let rejectTurn:((e:Error)=>void)|undefined;let stopped=false;let claimed=false;let runner:ConnectorRunner;let acknowledged=false;
-    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{stopped=true;rejectTurn?.(new Error('stopped'));},run:async(_c:unknown,_cwd:string,_prompt:string,_thread:string,onEvent:Function)=>{stopped=false;onEvent({type:'agent_message',text:'Pending evidence',threadId:'persistent-thread'});return new Promise((_resolve,reject)=>{rejectTurn=reject;});}} as unknown as CodexAppServer;
-    const client={claim:async()=>{if(claimed){await runner.stop();return undefined;}claimed=true;return claim();},createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),appendEvents:async()=>{throw new Error('Lease paused; events denied');},readRun:async()=>({...claim().run,status:'paused'}),stopped:async()=>{expect(stopped).toBe(true);acknowledged=true;},complete:async()=>{throw new Error('Cancelled turn must not complete');}} as unknown as WorkbenchConnectorClient;
+  it('cleans up a pre-turn pause without inventing unsent evidence',async()=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-cancel-before-turn-'));
+    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'unused',connectorId:'one',dataDir,projects:{},pollIntervalMs:1,leaseRenewIntervalMs:60_000};
+    let nativeRunCalls=0;let stopped=false;let claimed=false;let runner:ConnectorRunner;let acknowledged=false;
+    let resolveAcknowledged!:()=>void;const ack=new Promise<void>(resolve=>{resolveAcknowledged=resolve;});
+    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>{stopped=false;return{pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'};},stop:async()=>{stopped=true;},run:async()=>{nativeRunCalls++;throw new Error('A paused run must not enter the native turn');}} as unknown as CodexAppServer;
+    const client={claim:async()=>{if(!claimed){claimed=true;return claim();}await ack;await runner.stop();return undefined;},createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>({...claim().run,status:'paused'}),stopped:async()=>{expect(stopped).toBe(true);acknowledged=true;resolveAcknowledged();},complete:async()=>{throw new Error('Cancelled turn must not complete');}} as unknown as WorkbenchConnectorClient;
     runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
-    try{await runner.run();expect(acknowledged).toBe(true);expect(await readdir(path.join(dataDir,'unsent-evidence'))).toHaveLength(1);}finally{await rm(dataDir,{recursive:true,force:true});}
+    try{
+      await runner.run();
+      expect(nativeRunCalls).toBe(0);
+      expect(acknowledged).toBe(true);
+      expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);
+      await expect(readdir(path.join(dataDir,'unsent-evidence'))).rejects.toMatchObject({code:'ENOENT'});
+    }finally{await rm(dataDir,{recursive:true,force:true});}
+  });
+  it('persists and retains the original event when cancellation follows native turn start',async()=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-cancel-after-event-'));
+    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'unused',connectorId:'one',dataDir,projects:{},pollIntervalMs:1,leaseRenewIntervalMs:5};
+    const bounded=<T>(promise:Promise<T>)=>{let timer:ReturnType<typeof setTimeout>;return Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Timed out waiting for deterministic cancellation barrier')),2_000);})]).finally(()=>clearTimeout(timer));};
+    let remoteStatus:'running'|'paused'='running';let rejectTurn:((e:Error)=>void)|undefined;let runEnteredResolve!:()=>void;const runEntered=new Promise<void>(resolve=>{runEnteredResolve=resolve;});
+    let appendAttemptResolve!:(events:unknown[])=>void;const appendAttempt=new Promise<unknown[]>(resolve=>{appendAttemptResolve=resolve;});
+    let releaseAppend!:()=>void;let rejectAppend!:(error:Error)=>void;const appendResponse=new Promise<void>((resolve,reject)=>{releaseAppend=resolve;rejectAppend=reject;});
+    let pausedObservedResolve!:()=>void;const pausedObserved=new Promise<void>(resolve=>{pausedObservedResolve=resolve;});
+    let acknowledgeResolve!:()=>void;const acknowledgement=new Promise<void>(resolve=>{acknowledgeResolve=resolve;});
+    const order:string[]=[];let nativeRunEntered=false;let processStopped=false;let claimed=false;let runner:ConnectorRunner;let acknowledged=false;
+    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{if(nativeRunEntered&&!processStopped){processStopped=true;order.push('process-stop');rejectTurn?.(new Error('stopped'));}},run:async(_c:unknown,_cwd:string,_prompt:string,_thread:string,onEvent:Function)=>{nativeRunEntered=true;processStopped=false;order.push('native-run-entered');runEnteredResolve();onEvent({type:'agent_message',text:'Pending evidence',threadId:'persistent-thread'});return new Promise((_resolve,reject)=>{rejectTurn=reject;});}} as unknown as CodexAppServer;
+    const client={
+      claim:async()=>{if(!claimed){claimed=true;return claim();}await acknowledgement;await runner.stop();return undefined;},
+      createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),
+      appendEvents:async(_id:string,_generation:number,events:unknown[])=>{appendAttemptResolve(events);await appendResponse;},
+      readRun:async()=>{if(nativeRunEntered&&remoteStatus==='paused')pausedObservedResolve();return{...claim().run,status:remoteStatus};},
+      stopped:async()=>{expect(processStopped).toBe(true);order.push('cancellation-ack');acknowledged=true;acknowledgeResolve();},
+      complete:async()=>{throw new Error('Cancelled turn must not complete');}
+    } as unknown as WorkbenchConnectorClient;
+    runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    const execution=runner.run();
+    try{
+      await bounded(runEntered);
+      const [event]=await bounded(appendAttempt);
+      expect(nativeRunEntered).toBe(true);
+      const spoolFile=path.join(dataDir,'spool',`${stateKey('run-one','1')}.json`);
+      const durableSpool=JSON.parse(await readFile(spoolFile,'utf8')) as {events:Array<{id:string;text:string;threadId:string}>};
+      expect(durableSpool.events).toHaveLength(1);
+      expect([event]).toEqual(durableSpool.events);
+      const original=durableSpool.events[0]!;
+      expect(original.id).toMatch(/^[\da-f-]{36}$/i);
+      expect(original.text).toBe('Pending evidence');
+      expect(original.threadId).toBe('persistent-thread');
+
+      remoteStatus='paused';
+      rejectAppend(new Error('Lease paused; events denied'));
+      await bounded(pausedObserved);
+      await bounded(acknowledgement);
+      await bounded(execution);
+
+      expect(acknowledged).toBe(true);
+      expect(order.indexOf('native-run-entered')).toBeLessThan(order.indexOf('process-stop'));
+      expect(order.indexOf('process-stop')).toBeLessThan(order.indexOf('cancellation-ack'));
+      const retainedFiles=await readdir(path.join(dataDir,'unsent-evidence'));
+      expect(retainedFiles).toHaveLength(1);
+      const retained=JSON.parse(await readFile(path.join(dataDir,'unsent-evidence',retainedFiles[0]!), 'utf8')) as {events:Array<{id:string;text:string;threadId:string}>};
+      expect(retained.events).toEqual([original]);
+    }finally{
+      remoteStatus='paused';
+      releaseAppend();
+      await runner.stop();
+      await bounded(execution).catch(()=>undefined);
+      await rm(dataDir,{recursive:true,force:true});
+    }
   });
   it('preserves unsent events and artifacts when cloud is terminal after a lost response',async()=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-loss-'));

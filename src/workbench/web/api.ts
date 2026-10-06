@@ -9,7 +9,22 @@ export interface Snapshot {
   artifacts: Artifact[];
   settings: Setting[];
   runtimeProviders: RuntimeProvider[];
+  providerConnections?: ProviderConnection[];
   projectRoles?: Record<string, Member['role']>;
+}
+
+export interface ProviderConnection {
+  id: string;
+  name: string;
+  connectorId?: string;
+  enabled: boolean;
+  default: boolean;
+  status: 'disabled' | 'unbound' | 'disconnected' | 'offline' | 'capability_unavailable' | 'available' | string;
+  models: string[];
+  projectIds: string[];
+  runKinds?: string[];
+  localWorktrees?: boolean;
+  reason?: string;
 }
 
 export class ApiError extends Error {
@@ -52,8 +67,8 @@ export const workbenchApi = {
   revokeInvite: (inviteId: string) => request<{ revoked: true }>(`/invites/${encodeURIComponent(inviteId)}`, { method: 'DELETE' }),
   createProject: (input: { name: string; repositoryUrl?: string }) => request<Project>('/projects', { method: 'POST', body: JSON.stringify(input) }),
   updateProject: (id: string, input: { instructions?: string; expectedInstructions?: string; deliveryAuthorization?: string; feedbackIntake?: { enabled: boolean; allowExecution: boolean } }) => request<Project>(`/projects/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
-  createWork: (projectId: string, input: { title: string; overview: string }) => request<Work>(`/projects/${encodeURIComponent(projectId)}/works`, { method: 'POST', body: JSON.stringify(input) }),
-  sendMessage: (projectId: string, input: { text: string; workId?: string; requestId: string }) => request<{ message: Message; run: Run }>(`/projects/${encodeURIComponent(projectId)}/messages`, { method: 'POST', body: JSON.stringify(input) }),
+  createWork: (projectId: string, input: { title: string; overview: string; connectionId: string; profileId?: string }) => request<Work>(`/projects/${encodeURIComponent(projectId)}/works`, { method: 'POST', body: JSON.stringify(input) }),
+  sendMessage: (projectId: string, input: { text: string; workId?: string; connectionId?: string; requestId: string }) => request<{ message: Message; run: Run }>(`/projects/${encodeURIComponent(projectId)}/messages`, { method: 'POST', body: JSON.stringify(input) }),
   updateWork: (workId: string, input: { revision: number; overview?: string; status?: Work['status'] }) => request<Work>(`/works/${encodeURIComponent(workId)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   requestDraftPr: (workId: string, input: { candidateRunId: string; candidateRevision: string; action: 'create_draft_pr'; requestId: string }) => request<{ run: Run; operationId: string }>(`/works/${encodeURIComponent(workId)}/delivery`, { method: 'POST', body: JSON.stringify(input) }),
   requestMergePr: (workId: string, input: { priorDeliveryRunId: string; reviewRunId: string; requestId: string }) => request<{ run: Run; operationId: string }>(`/works/${encodeURIComponent(workId)}/merge`, { method: 'POST', body: JSON.stringify(input) }),

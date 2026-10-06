@@ -68,7 +68,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         headers: {
             cookie
         },
-        payload: payload as never
+        payload: connectorFixturePayload(path,payload) as never
     });
     const conn = (method: "GET" | "POST", path: string, payload?: unknown) => app.inject({
         method,
@@ -77,8 +77,29 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         headers: {
             authorization: `Bearer ${connectorToken}`
         },
-        payload: payload as never
+        payload: connectorFixturePayload(path,payload) as never
     });
+    const fixtureCapabilities={codexAppServer:true,localWorktrees:true,models:['gpt-6-luna','gpt-6.1-sol']};
+    const connectorFixturePayload=(path:string,payload:unknown)=>path==='/claim'?{
+        ...(payload as Record<string,unknown>??{}),
+        capabilities:{...fixtureCapabilities,...((payload as {capabilities?:Record<string,unknown>}|undefined)?.capabilities??{})}
+    }:payload;
+    const fixtureConnections=new Map<string,string>();
+    // Enroll, discover and bind through actual HTTP before a scenario requests execution.
+    // Scope is exactly the scenario's project(s); this never adds grants to another fixture.
+    async function enrollProvider(connectorId:string,projectIds:string[]){
+        const enrolled=checkedJson(await user('POST','/connectors',{id:connectorId,projectIds}));
+        const discovery=await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,runKinds:[]}}});
+        expect(discovery.statusCode).toBe(204);
+        const connection=checkedJson(await user('POST','/settings',{kind:'provider',name:`Fixture ${connectorId}`,data:{provider:'openai',method:'codex-host',connectorId,enabled:true,default:true}}));
+        fixtureConnections.set(connectorId,connection.id);
+        return enrolled;
+    }
+    async function selectExistingProvider(connectorId:string,bearer:string){
+        const discovered=await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${bearer}`},payload:{capabilities:{...fixtureCapabilities,runKinds:[]}}});
+        expect(discovered.statusCode).toBe(204);
+        checkedJson(await user('PATCH',`/settings/${fixtureConnections.get(connectorId)!}`,{data:{default:true}}));
+    }
     it("persists project and conversation, idempotent submission and scoped login", async () => {
         expect((await app.inject("/api/workbench/snapshot")).statusCode).toBe(401);
         const p = await user("POST", "/projects", {
@@ -86,6 +107,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             instructions: "Build from evidence"
         });
         projectId = p.json().id;
+        connectorToken=(await enrollProvider('test-connector',[projectId])).token;
         const b = {
             text: "Plan a real feature",
             requestId: "request-001"
@@ -121,11 +143,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(persisted).not.toBe(rejected);
     });
     it("claims once, fences stale events, deduplicates, records artifacts and completes", async () => {
-        const c = await user("POST", "/connectors", {
-            id: "test-connector",
-            projectIds: [projectId]
-        });
-        connectorToken = c.json().token;
+        await selectExistingProvider('test-connector',connectorToken);
         const claim = await conn("POST", "/claim", {});
         expect(claim.statusCode).toBe(200);
         const run = claim.json().run;
@@ -147,7 +165,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await conn("POST", `/runs/${run.id}/events`, events);
         expect((await user("GET", "/snapshot")).json().messages).toHaveLength(2);
         const bridge=(await conn('POST',`/runs/${run.id}/bridge-token`,{generation:run.generation})).json().token;
-        const bridgeCall=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${bridge}`},payload:payload as never});
+        const bridgeCall=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${bridge}`},payload:connectorFixturePayload(path,payload) as never});
         expect((await bridgeCall(`/runs/${run.id}/tools`,{generation:run.generation,action:'read_context',input:{},requestId:'bridge-read'})).statusCode).toBe(200);
         expect((await bridgeCall('/claim',{})).statusCode).toBe(401);
         expect((await bridgeCall(`/runs/${run.id}/renew`,{generation:run.generation})).statusCode).toBe(401);
@@ -217,7 +235,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             headers: {
                 cookie: memberCookie
             },
-            payload: payload as never
+            payload: connectorFixturePayload(path,payload) as never
         });
         expect((await memberReq("PATCH", `/projects/${projectId}`, {
             instructions: "escalate"
@@ -289,10 +307,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const p = (await user("POST", "/projects", {
             name: "Contention"
         })).json();
-        const raw = (await user("POST", "/connectors", {
-            id: "concurrent",
-            projectIds: [p.id]
-        })).json().token;
+        const raw = (await enrollProvider('concurrent',[p.id])).token;
         await user("POST", `/projects/${p.id}/messages`, {
             text: "First run",
             requestId: "concurrency-1"
@@ -303,7 +318,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             headers: {
                 authorization: `Bearer ${raw}`
             },
-            payload: payload as never
+            payload: connectorFixturePayload(path,payload) as never
         });
         const results = await Promise.all([send("POST", "/claim", {}), send("POST", "/claim", {})]);
         expect(results.map(r => r.statusCode).sort()).toEqual([200, 204]);
@@ -333,17 +348,14 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const p = (await user("POST", "/projects", {
             name: "Cancellation"
         })).json();
-        const t = (await user("POST", "/connectors", {
-            id: "cancel-connector",
-            projectIds: [p.id]
-        })).json().token;
+        const t = (await enrollProvider('cancel-connector',[p.id])).token;
         const send = (path: string, payload: unknown) => app.inject({
             method: "POST",
             url: "/api/workbench/connector" + path,
             headers: {
                 authorization: `Bearer ${t}`
             },
-            payload: payload as never
+            payload: connectorFixturePayload(path,payload) as never
         });
         const work = (await user("POST", `/projects/${p.id}/works`, {
             title: "Shared writer"
@@ -444,10 +456,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(snap.runs.filter((r: {
             projectId: string;
         }) => r.projectId === p.id)).toHaveLength(0);
+        const sourceToken=(await enrollProvider('source-triage',[p.id])).token;
         expect((await user('PATCH',`/projects/${p.id}`,{feedbackIntake:{enabled:true,allowExecution:false}})).statusCode).toBe(200);
         await app.inject({...gh,headers:{...gh.headers,'x-github-delivery':'delivery-triage'}});
-        const sourceToken=(await user('POST','/connectors',{id:'source-triage',projectIds:[p.id]})).json().token;
-        const scoped=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${sourceToken}`},payload:payload as never});
+        const scoped=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${sourceToken}`},payload:connectorFixturePayload(path,payload) as never});
         const run=(await scoped('/claim',{})).json().run;expect(run.kind).toBe('master');expect(run.allowedActions).not.toContain('dispatch');
         expect((await scoped(`/runs/${run.id}/tools`,{generation:run.generation,action:'dispatch',input:{workId:'none',prompt:'Execute source',kind:'implementation',model:'gpt-6-luna'},requestId:'source-deny'})).statusCode).toBe(403);
         expect((await scoped(`/runs/${run.id}/tools`,{generation:run.generation,action:'update_settings',input:{instructions:'Escalate'},requestId:'source-settings-deny'})).statusCode).toBe(403);
@@ -455,6 +467,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await scoped(`/runs/${run.id}/renew`,{generation:run.generation})).statusCode).toBe(403);
     });
     it("binds effective profile skills and derives runtime evidence independently of provider metadata", async () => {
+        await selectExistingProvider('test-connector',connectorToken);
         const skill = (await user('POST','/settings',{kind:'skill',name:'Evidence',data:{content:'Record proof before claiming success'}})).json();
         const profile = (await user('POST','/settings',{kind:'profile',name:'Sol reviewer',data:{model:'gpt-6.1-sol',reasoning:'high',skillIds:[skill.id],tools:[]}})).json();
         const work = (await user('POST',`/projects/${projectId}/works`,{title:'Effective settings',profileId:profile.id})).json();
@@ -465,8 +478,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await user('PATCH',`/settings/${skill.id}`,{data:{content:'Updated later'}});
         const stored = await sql`SELECT data FROM wb_records WHERE id=${submitted.run.id}`;
         expect(stored[0]!.data.execution.skills[0].content).toBe('Record proof before claiming success');
-        const provider = (await user('POST','/settings',{kind:'provider',name:'Saved only',data:{provider:'openai',method:'codex-host'}})).json();
-        expect(provider.id).toBeTruthy();
+        const unbound = await user('POST','/settings',{kind:'provider',name:'Saved only',data:{provider:'openai',method:'codex-host'}});
+        expect(unbound.statusCode).toBe(400);
+        const provider = (await user('GET','/snapshot')).json().settings.find((setting:any)=>setting.id===fixtureConnections.get('test-connector'));
+        expect(provider.data.connectorId).toBe('test-connector');
         const runtime = (await user('GET','/snapshot')).json().runtimeProviders;
         expect(runtime.every((r:{connectorId:string}) => r.connectorId !== provider.id)).toBe(true);
         expect(runtime.some((r:{verifiedRunId?:string}) => !!r.verifiedRunId)).toBe(true);
@@ -520,9 +535,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('requires connector stop proof before browser reconciliation',async()=>{
         const p=(await user('POST','/projects',{name:'Recovery proof'})).json();
+        const credential=(await enrollProvider('recovery-connector',[p.id])).token;
         await user('POST',`/projects/${p.id}/messages`,{text:'Recover safely',requestId:'recovery-run'});
-        const credential=(await user('POST','/connectors',{id:'recovery-connector',projectIds:[p.id]})).json().token;
-        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:connectorFixturePayload(path,payload) as never});
         const r=(await send('/claim',{})).json().run;
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"') WHERE id=${r.id}`;
         expect((await user('POST',`/runs/${r.id}/reconcile`,{stopped:true})).statusCode).toBe(409);
@@ -534,12 +549,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('Master and UI share scoped optimistic settings updates with original actor authority',async()=>{
         const p=(await user('POST','/projects',{name:'Settings operations'})).json();
+        const credential=(await enrollProvider('settings-connector',[p.id])).token;
         const skill=(await user('POST','/settings',{projectId:p.id,kind:'skill',name:'Original',data:{content:'Original instructions'}})).json();
         const outside=(await user('POST','/settings',{projectId,kind:'skill',name:'Outside project',data:{content:'Protected'}})).json();
         const profile=(await user('POST','/settings',{kind:'profile',name:'Workspace profile',data:{model:'gpt-6-luna',reasoning:'medium',skillIds:[]}})).json();
         await user('POST',`/projects/${p.id}/messages`,{text:'Update the project skill',requestId:'settings-owner-master'});
-        const credential=(await user('POST','/connectors',{id:'settings-connector',projectIds:[p.id]})).json().token;
-        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:connectorFixturePayload(path,payload) as never});
         const run=(await send('/claim',{})).json().run;
         const tool=(r:any,input:unknown,requestId:string)=>send(`/runs/${r.id}/tools`,{generation:r.generation,action:'update_settings',input,requestId});
         const masterInstructions=await tool(run,{instructions:'Master version',expectedInstructions:p.instructions},'master-instructions-first');
@@ -566,10 +581,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('reflects active Work progress and kind-filtered capacity without treating a turn as done',async()=>{
         const p=(await user('POST','/projects',{name:'Work activity proof'})).json();
+        const credential=(await enrollProvider('activity-connector',[p.id])).token;
         const work=(await user('POST',`/projects/${p.id}/works`,{title:'Current progress'})).json();
         await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Implement one step',requestId:'activity-implementation'});
-        const credential=(await user('POST','/connectors',{id:'activity-connector',projectIds:[p.id]})).json().token;
-        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:connectorFixturePayload(path,payload) as never});
         expect((await send('/claim',{capabilities:{runKinds:['master']}})).statusCode).toBe(204);
         const run=(await send('/claim',{capabilities:{runKinds:['implementation','review']}})).json().run;
         expect((await user('GET',`/works/${work.id}`)).json().work.status).toBe('in_progress');
@@ -586,9 +601,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('strictly queues one authorized delivery Run for the exact candidate and fences retry generations',async()=>{
         const p=checkedJson((await user('POST','/projects',{name:'Draft PR idempotency',repositoryUrl:'https://github.com/example/draft-pr'}))) as Project;
+        const connector=await enrollProvider('draft-pr-connector',[p.id]);
         const work=checkedJson((await user('POST',`/projects/${p.id}/works`,{title:'Create a bounded draft'}))) as Work;
-        const connector=checkedJson((await user('POST','/connectors',{id:'draft-pr-connector',projectIds:[p.id]})));
-        const connRequest=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${connector.token}`},payload:payload as never});
+        const connRequest=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${connector.token}`},payload:connectorFixturePayload(path,payload) as never});
         expect((await connRequest('/claim',{capabilities:{git:true,githubWrite:true,deliveryActions:['create_draft_pr']}})).statusCode).toBe(204);
         const connection=await user('POST','/settings',{projectId:p.id,kind:'connection',name:'Draft PR delivery',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',baseBranch:'main',allowDraftPr:true}});
         expect(connection.statusCode).toBe(200);
@@ -597,7 +612,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const invite=checkedJson((await user('POST','/invites',{email:'draft-pr-member@test.example',projectId:p.id,role:'member'})));
         const accepted=await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invite.token,name:'Draft PR member',password:'draft-pr-password'}});
         checkedJson(accepted);const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:'draft-pr-member@test.example',password:'draft-pr-password'}});checkedJson(login);const memberCookie=String(login.headers['set-cookie']).split(';')[0]!;
-        const memberReq=(method:'GET'|'POST'|'PATCH',path:string,payload?:unknown)=>app.inject({method,url:'/api/workbench'+path,headers:{cookie:memberCookie},payload:payload as never});
+        const memberReq=(method:'GET'|'POST'|'PATCH',path:string,payload?:unknown)=>app.inject({method,url:'/api/workbench'+path,headers:{cookie:memberCookie},payload:connectorFixturePayload(path,payload) as never});
         const member=checkedJson((await memberReq('GET','/me')));const candidateId=crypto.randomUUID();const commitSha='a'.repeat(40);const baseRevision='b'.repeat(40);const revision=createHash('sha256').update(baseRevision).update('\0').update(commitSha).digest('hex');const fingerprint='c'.repeat(64);
         const candidate:Run={id:candidateId,projectId:p.id,workId:work.id,prompt:'Implement bounded change',requestedBy:member.id,kind:'implementation',model:'gpt-6-luna',reasoning:'medium',status:'completed',connectorId:'draft-pr-connector',generation:1,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
         const diff:Artifact={id:`artifact:${candidateId}:diff`,projectId:p.id,workId:work.id,runId:candidateId,kind:'diff',revision,data:{source:'git',candidateRevision:commitSha,baseRevision,files:[{path:'src/example.ts'}]},createdAt:new Date().toISOString()};
@@ -610,7 +625,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const masterTool=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'request_delivery',input:{workId:work.id,candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'delivery-from-master'},requestId:'master-tool-delivery'} as never});
         expect(masterTool.statusCode).toBe(200);
         expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'request_delivery',input:{workId:work.id,candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'delivery-from-master',targetId:'forbidden'},requestId:'master-tool-extra'} as never})).statusCode).toBe(400);
-        const other=checkedJson((await user('POST','/projects',{name:'Other candidate scope'}))) as Project;const otherWork=checkedJson((await user('POST',`/projects/${other.id}/works`,{title:'Other project candidate'}))) as Work;
+        const other=checkedJson((await user('POST','/projects',{name:'Other candidate scope'}))) as Project;await enrollProvider('other-candidate-connector',[other.id]);const otherWork=checkedJson((await user('POST',`/projects/${other.id}/works`,{title:'Other project candidate'}))) as Work;
         const crossMaster=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${master.id}/tools`,headers:{authorization:`Bearer ${bridge}`},payload:{generation:master.generation,action:'request_delivery',input:{workId:otherWork.id,candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'master-cross-project'},requestId:'master-cross-project'} as never});expect(crossMaster.statusCode).toBe(403);
         await connRequest(`/runs/${master.id}/complete`,{generation:master.generation,threadId:'draft-pr-master-thread'});
         const request=(requestId:string,input:Record<string,unknown>={candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId})=>memberReq('POST',`/works/${work.id}/delivery`,input);
@@ -700,10 +715,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('reviewer bridge reads exact candidate evidence and denies wider reads or mutations',async()=>{
         const p=(await user('POST','/projects',{name:'Scoped review proof'})).json();
+        const credential=(await enrollProvider('review-bridge-connector',[p.id])).token;
         const work=(await user('POST',`/projects/${p.id}/works`,{title:'Review candidate'})).json();
         const other=(await user('POST',`/projects/${p.id}/works`,{title:'Private other Work'})).json();
-        const credential=(await user('POST','/connectors',{id:'review-bridge-connector',projectIds:[p.id]})).json().token;
-        const send=(path:string,payload:unknown,bearer=credential)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${bearer}`},payload:payload as never});
+        const send=(path:string,payload:unknown,bearer=credential)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${bearer}`},payload:connectorFixturePayload(path,payload) as never});
         await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Implement candidate',requestId:'review-bridge-implementation'});
         const candidate=(await send('/claim',{})).json().run;
         const diff=await send(`/runs/${candidate.id}/artifacts`,{generation:candidate.generation,kind:'diff',revision:'exact-candidate-revision',data:{files:[{path:'src/example.ts',added:1,removed:0,lines:['+ actual evidence']}],candidateFingerprint:'candidate-bytes',candidateRevision:'a'.repeat(40)},requestId:'candidate-diff'});
@@ -906,10 +921,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
  });
     it('Master partial Work updates preserve omitted overview/status and allow explicit clearing',async()=>{
         const p=checkedJson((await user('POST','/projects',{name:'Partial Work update proof'})));
+        const credential=(await enrollProvider('partial-work-connector',[p.id])).token;
         const work=checkedJson((await user('POST',`/projects/${p.id}/works`,{title:'Preserve definition',overview:'Original task definition',sources:['source:original']})));
         await user('POST',`/projects/${p.id}/messages`,{text:'Update only current progress',requestId:'partial-work-master'});
-        const credential=checkedJson((await user('POST','/connectors',{id:'partial-work-connector',projectIds:[p.id]}))).token;
-        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:payload as never});
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:connectorFixturePayload(path,payload) as never});
         const run=checkedJson((await send('/claim',{}))).run;
         const tool=(input:unknown)=>send(`/runs/${run.id}/tools`,{generation:run.generation,action:'update_work',input,requestId:crypto.randomUUID()});
         const progress=await tool({workId:work.id,revision:work.revision,status:'in_progress'});
@@ -954,6 +969,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const persisted=(await user('GET','/snapshot')).json().settings.find((setting:any)=>setting.id===profile.id);
         expect(persisted.data.skillIds).toEqual([global.id]);
         for(const project of [a,b]) {
+            await enrollProvider(`shared-profile-${project.id}`,[project.id]);
             const work=(await user('POST',`/projects/${project.id}/works`,{title:'Use the shared profile',profileId:profile.id})).json();
             const dispatched=await user('POST',`/projects/${project.id}/messages`,{workId:work.id,text:'Use reusable instructions',requestId:`shared-profile-${project.id}`});
             expect(dispatched.statusCode).toBe(200);

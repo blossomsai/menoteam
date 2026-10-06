@@ -4,6 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { WorkbenchConnectorClient } from './client.js';
+import { createWorkSchema } from './mcp-schemas.js';
 
 const contextFile = process.env.MENOTEAM_RUN_CONTEXT_FILE ?? '';
 if (!contextFile) throw new Error('Run context file is missing');
@@ -32,7 +33,7 @@ tool('read_context', 'Read this project, its Works, conversation, runs, and arti
 tool('read_work', 'Read one Work, its conversation, and artifacts.', z.object({ workId }), 'read_work');
 tool('read_run', 'Read a run, its events, and artifacts.', z.object({ runId: workId }), 'read_run');
 tool('submit_review_result', 'Submit the structured disposition and findings for this assigned candidate review.', z.object({ disposition: z.enum(['approved','changes_requested','insufficient_evidence']), findings: z.array(z.object({ id: z.string().min(1).max(120), blocking: z.boolean(), summary: z.string().min(1).max(2000) }).strict()).max(100), evidenceArtifactIds: z.array(workId).max(100) }).strict(), 'submit_review_result');
-tool('create_work', 'Create a Work in this project.', z.object({ title: text, overview: z.string().max(32_000).optional(), profileId: z.string().max(200).optional(), sources: z.array(z.string().max(2000)).max(100).optional() }).strict(), 'create_work');
+tool('create_work', 'Create a Work in this project.', createWorkSchema, 'create_work');
 tool('update_work', 'Update a Work overview or status using its current revision.', z.object({ workId, revision: z.number().int().min(1), overview: z.string().max(32_000).optional(), status: z.enum(['queued','in_progress','paused','done']).optional() }).strict(), 'update_work');
 tool('dispatch', 'Assign an implementation or review run for a Work.', z.object({ workId, prompt: z.string().min(1).max(12_000), kind: z.enum(['implementation','review']), model: z.enum(['gpt-6-luna','gpt-6.1-sol']), reasoning: z.enum(['low','medium','high','xhigh']).default('medium') }).strict(), 'dispatch');
 tool('request_delivery', 'Queue a draft pull request for an exact completed implementation candidate.', z.object({ workId, candidateRunId: workId, candidateRevision: z.string().min(1).max(200), action: z.literal('create_draft_pr'), requestId: z.string().min(1).max(200) }).strict(), 'request_delivery');
