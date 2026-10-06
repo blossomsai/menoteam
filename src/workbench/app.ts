@@ -1354,7 +1354,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             result = {
                 work: w,
                 messages: (await store.messages(r.projectId, w!.id, undefined, undefined, tx)).messages,
-                artifacts: (await store.artifactMetadata([r.projectId],tx,w!.id)).filter(a => a.workId === w!.id)
+                artifacts: (await store.artifactMetadata([r.projectId],tx,w!.id)).filter(a => a.workId === w!.id),
+                ...(r.kind === 'review' && r.workId === w!.id && r.reviewBinding
+                    ? { reviewAssignment: { reviewerRunId: r.id, reviewBinding: r.reviewBinding } }
+                    : {})
             };
         }
         else if (b.action === "read_run") {
