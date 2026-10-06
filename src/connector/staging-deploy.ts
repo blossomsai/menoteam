@@ -141,7 +141,7 @@ export async function sshTransport(target: StagingDeploymentTarget, request: Sta
       if (timer) clearTimeout(timer);
       if (processStopped) {
         stopConfirmed = true;
-        if (startTask && !trackingStarted) void startTask.then(acknowledgeStopped).catch(() => {});
+        if (startTask && !trackingStarted) void startTask.then(acknowledgeStopped, acknowledgeStopped).catch(() => {});
       }
       if (processStopped && trackingStarted) {
         try { await acknowledgeStopped(); }
@@ -171,7 +171,7 @@ export async function sshTransport(target: StagingDeploymentTarget, request: Sta
         identity = await runtime.readProcessIdentity(child.pid);
         if (!identity || identity.processGroupId !== child.pid) throw new Error('SSH process identity could not be verified');
         if (settled || childClosed) { await stopAndFinish('Staging SSH process exited before the request was sent; remote outcome remains unknown'); return; }
-        startTask = Promise.resolve(tracking?.started(identity)).then(() => { trackingStarted = true; });
+        startTask = (async () => { try { await tracking?.started(identity); } finally { trackingStarted = true; } })();
         await startTask;
         if (settled || childClosed) { await stopAndFinish('Staging SSH process exited before the request was sent; remote outcome remains unknown'); return; }
         child.stdin.end(`${JSON.stringify(request)}\n`);

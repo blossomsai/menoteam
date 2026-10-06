@@ -196,4 +196,14 @@ describe('fixed staging deployment adapter', () => {
       await expect(transport).rejects.toThrow(/receipt exceeded.*unknown/u);
     } finally { child.dispose(); }
   });
+
+  it('acknowledges local group stop when start tracking rejects its closing fence',async()=>{
+    const child=new FakeSshChild();let stopped=0;
+    try{
+      const transport=sshTransport(target,{...request,action:'status'},{started:async()=>{throw new Error('closing fence');},stopped:async()=>{stopped++;}},fakeSshRuntime(child));
+      await expect(transport).rejects.toThrow(/closing fence/u);
+      expect(child.stdin.writableEnded).toBe(false);expect(stopped).toBe(1);
+    }finally{child.dispose();}
+  });
+
 });

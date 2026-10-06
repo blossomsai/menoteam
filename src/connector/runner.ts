@@ -138,6 +138,9 @@ export class ConnectorRunner {
     }
     if (spool.stopped) {
       await client.stopped(spool.runId,spool.generation,spool.threadId);
+      // A local SSH stop does not resolve the remote operation. Keep the immutable
+      // intent in the active spool so the next Connector can reconcile it by status.
+      if(spool.stagingIntent){spool.stopped=false;await this.save(spool);return;}
       await this.retainOrRemove(spool);
       return;
     }
@@ -159,15 +162,17 @@ export class ConnectorRunner {
   private async reconcileStaging(spool:Spool):Promise<void>{
     const client=this.client!,intent=spool.stagingIntent,targetId=intent?.targetId,target=targetId?this.config.deploymentTargets?.[targetId]:undefined;
     if(!intent||!targetId||!target)throw new Error('Saved staging target configuration is unavailable; reservation retained');
-    const authorize=async()=>{const grant=await client.authorizeStagingEffect(spool.runId,spool.generation,'status');if(grant.action!=='status')throw new Error('Staging status authorization changed');};
+    if(this.closing)throw new Error('Connector is closing; staging status remains reserved');
+    const executionId=randomUUID();
+    spool.deliveryExecutor={pid:process.pid,executionId,stage:'staging'};activeDeliveryExecutors.add(executionId);
+    const authorize=async()=>{if(this.closing)throw new Error('Connector is closing; staging status remains reserved');const grant=await client.authorizeStagingEffect(spool.runId,spool.generation,'status');if(grant.action!=='status')throw new Error('Staging status authorization changed');};
     const {previousDeploymentId:_previousDeploymentId,...statusIntent}=intent;
-    const receipt=await runStagingOperation(targetId,target,{...statusIntent,action:'status',operationId:spool.runId},
-      {starting:async()=>{spool.stagingTransportStarted=true;spool.stagingTransportStopped=false;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);},
-       started:async identity=>{spool.stagingProcessIdentity=identity;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);},
-       stopped:async()=>{spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);}},
-      this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,authorize,this.dependencies?.staging?.targetValidator);
-    spool.stagingReceipt=receipt;spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging status did not confirm a verified deployment; target reservation remains held'};
-    await this.save(spool);await this.flush(spool);
+    try{
+      await this.save(spool);
+      const receipt=await this.runStagingLifecycle(spool,targetId,target,{...statusIntent,action:'status',operationId:spool.runId},authorize);
+      spool.stagingReceipt=receipt;spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging status did not confirm a verified deployment; target reservation remains held'};
+      spool.deliveryExecutor.stage='completion';await this.save(spool);await this.flush(spool);
+    }finally{activeDeliveryExecutors.delete(executionId);}
   }
   private async recover():Promise<void> {
     const directory = path.join(this.config.dataDir,'spool');
@@ -186,11 +191,14 @@ export class ConnectorRunner {
         if(executor.pid===process.pid){if(activeDeliveryExecutors.has(executor.executionId))continue;executorStopped=true;}
         else{try{process.kill(executor.pid,0);continue;}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')executorStopped=true;else continue;}}
         if(!executorStopped)continue;
+        const remote=await this.client!.readRun(spool.runId);
+        if(remote.generation!==spool.generation)continue;
         if(spool.stagingProcessIdentity){
           const gone=await waitProcessGroup(spool.stagingProcessIdentity.processGroupId,1);
-          if(!gone&&!await stopStagingProcess(spool.stagingProcessIdentity))continue;
+          if(!gone&&!await (this.dependencies?.staging?.stopProcess??stopStagingProcess)(spool.stagingProcessIdentity).catch(()=>false))continue;
           spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);
         }else if(!spool.stagingTransportStopped)continue;
+        if(['paused','cancelled','interrupted'].includes(remote.status))continue;
         try{await this.reconcileStaging(spool);}catch{/* Unknown remote outcome and reservation stay durable. */}
         continue;
       }
@@ -435,7 +443,7 @@ export class ConnectorRunner {
 
   private async executeDelivery(claim:ClaimedRun):Promise<void>{
     const client=this.client!;const run=claim.run;const initialStage=run.operation?.action==='deploy_staging'||run.operation?.action==='rollback_staging';const spool:Spool={runId:run.id,generation:run.generation,events:[],artifacts:[],deliveryExecutor:{pid:process.pid,executionId:randomUUID(),stage:initialStage?'staging':run.operation?.action==='merge_pr'?'http':'git'}};
-    activeDeliveryExecutors.add(spool.deliveryExecutor!.executionId);
+    const executionId=spool.deliveryExecutor!.executionId;activeDeliveryExecutors.add(executionId);
     try{
       await this.save(spool);
       if(run.operation?.action!=='merge_pr'||run.operation.phase!=='merge_intent')await client.renew(run.id,run.generation);
@@ -459,7 +467,7 @@ export class ConnectorRunner {
       if(spool.completion)throw error;
       if(initialStage){
         if(spool.stagingProcessIdentity||spool.stagingTransportStarted&&!spool.stagingTransportStopped){await this.save(spool);throw new Error('Staging SSH stop is unconfirmed; reservation retained for reconciliation');}
-        if(this.closing){spool.stopped=true;await this.save(spool);try{await this.flush(spool);}catch{/* Keep exact intent and reservation for the next Connector. */}throw new Error('Staging execution stopped locally; remote outcome remains reserved for reconciliation');}
+        if(this.closing||(error as NodeJS.ErrnoException).code==='ESTAGINGLEASELOST'){spool.stopped=true;await this.save(spool);try{await this.flush(spool);}catch{/* Keep exact intent and reservation for the next Connector. */}throw new Error('Staging execution stopped locally; remote outcome remains reserved for reconciliation');}
         const remote=await client.readRun(run.id).catch(()=>undefined);
         if(remote?.generation===run.generation&&['paused','cancelled','interrupted'].includes(remote.status)){
           spool.stopped=true;await this.save(spool);await this.flush(spool).catch(()=>undefined);
@@ -498,7 +506,7 @@ export class ConnectorRunner {
         }
       }
       throw new Error('Draft PR operation failed; inspect the durable delivery run');
-    }finally{activeDeliveryExecutors.delete(spool.deliveryExecutor!.executionId);}
+    }finally{activeDeliveryExecutors.delete(executionId);}
   }
 
   private async executeStaging(claim:ClaimedRun,spool:Spool):Promise<void>{
@@ -512,31 +520,56 @@ export class ConnectorRunner {
     const expectedAction=statusOnly?'status':rollback?'rollback':'deploy';
     const {previousDeploymentId:_savedPreviousDeploymentId,...requestIntent}=stagingIntent;
     const request:StagingRequest={...requestIntent,...(!statusOnly&&rollback&&op.previousDeploymentId?{previousDeploymentId:op.previousDeploymentId}:{}),operationId:run.id,action:expectedAction};
-    let renewing=false,renewalFailed=false;
-    const stopStaging=this.dependencies?.staging?.stopProcess??stopStagingProcess;
-    const renewTimer=setInterval(()=>{
-      if(renewing||renewalFailed||this.closing)return;
-      renewing=true;
-      void client.renew(run.id,run.generation).catch(async()=>{
-        renewalFailed=true;
-        const identity=this.activeStagingProcesses.get(run.id);
-        if(identity)await stopStaging(identity).catch(()=>false);
-      }).finally(()=>{renewing=false;});
-    },Math.max(5_000,Math.min(this.config.leaseRenewIntervalMs??10_000,30_000)));
-    renewTimer.unref();
     const authorize=async(effect:'provenance'|'transport')=>{
+      if(this.closing)throw new Error('Connector is closing; staging effect remains reserved');
       const grant=await client.authorizeStagingEffect(run.id,run.generation,statusOnly?'status':effect);
       if(grant.action!==expectedAction)throw new Error('Staging authorization changed before the next external effect');
     };
+    const receipt=await this.runStagingLifecycle(spool,op.targetId,target,request,authorize);
+    spool.deliveryExecutor!.stage='completion';spool.stagingReceipt=receipt;
+    spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'};
+    await this.save(spool);await this.flush(spool);
+  }
+
+  private async runStagingLifecycle(spool:Spool,targetId:string,target:NonNullable<ConnectorConfig['deploymentTargets']>[string],request:StagingRequest,authorize:(effect:'provenance'|'transport')=>Promise<void>):Promise<StagingReceipt>{
+    const client=this.client!,runId=spool.runId,generation=spool.generation;
+    let active=true,leaseLost=false,renewal:Promise<void>|undefined;
+    const stopStaging=this.dependencies?.staging?.stopProcess??stopStagingProcess;
+    const assertActive=()=>{if(!active||leaseLost||this.closing)throw new Error('Staging lease or Connector shutdown prevents a new effect; reservation remains held');};
+    const stopOwned=async(identity:CodexProcessIdentity)=>{if(!await stopStaging(identity).catch(()=>false))throw new Error('Staging SSH stop is unconfirmed; reservation remains held');};
+    const renewTimer=setInterval(()=>{
+      if(renewal||leaseLost||this.closing)return;
+      // Keep timer promises fulfilled and joined: a late stop failure must never
+      // become an unhandled rejection or disappear when the timer is cleared.
+      renewal=(async()=>{
+        try{await client.renew(runId,generation);}
+        catch{
+          leaseLost=true;
+          const identity=this.activeStagingProcesses.get(runId);
+          if(identity)await stopOwned(identity).catch(()=>{});
+        }
+      })();
+      void renewal.then(()=>{renewal=undefined;});
+    },Math.max(5_000,Math.min(this.config.leaseRenewIntervalMs??10_000,30_000)));
+    renewTimer.unref();
     try{
-      const receipt=await runStagingOperation(op.targetId,target,request,{
-        starting:async()=>{if(renewalFailed||this.closing)throw new Error('Staging lease or Connector shutdown prevents a new SSH effect');spool.stagingTransportStarted=true;spool.stagingTransportStopped=false;spool.deliveryExecutor!.stage='staging';await this.save(spool);},
-        started:async identity=>{spool.stagingProcessIdentity=identity;this.activeStagingProcesses.set(run.id,identity);spool.deliveryExecutor!.stage='staging';await this.save(spool);if(renewalFailed||this.closing)await stopStaging(identity).catch(()=>false);},
-        stopped:async()=>{spool.stagingProcessIdentity=undefined;this.activeStagingProcesses.delete(run.id);spool.stagingTransportStopped=true;await this.save(spool);}
-      },this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,authorize,this.dependencies?.staging?.targetValidator);
-      spool.deliveryExecutor!.stage='completion';spool.stagingReceipt=receipt;
-      spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'};
-      await this.save(spool);await this.flush(spool);
-    }finally{clearInterval(renewTimer);}
+      const receipt=await runStagingOperation(targetId,target,request,{
+        starting:async()=>{assertActive();spool.stagingTransportStarted=true;spool.stagingTransportStopped=false;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);assertActive();},
+        started:async identity=>{
+          // A late callback owns only this verified SSH identity; it cannot
+          // recreate a completed spool or send JSON after shutdown/lease loss.
+          if(!active){await stopOwned(identity);throw new Error('Staging lifecycle has ended; remote outcome remains unknown');}
+          spool.stagingProcessIdentity=identity;this.activeStagingProcesses.set(runId,identity);spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);
+          if(leaseLost||this.closing){await stopOwned(identity);assertActive();}
+        },
+        stopped:async()=>{if(!active)return;spool.stagingProcessIdentity=undefined;this.activeStagingProcesses.delete(runId);spool.stagingTransportStopped=true;await this.save(spool);}
+      },this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,async effect=>{assertActive();await authorize(effect);assertActive();},this.dependencies?.staging?.targetValidator);
+      assertActive();return receipt;
+    }finally{
+      clearInterval(renewTimer);
+      if(renewal)await renewal;
+      active=false;
+      if(leaseLost||this.closing)throw Object.assign(new Error('Staging lease or Connector shutdown ended this lifecycle; reservation remains held'),{code:leaseLost?'ESTAGINGLEASELOST':'ESTAGINGCLOSING'});
+    }
   }
 }
