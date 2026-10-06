@@ -8,6 +8,7 @@ import type { CodexAppServer } from '../src/connector/codex.js';
 import type { ClaimedRun, ConnectorConfig } from '../src/connector/types.js';
 import type { Run } from '../src/workbench/types.js';
 import type { StagingReceipt, StagingRequest, StagingTracking } from '../src/connector/staging-deploy.js';
+import type { discoverStagingBuild, StagingBuildReceipt } from '../src/connector/staging-build.js';
 import { readJson, stateKey, writeSecureJson } from '../src/connector/state.js';
 
 const commitSha = 'a'.repeat(40);
@@ -34,7 +35,7 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
@@ -42,16 +43,20 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'tr
   const completions: Array<{ error?: string }> = [];
   const renewals:number[]=[];
   const stoppedAcks:number[]=[];
+  const buildStatuses:string[]=[];
+  const buildReceipts:StagingBuildReceipt[]=[];
   const client = {
     claim: async () => { if (!claimed&&!options.recovery) { claimed = true; return claim; } await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
     renew: async (_id:string,generation:number) => { renewals.push(generation);await options.renew?.(renewals.length);if(options.pauseOnHeartbeat&&renewals.length>1){claim.run.status='paused';throw new Error('lease rejected after pause');}return claim.run; },
-    authorizeStagingEffect: async (_id: string, generation: number, effect: 'provenance' | 'transport' | 'status') => {
+    authorizeStagingEffect: async (_id: string, generation: number, effect: 'discovery' | 'provenance' | 'transport' | 'status') => {
       expect(generation).toBe(claim.run.generation);
       return authorize(effect);
     },
     stagingProgress: async (_id: string, _generation: number, receipt: StagingReceipt) => { receipts.push(receipt); },
+    stagingBuildStatus:async(_id:string,_generation:number,status:string)=>{buildStatuses.push(status);return{run:claim.run};},
+    stagingBuildReceipt:async(_id:string,_generation:number,receipt:StagingBuildReceipt)=>{await options.onBuildReceipt?.(receipt);buildReceipts.push(receipt);claim.run.operation!.buildReceipt={...receipt,verifiedAt:new Date().toISOString(),verifiedGeneration:claim.run.generation};claim.run.operation!.buildStatus='verified';claim.run.operation!.imageDigest=receipt.imageDigest;return{run:claim.run};},
     stopped: async (_id:string,generation:number)=>{expect(_id).toBe(runId);expect(generation).toBe(1);stoppedAcks.push(generation);await options.stopAck?.(stoppedAcks.length,await readJson<Record<string,unknown>>(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`)));claim.run.stoppedAt=new Date().toISOString();return claim.run;},
-    complete: async (_id: string, _generation: number, completion: { error?: string }) => { completions.push(completion); await runner.stop(); return claim.run; },
+    complete: async (_id: string, _generation: number, completion: { error?: string }) => { completions.push(completion);await options.completeAck?.(); await runner.stop(); return claim.run; },
     readRun: async () => claim.run,
   } as unknown as WorkbenchConnectorClient;
   const native = { start: async () => ['gpt-6.1-sol'], stop: async () => {} } as unknown as CodexAppServer;
@@ -65,20 +70,20 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'tr
   runner = new ConnectorRunner(config, {
     native: () => native,
     client: () => client,
-    staging: { transport: fakeTransport as never, provenanceVerifier: attestation, targetValidator: async () => {}, ...(options.stopProcess?{stopProcess:options.stopProcess as never}:{}) },
+    staging: { transport: fakeTransport as never, provenanceVerifier: options.provenanceVerifier??attestation, targetValidator: async () => {}, ...(options.stopProcess?{stopProcess:options.stopProcess as never}:{}),...(options.buildDiscovery?{buildDiscovery:options.buildDiscovery}:{}) },
   });
   if(options.recovery)await writeSecureJson(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`),{runId,generation:1,events:[],artifacts:[],stagingIntent:{targetId:'staging',commitSha,imageDigest,expectedCurrentDeploymentId:null},stagingTransportStarted:true,stagingTransportStopped:!options.recoveryIdentity,...(options.recoveryIdentity?{stagingProcessIdentity:identity}:{}),deliveryExecutor:{pid:process.pid,executionId:'crashed-fixture',stage:'staging'}});
   options.onRunner?.(runner);
   try {
     await runner.run();await options.afterRun?.();
     const spools=await Promise.all((await readdir(path.join(dataDir,'spool'))).map(file=>readJson<Record<string,unknown>>(path.join(dataDir,'spool',file))));
-    return { receipts, completions, renewals, stoppedAcks, spools };
+    return { receipts, completions, renewals, stoppedAcks, spools,buildStatuses,buildReceipts };
   }
   finally { await rm(dataDir, { recursive: true, force: true }); }
 }
 
 describe('staging delivery Connector integration', () => {
-  it('authorizes before provenance and SSH, then completes only from the exact healthy receipt', async () => {
+  it('authorizes provenance and SSH, then completes only from the exact healthy receipt', async () => {
     const effects: string[] = [];
     const result = await execute(stagingClaim(), async effect => { effects.push(effect); return { authorized: true, action: 'deploy' }; }, async request => ({
       operationId: request.operationId, targetId: request.targetId, phase: 'health_passed', deploymentId: 'deploy_verified',
@@ -278,5 +283,36 @@ describe('staging delivery Connector integration', () => {
     }});
     expect(stops).toEqual([identity]);expect(result.spools).toEqual([]);
   });
+
+  it('keeps an unknown receipt completion in the outbox until the server acknowledges it',async()=>{
+    let tracking!:StagingTracking;
+    const result=await execute(stagingClaim('deploy_intent'),async()=>({authorized:true,action:'status'}),async(request,value)=>{
+      tracking=value!;return{operationId:request.operationId,targetId:request.targetId,phase:'unknown',commitSha,imageDigest,checkedAt:new Date().toISOString()};
+    },{completeAck:async()=>{throw new Error('completion response lost');},stopProcess:async()=>true,afterRun:async()=>{
+      await expect(tracking.started(identity)).rejects.toThrow(/lifecycle has ended/u);await tracking.stopped();
+    }});
+    expect(result.receipts).toHaveLength(1);expect(result.completions.length).toBeGreaterThan(0);
+    expect(result.spools).toHaveLength(1);expect(result.spools[0]).toMatchObject({stagingIntent:{commitSha,imageDigest},completion:{error:expect.stringContaining('reservation remains held')},deliveryExecutor:{stage:'completion'}});
+    expect(result.spools[0]?.stagingReceipt).toBeUndefined();expect(result.spools[0]?.stagingTransportStopped).toBeUndefined();
+  });
+
+  it('joins aborted discovery cleanup on shutdown before acknowledging a local stop',async()=>{
+    const claim=stagingClaim();claim.run.operation!.phase='build_discovery';claim.run.operation!.imageDigest=undefined;
+    let runner!:ConnectorRunner,cleanup=false,stopJoined:Promise<void>|undefined;
+    const result=await execute(claim,async effect=>{expect(effect).toBe('discovery');return{authorized:true,action:'discover'};},async()=>{throw new Error('SSH must not start during discovery');},{stopAfterMs:1_000,onRunner:value=>{runner=value;},stopAck:async()=>{expect(cleanup).toBe(true);},buildDiscovery:async(_sha,_fetcher,_token,signal)=>{
+      setTimeout(()=>{stopJoined=runner.stop();},10);
+      try{await new Promise<void>((_resolve,reject)=>{signal?.addEventListener('abort',()=>reject(new Error('discovery aborted')),{once:true});});throw new Error('unexpected receipt');}
+      finally{await new Promise(resolve=>setTimeout(resolve,10));cleanup=true;}
+    },afterRun:async()=>{await stopJoined;expect(cleanup).toBe(true);}});
+    expect(result.buildStatuses).toEqual(['discovering']);expect(result.buildReceipts).toEqual([]);expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);expect(result.stoppedAcks).toEqual([1]);expect(result.spools).toEqual([]);
+  });
+
+  it('aborts discovery provenance on lease loss without freezing a receipt or starting SSH',async()=>{
+    const claim=stagingClaim();claim.run.operation!.phase='build_discovery';claim.run.operation!.imageDigest=undefined;
+    const discovered:StagingBuildReceipt={schemaVersion:1,repository:'blossomsai/menoteam',repositoryId:'88',workflowPath:'.github/workflows/build-workbench-image.yml',runId:123,runAttempt:2,artifactId:456,archiveDigest:`sha256:${'e'.repeat(64)}`,artifactExpiresAt:new Date(Date.now()+60_000).toISOString(),sourceSha:commitSha,imageRepository:repository,imageDigest,runUrl:'https://github.com/blossomsai/menoteam/actions/runs/123'};
+    let provenanceAborted=false;
+    const result=await execute(claim,async effect=>{expect(effect).toBe('discovery');return{authorized:true,action:'discover'};},async()=>{throw new Error('SSH must not start');},{stopAfterMs:6_500,pauseOnHeartbeat:true,buildDiscovery:async()=>discovered,provenanceVerifier:async(_args,signal)=>new Promise<string>((_resolve,reject)=>{signal?.addEventListener('abort',()=>{provenanceAborted=true;reject(new Error('provenance aborted'));},{once:true});})});
+    expect(provenanceAborted).toBe(true);expect(result.buildStatuses).toEqual(['discovering']);expect(result.buildReceipts).toEqual([]);expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);expect(result.stoppedAcks).toEqual([1]);expect(result.spools).toEqual([]);
+  },10_000);
 
 });

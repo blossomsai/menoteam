@@ -66,7 +66,7 @@ export interface Run {
         workTitle: string;
         changeSummary: string;
         qaStatus: string;
-        phase: 'queued' | 'published' | 'pr_created' | 'ready_intent' | 'merge_intent' | 'merged' | 'deploy_intent' | 'deploy_unknown' | 'deployed' | 'health_passed' | 'rollback_intent' | 'rolled_back' | 'target_offline';
+        phase: 'queued' | 'published' | 'pr_created' | 'ready_intent' | 'merge_intent' | 'merged' | 'build_discovery' | 'deploy_intent' | 'deploy_unknown' | 'deployed' | 'health_passed' | 'rollback_intent' | 'rolled_back' | 'target_offline';
         effectIntentGeneration?: number;
         external?: { pullRequestNumber?: number; pullRequestUrl?: string; headSha?: string; baseSha?: string; mergeSha?: string; pullRequestNodeId?: string };
         priorDeliveryRunId?: string;
@@ -80,6 +80,25 @@ export interface Run {
         targetPolicyVersion?: string;
         imageDigest?: string;
         sourceMergeRunId?: string;
+        buildStatus?: 'discovering' | 'unavailable' | 'running' | 'failed' | 'receipt_missing' | 'receipt_expired' | 'provenance_failed' | 'verified';
+        buildMessage?: string;
+        buildReceipt?: {
+            schemaVersion: 1;
+            repository: 'blossomsai/menoteam';
+            repositoryId: string;
+            workflowPath: '.github/workflows/build-workbench-image.yml';
+            runId: number;
+            runAttempt: number;
+            artifactId: number;
+            archiveDigest: string;
+            artifactExpiresAt: string;
+            sourceSha: string;
+            imageRepository: 'ghcr.io/blossomsai/menoteam-work-map';
+            imageDigest: string;
+            runUrl: string;
+            verifiedAt: string;
+            verifiedGeneration: number;
+        };
         previousDeploymentRunId?: string;
         previousDeploymentId?: string;
         rollbackToImageDigest?: string;

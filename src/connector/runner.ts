@@ -14,7 +14,8 @@ import { captureRequiredLocalQa } from './local-qa.js';
 import { assertQaResourcePolicy,bindQaExecutor,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
 import { savedQaPolicy,sameQaPolicy } from '../workbench/local-qa.js';
 import { mergePullRequest } from './github-merge-pr.js';
-import { runStagingOperation, stopStagingProcess, type StagingReceipt, type StagingRequest } from './staging-deploy.js';
+import { runStagingOperation, stopStagingProcess, verifyStagingImage, type StagingReceipt, type StagingRequest } from './staging-deploy.js';
+import { discoverStagingBuild, StagingBuildDiscoveryError, verifyFrozenStagingBuild, type StagingBuildReceipt } from './staging-build.js';
 import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
 
 const activeDeliveryExecutors=new Set<string>();
@@ -57,6 +58,7 @@ export class ConnectorRunner {
   private closing = false;
   private readonly active = new Set<CodexAppServer>();
   private readonly runAborts = new Set<AbortController>();
+  private readonly stagingBuildLifecycles = new Set<Promise<unknown>>();
   private readonly tasks = new Set<Promise<void>>();
   private readonly activeRuns = new Set<string>();
   private readonly activeKinds = new Map<string,ClaimedRun['run']['kind']>();
@@ -68,17 +70,46 @@ export class ConnectorRunner {
     native: () => CodexAppServer;
     client: (models:string[], modelReasoningEfforts?:Record<string,string[]>) => WorkbenchConnectorClient;
     delivery?:{fetcher?:typeof fetch;transport?:Parameters<typeof createDraftPullRequest>[5]};
-    staging?:{transport?:Parameters<typeof runStagingOperation>[4];provenanceVerifier?:Parameters<typeof runStagingOperation>[5];targetValidator?:Parameters<typeof runStagingOperation>[7];stopProcess?:typeof stopStagingProcess};
+    staging?:{transport?:Parameters<typeof runStagingOperation>[4];provenanceVerifier?:Parameters<typeof runStagingOperation>[5];targetValidator?:Parameters<typeof runStagingOperation>[7];stopProcess?:typeof stopStagingProcess;buildFetcher?:typeof fetch;buildDiscovery?:typeof discoverStagingBuild};
   }) {}
   private native():CodexAppServer { return this.dependencies?.native() ?? new CodexAppServer(this.config.codexBinary); }
+
+  private withStagingLease<T>(runId:string,generation:number,task:(signal:AbortSignal,assertActive:()=>void)=>Promise<T>,onLeaseLost?:()=>Promise<void>,waitForStop=false):Promise<T>{
+    const client=this.client!,controller=new AbortController();let active=true,leaseLost=false,renewal:Promise<void>|undefined;
+    this.runAborts.add(controller);
+    const assertActive=()=>{if(!active||leaseLost||this.closing||controller.signal.aborted)throw Object.assign(new Error('Staging lifecycle ended; it prevents a new effect'),{code:leaseLost?'ESTAGINGLEASELOST':this.closing?'ESTAGINGCLOSING':'ESTAGINGSTOPPED'});};
+    const renewTimer=setInterval(()=>{
+      if(renewal||leaseLost||this.closing)return;
+      renewal=(async()=>{
+        try{await client.renew(runId,generation);}
+        catch{leaseLost=true;controller.abort();await onLeaseLost?.().catch(()=>{});}
+      })();
+      void renewal.then(()=>{renewal=undefined;});
+    },Math.max(5_000,Math.min(this.config.leaseRenewIntervalMs??10_000,30_000)));
+    renewTimer.unref();
+    const lifecycle=(async()=>{
+      try{assertActive();return await task(controller.signal,assertActive);}
+      finally{
+        clearInterval(renewTimer);if(renewal)await renewal;active=false;controller.abort();this.runAborts.delete(controller);
+        if(leaseLost||this.closing)throw Object.assign(new Error('Staging lease or Connector shutdown ended the operation; its reservation remains held'),{code:leaseLost?'ESTAGINGLEASELOST':'ESTAGINGCLOSING'});
+      }
+    })();
+    if(waitForStop){
+      this.stagingBuildLifecycles.add(lifecycle);
+      void lifecycle.finally(()=>this.stagingBuildLifecycles.delete(lifecycle)).catch(()=>{});
+    }
+    return lifecycle;
+  }
 
   async stop(): Promise<void> {
     this.closing = true;
     for(const abort of this.runAborts)abort.abort();
     const stopStaging=this.dependencies?.staging?.stopProcess??stopStagingProcess;
-    const stageStops=await Promise.allSettled([...this.activeStagingProcesses].map(async([runId,identity])=>{if(!await stopStaging(identity))throw new Error('Staging SSH stop is unconfirmed; target reservation remains held');this.activeStagingProcesses.delete(runId);}));
+    const stageStops=await Promise.allSettled([...this.activeStagingProcesses].map(async([_runId,identity])=>{if(!await stopStaging(identity))throw new Error('Staging SSH stop is unconfirmed; target reservation remains held');}));
+    const lifecycleStops=await Promise.allSettled([...this.stagingBuildLifecycles]);
     await Promise.all([...this.active].map(native=>native.stop()).concat([...this.runAborts].map(abort=>waitForGit(abort.signal))));
     if(stageStops.some(result=>result.status==='rejected'))throw new Error('One or more staging SSH process groups could not be confirmed stopped; remote outcome remains unknown');
+    if(lifecycleStops.some(result=>result.status==='rejected'&&this.activeStagingProcesses.size))throw new Error('Staging lifecycle cleanup could not be confirmed; remote outcome remains reserved');
   }
 
   async run(): Promise<void> {
@@ -452,7 +483,13 @@ export class ConnectorRunner {
     try{
       await this.save(spool);
       if(run.operation?.action!=='merge_pr'||run.operation.phase!=='merge_intent')await client.renew(run.id,run.generation);
-      if(initialStage){await this.executeStaging(claim,spool);return;}
+      if(initialStage){
+        if(run.operation?.action==='deploy_staging'&&run.operation.phase==='build_discovery'){
+          const refreshed=await this.discoverStagingReceipt(claim);
+          claim.run=refreshed;
+        }
+        await this.executeStaging(claim,spool);return;
+      }
       if(run.operation?.action==='merge_pr'){
         const result=await mergePullRequest(claim,async()=>{const auth=await client.authorizeDeliveryEffect(run.id,run.generation);if(auth.repositoryUrl!==run.operation?.repositoryUrl)throw new Error('Merge repository authorization changed');},this.dependencies?.delivery?.fetcher??fetch,async phase=>{spool.deliveryProgress={phase};await this.save(spool);await this.flush(spool);});
         spool.deliveryExecutor!.stage='completion';spool.deliveryProgress={phase:'merged',...result};await this.save(spool);await this.flush(spool);return;
@@ -519,7 +556,7 @@ export class ConnectorRunner {
     if(!op||!['deploy_staging','rollback_staging'].includes(op.action)||!op.targetId||!op.commitSha||!op.imageDigest||!op.expectedCurrentDeploymentId&&op.expectedCurrentDeploymentId!==null)throw new Error('Staging operation identity is incomplete');
     const target=this.config.deploymentTargets?.[op.targetId];if(!target)throw new Error('Staging Connector target is not configured');
     const rollback=op.action==='rollback_staging';if(rollback&&!op.previousDeploymentId)throw new Error('Rollback is missing its saved previous deployment identity');
-    const statusOnly=op.phase!=='queued'||Boolean(op.effectIntentGeneration);
+    const statusOnly=Boolean(op.effectIntentGeneration)||(op.phase!=='queued'&&!(op.action==='deploy_staging'&&op.phase==='build_discovery'&&op.buildStatus==='verified'&&Boolean(op.buildReceipt)));
     const stagingIntent:Spool['stagingIntent']={targetId:op.targetId,commitSha:op.commitSha,imageDigest:op.imageDigest,expectedCurrentDeploymentId:op.expectedCurrentDeploymentId??null,...(rollback&&op.previousDeploymentId?{previousDeploymentId:op.previousDeploymentId}:{})};
     spool.stagingIntent=stagingIntent;spool.deliveryExecutor!.stage='staging';await this.save(spool);
     const expectedAction=statusOnly?'status':rollback?'rollback':'deploy';
@@ -530,51 +567,60 @@ export class ConnectorRunner {
       const grant=await client.authorizeStagingEffect(run.id,run.generation,statusOnly?'status':effect);
       if(grant.action!==expectedAction)throw new Error('Staging authorization changed before the next external effect');
     };
-    const receipt=await this.runStagingLifecycle(spool,op.targetId,target,request,authorize);
+    const receipt=await this.runStagingLifecycle(spool,op.targetId,target,request,authorize,op.action==='deploy_staging'&&op.buildStatus==='verified'&&Boolean(op.buildReceipt));
     spool.deliveryExecutor!.stage='completion';spool.stagingReceipt=receipt;
     spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'};
     await this.save(spool);await this.flush(spool);
   }
 
-  private async runStagingLifecycle(spool:Spool,targetId:string,target:NonNullable<ConnectorConfig['deploymentTargets']>[string],request:StagingRequest,authorize:(effect:'provenance'|'transport')=>Promise<void>):Promise<StagingReceipt>{
-    const client=this.client!,runId=spool.runId,generation=spool.generation;
-    let active=true,leaseLost=false,renewal:Promise<void>|undefined;
-    const stopStaging=this.dependencies?.staging?.stopProcess??stopStagingProcess;
-    const assertActive=()=>{if(!active||leaseLost||this.closing)throw new Error('Staging lease or Connector shutdown prevents a new effect; reservation remains held');};
+  private async discoverStagingReceipt(claim:ClaimedRun):Promise<ClaimedRun['run']>{
+    const client=this.client!,run=claim.run,op=run.operation;
+    if(!op||op.action!=='deploy_staging'||op.phase!=='build_discovery'||!op.targetId||!op.commitSha)throw new Error('Staging build discovery identity is incomplete');
+    const targetId=op.targetId,commitSha=op.commitSha;
+    return this.withStagingLease(run.id,run.generation,async(signal,assertActive)=>{
+      const grant=await client.authorizeStagingEffect(run.id,run.generation,'discovery');if(grant.action!=='discover')throw new Error('Staging build discovery authorization changed');
+      try{
+        const target=this.config.deploymentTargets?.[targetId];if(!target)throw new StagingBuildDiscoveryError('unavailable','Staging Connector target is not configured');
+        if(!op.buildReceipt)await client.stagingBuildStatus(run.id,run.generation,'discovering');
+        let receipt:StagingBuildReceipt;
+        if(op.buildReceipt){
+          const {verifiedAt:_verifiedAt,verifiedGeneration:_verifiedGeneration,...frozen}=op.buildReceipt;
+          receipt=frozen;
+          await verifyFrozenStagingBuild(receipt,this.dependencies?.staging?.buildFetcher??fetch,process.env.MENOTEAM_GITHUB_TOKEN,signal);
+        }else receipt=await (this.dependencies?.staging?.buildDiscovery??discoverStagingBuild)(commitSha,this.dependencies?.staging?.buildFetcher??fetch,process.env.MENOTEAM_GITHUB_TOKEN,signal);
+        assertActive();
+        await verifyStagingImage(target,commitSha,receipt.imageDigest,this.dependencies?.staging?.provenanceVerifier,signal);
+        assertActive();
+        const stored=await client.stagingBuildReceipt(run.id,run.generation,receipt);
+        assertActive();
+        return stored.run;
+      }catch(error){
+        const status=error instanceof StagingBuildDiscoveryError?error.status:'provenance_failed';
+        if(!signal.aborted&&!this.closing)await client.stagingBuildStatus(run.id,run.generation,status).catch(()=>undefined);
+        throw new Error(status==='provenance_failed'?'Staging image provenance failed; no remote effect was started':'Staging build discovery did not produce a usable receipt');
+      }
+    },undefined,true);
+  }
+
+  private async runStagingLifecycle(spool:Spool,targetId:string,target:NonNullable<ConnectorConfig['deploymentTargets']>[string],request:StagingRequest,authorize:(effect:'provenance'|'transport')=>Promise<void>,provenanceAlreadyVerified=false):Promise<StagingReceipt>{
+    const runId=spool.runId,stopStaging=this.dependencies?.staging?.stopProcess??stopStagingProcess;
+    // Stop proof may update an active outbox, but never recreate an ACKed one.
+    let finished=false;
     const stopOwned=async(identity:CodexProcessIdentity)=>{if(!await stopStaging(identity).catch(()=>false))throw new Error('Staging SSH stop is unconfirmed; reservation remains held');};
-    const renewTimer=setInterval(()=>{
-      if(renewal||leaseLost||this.closing)return;
-      // Keep timer promises fulfilled and joined: a late stop failure must never
-      // become an unhandled rejection or disappear when the timer is cleared.
-      renewal=(async()=>{
-        try{await client.renew(runId,generation);}
-        catch{
-          leaseLost=true;
-          const identity=this.activeStagingProcesses.get(runId);
-          if(identity)await stopOwned(identity).catch(()=>{});
-        }
-      })();
-      void renewal.then(()=>{renewal=undefined;});
-    },Math.max(5_000,Math.min(this.config.leaseRenewIntervalMs??10_000,30_000)));
-    renewTimer.unref();
-    try{
+    try{return await this.withStagingLease(runId,spool.generation,async(signal,assertActive)=>{
       const receipt=await runStagingOperation(targetId,target,request,{
         starting:async()=>{assertActive();spool.stagingTransportStarted=true;spool.stagingTransportStopped=false;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);assertActive();},
         started:async identity=>{
           // A late callback owns only this verified SSH identity; it cannot
           // recreate a completed spool or send JSON after shutdown/lease loss.
-          if(!active){await stopOwned(identity);throw new Error('Staging lifecycle has ended; remote outcome remains unknown');}
+          if(finished||signal.aborted||this.closing){await stopOwned(identity);throw new Error('Staging lifecycle has ended; remote outcome remains unknown');}
           spool.stagingProcessIdentity=identity;this.activeStagingProcesses.set(runId,identity);spool.deliveryExecutor&&(spool.deliveryExecutor.stage='staging');await this.save(spool);
-          if(leaseLost||this.closing){await stopOwned(identity);assertActive();}
+          if(signal.aborted||this.closing){await stopOwned(identity);assertActive();}
         },
-        stopped:async()=>{if(!active)return;spool.stagingProcessIdentity=undefined;this.activeStagingProcesses.delete(runId);spool.stagingTransportStopped=true;await this.save(spool);}
-      },this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,async effect=>{assertActive();await authorize(effect);assertActive();},this.dependencies?.staging?.targetValidator);
+        stopped:async()=>{if(finished)return;const tracked=this.activeStagingProcesses.has(runId);this.activeStagingProcesses.delete(runId);if(tracked||this.closing){spool.stagingProcessIdentity=undefined;spool.stagingTransportStopped=true;await this.save(spool);}}
+      },this.dependencies?.staging?.transport,this.dependencies?.staging?.provenanceVerifier,async effect=>{assertActive();await authorize(effect);assertActive();},this.dependencies?.staging?.targetValidator,provenanceAlreadyVerified,signal);
       assertActive();return receipt;
-    }finally{
-      clearInterval(renewTimer);
-      if(renewal)await renewal;
-      active=false;
-      if(leaseLost||this.closing)throw Object.assign(new Error('Staging lease or Connector shutdown ended this lifecycle; reservation remains held'),{code:leaseLost?'ESTAGINGLEASELOST':'ESTAGINGCLOSING'});
-    }
+    },async()=>{const identity=this.activeStagingProcesses.get(runId);if(identity)await stopOwned(identity);});}
+    finally{finished=true;}
   }
 }

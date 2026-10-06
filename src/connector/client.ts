@@ -21,7 +21,7 @@ export class ConnectorHttpError extends Error {
 
 function routeCategory(path: string): string {
   if (path === '/api/workbench/connector/claim') return 'connector.claim';
-  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress|staging-authorize|staging-progress)$/u)?.[1];
+  const route = path.match(/^\/api\/workbench\/connector\/runs\/[^/]+\/(renew|events|artifacts|stopped|bridge-token|complete|tools|qa-authorize|delivery-authorize|delivery-progress|staging-authorize|staging-progress|staging-build-status|staging-build-receipt)$/u)?.[1];
   if (route) return `connector.runs.${route}`;
   if (/^\/api\/workbench\/connector\/runs\/[^/]+$/u.test(path)) return 'connector.runs.read';
   return 'unknown';
@@ -94,7 +94,9 @@ export class WorkbenchConnectorClient {
     });
   }
   deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string}):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
-  authorizeStagingEffect(runId:string,generation:number,effect:'provenance'|'transport'|'status'):Promise<{authorized:true;action:'deploy'|'rollback'|'status'}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-authorize`,{method:'POST',body:{generation,effect}});}
+  authorizeStagingEffect(runId:string,generation:number,effect:'discovery'|'provenance'|'transport'|'status'):Promise<{authorized:true;action:'discover'|'deploy'|'rollback'|'status'}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-authorize`,{method:'POST',body:{generation,effect}});}
+  stagingBuildStatus(runId:string,generation:number,status:import('./staging-build.js').StagingBuildStatus|'discovering'):Promise<{run:Run}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-build-status`,{method:'POST',body:{generation,status}});}
+  stagingBuildReceipt(runId:string,generation:number,receipt:Omit<import('./staging-build.js').StagingBuildReceipt,'verifiedAt'>):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-build-receipt`,{method:'POST',body:{generation,receipt}});}
   stagingProgress(runId:string,generation:number,receipt:import('./staging-deploy.js').StagingReceipt):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/staging-progress`,{method:'POST',body:{generation,receipt}});}
 
   pauseState(runId: string): Promise<Run> { return this.readRun(runId); }
@@ -184,7 +186,9 @@ function validateResponse(path: string, value: unknown): unknown {
     run: z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough(),
     artifact: z.object({ id: z.string(), kind: z.literal('delivery'), revision: z.string(), data: z.unknown() }).passthrough(),
   }).parse(value);
-  if (path.endsWith('/staging-authorize')) return z.object({authorized:z.literal(true),action:z.enum(['deploy','rollback','status'])}).strict().parse(value);
+  if (path.endsWith('/staging-authorize')) return z.object({authorized:z.literal(true),action:z.enum(['discover','deploy','rollback','status'])}).strict().parse(value);
+  if (path.endsWith('/staging-build-status')) return z.object({run:z.object({id:z.string(),status:z.string(),generation:z.number()}).passthrough()}).strict().parse(value);
+  if (path.endsWith('/staging-build-receipt')) return z.object({run:z.object({id:z.string(),status:z.string(),generation:z.number()}).passthrough(),artifact:z.object({id:z.string(),kind:z.literal('delivery'),revision:z.string(),data:z.unknown()}).passthrough()}).strict().parse(value);
   if (path.endsWith('/staging-progress')) return z.object({
     run: z.object({ id: z.string(), status: z.string(), generation: z.number() }).passthrough(),
     artifact: z.object({ id: z.string(), kind: z.literal('delivery'), revision: z.string(), data: z.unknown() }).passthrough(),

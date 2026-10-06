@@ -73,6 +73,14 @@ describe('fixed staging deployment adapter', () => {
     await expect(verifyStagingImage(target, commitSha, imageDigest, async () => output)).rejects.toThrow(/does not match/u);
   });
 
+  it('verifies provenance before the server grants mutation intent', async () => {
+    const order: string[] = [];
+    const output = JSON.stringify([{ verificationResult: { statement: { subject: [{ name: target.imageRepository, digest: { sha256: imageDigest.slice(7) } }] } } }]);
+    const transport = async (_target: StagingDeploymentTarget, input: StagingRequest): Promise<StagingReceipt> => ({operationId:input.operationId,targetId:input.targetId,phase:'health_passed',deploymentId:'deploy_123',commitSha:input.commitSha,imageDigest:input.imageDigest,checkedAt:new Date().toISOString()});
+    await runStagingOperation('staging',target,request,undefined,transport,async()=>{order.push('attestation');return output;},async effect=>{order.push(effect);},async()=>{});
+    expect(order).toEqual(['attestation','provenance','transport']);
+  });
+
   it('only sends the typed request to the fixed helper transport and rejects mismatched receipts', async () => {
     let sent: StagingRequest | undefined;
     const transport = async (_target: StagingDeploymentTarget, input: StagingRequest): Promise<StagingReceipt> => {

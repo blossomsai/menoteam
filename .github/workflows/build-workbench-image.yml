@@ -72,8 +72,30 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
           SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPOSITORY_ID: ${{ github.repository_id }}
         run: |
           [[ "$IMAGE_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg repositoryId "$REPOSITORY_ID" \
+            --arg workflowPath ".github/workflows/build-workbench-image.yml" \
+            --arg runId "$RUN_ID" \
+            --arg runAttempt "$RUN_ATTEMPT" \
+            --arg sourceSha "$SOURCE_SHA" \
+            --arg imageRepository "ghcr.io/blossomsai/menoteam-work-map" \
+            --arg imageDigest "$IMAGE_DIGEST" \
+            '{schemaVersion:1,repository:$repository,repositoryId:$repositoryId,workflowPath:$workflowPath,runId:($runId|tonumber),runAttempt:($runAttempt|tonumber),sourceSha:$sourceSha,imageRepository:$imageRepository,imageDigest:$imageDigest}' \
+            > workbench-image-receipt.json
           printf 'image=ghcr.io/blossomsai/menoteam-work-map@%s\nsource=%s\n' \
             "$IMAGE_DIGEST" "$SOURCE_SHA" \
             >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload immutable build receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: workbench-image-receipt-attempt-${{ github.run_attempt }}
+          path: workbench-image-receipt.json
+          if-no-files-found: error
+          retention-days: 7

@@ -18,13 +18,31 @@ that policy. A delivery request is unavailable unless the project policy and
 the claiming Connector both advertise the same configured ID. Do not add a
 second target-settings subsystem.
 
-Runs carry only the target ID, exact merged commit SHA, immutable OCI image
-digest, and stable request ID. They never carry a hostname, SSH key, path,
+Deploy requests carry only the source merge Run ID, target ID, and stable
+request ID. The server derives the exact merged commit SHA from that completed
+merge receipt and queues the existing delivery Run at `build_discovery`; a
+caller cannot supply an image digest. The fixed Connector looks up only the
+newest matching `workflow_dispatch` run for that exact SHA on `main` and
+requires that attempt to have completed successfully. A newer running or
+failed attempt remains visible. The Connector reads its one attempt-scoped
+receipt artifact and verifies the signed GHCR digest
+with the existing `gh attestation verify` policy. It does not dispatch builds
+or fall back to an earlier run. The authenticated Connector submits the
+validated receipt; the server durably binds its run/attempt/artifact IDs,
+archive digest, source SHA, and OCI digest before granting mutation intent.
+The server authorizes and freezes this evidence but does not independently
+claim to perform cryptographic attestation verification.
+On retry, discovery re-reads the frozen run attempt and artifact IDs instead
+of selecting a newer build. Archive reads are bounded, require one regular
+receipt file, and stream its bytes without extracting filesystem paths.
+
+Runs never carry a hostname, SSH key, path,
 command, environment, Compose file, or arbitrary URL. The server rechecks the
 original actor's current project authority, target policy version, verified
-merge receipt, image provenance, and Connector grant before each remote
-effect. Missing configuration, credentials, merge receipt, or build
-provenance means `unavailable`, not a queued success.
+merge receipt, frozen build receipt and Connector grant before each remote
+effect. Missing configuration, credentials, merge receipt, build, receipt, or
+provenance remains visible as unavailable/failed and can be retried through
+read-only discovery; it never creates a queued success.
 
 The only remote command is a fixed helper invocation with validated IDs,
 40-character commit SHA, and OCI digest. Pass local SSH arguments as an argv
@@ -39,7 +57,11 @@ Compose overrides.
 Use the existing delivery Run, canonical request key, lease/generation fence,
 Connector spool, and immutable delivery Artifact. Snapshot target ID/policy
 version, merge receipt ID/SHA, image digest/provenance, and actor when the
-operation is created. Before each effect, persist its intent. A retry first
+operation is created. A deploy's canonical key is target plus immutable merge
+Run; legacy digest-bound operations retain their existing reconciliation key.
+Persist the verified `buildReceipt` before creating deploy intent, including
+the workflow run/attempt, artifact ID and archive digest, OCI digest, and
+verification time. Before each effect, persist its intent. A retry first
 queries the helper by operation ID and reconciles the recorded result; it does
 not blindly replay an ambiguous remote effect.
 

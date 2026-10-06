@@ -60,10 +60,10 @@ export function validateStagingRequest(input: StagingRequest): StagingRequest {
 }
 
 /** Verify the exact GHCR digest against the repository's fixed image workflow before any SSH effect. */
-export async function verifyStagingImage(target: StagingDeploymentTarget, commitSha: string, imageDigest: string, verifier: (args: string[]) => Promise<string> = verifyWithGh): Promise<void> {
+export async function verifyStagingImage(target: StagingDeploymentTarget, commitSha: string, imageDigest: string, verifier: (args: string[], signal?:AbortSignal) => Promise<string> = verifyWithGh, signal?:AbortSignal): Promise<void> {
   if (!SHA.test(commitSha) || !DIGEST.test(imageDigest)) throw new Error('Staging image provenance is invalid');
   const args = ['attestation', 'verify', `oci://${target.imageRepository}@${imageDigest}`, '--repo', 'blossomsai/menoteam', '--signer-workflow', 'blossomsai/menoteam/.github/workflows/build-workbench-image.yml', '--source-digest', commitSha, '--source-ref', 'refs/heads/main', '--deny-self-hosted-runners', '--format', 'json'];
-  const output = await verifier(args);
+  const output = await verifier(args,signal);
   let parsed: unknown;
   try { parsed = JSON.parse(output); } catch { throw new Error('Image attestation response was not valid JSON'); }
   const results = z.array(z.object({ verificationResult: z.object({ statement: z.object({ subject: z.array(z.object({ name: z.string(), digest: z.record(z.string(), z.string()) }).passthrough()).min(1) }).passthrough() }).passthrough() }).passthrough()).min(1).parse(parsed);
@@ -71,10 +71,10 @@ export async function verifyStagingImage(target: StagingDeploymentTarget, commit
   if (!results.some(result => result.verificationResult.statement.subject.some(subject => subject.name === target.imageRepository && subject.digest.sha256 === expectedDigest))) throw new Error('Attested image digest does not match the requested image');
 }
 
-async function verifyWithGh(args: string[]): Promise<string> {
+async function verifyWithGh(args: string[], signal?:AbortSignal): Promise<string> {
   const token = process.env.MENOTEAM_GITHUB_TOKEN;
   if (!token) throw new Error('Staging image provenance verifier is unavailable');
-  const { stdout } = await execFile('gh', args, { encoding: 'utf8', maxBuffer: 256 * 1024, timeout: 30_000, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C', GH_TOKEN: token } });
+  const { stdout } = await execFile('gh', args, { encoding: 'utf8', maxBuffer: 256 * 1024, timeout: 30_000, ...(signal?{signal}:{}), env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C', GH_TOKEN: token } });
   return stdout;
 }
 
@@ -96,12 +96,12 @@ async function validateTarget(target: StagingDeploymentTarget): Promise<void> {
 }
 
 /** Fixed helper path and JSON stdin; no request field is interpreted as a command, path, or URL. */
-export async function runStagingOperation(targetId: string, target: StagingDeploymentTarget, input: StagingRequest, tracking?: StagingTracking, transport: StagingTransport = sshTransport, provenanceVerifier?: (args: string[]) => Promise<string>, authorize?: StagingAuthorization, targetValidator: (target: StagingDeploymentTarget) => Promise<void> = validateTarget): Promise<StagingReceipt> {
+export async function runStagingOperation(targetId: string, target: StagingDeploymentTarget, input: StagingRequest, tracking?: StagingTracking, transport: StagingTransport = sshTransport, provenanceVerifier?: (args: string[], signal?:AbortSignal) => Promise<string>, authorize?: StagingAuthorization, targetValidator: (target: StagingDeploymentTarget) => Promise<void> = validateTarget, provenanceAlreadyVerified = false, signal?:AbortSignal): Promise<StagingReceipt> {
   const request = validateStagingRequest(input);
   if (request.targetId !== targetId) throw new Error('Staging target binding changed');
   if (request.action === 'deploy' || request.action === 'rollback') {
+    if (!provenanceAlreadyVerified) await verifyStagingImage(target, request.commitSha, request.imageDigest, provenanceVerifier,signal);
     await authorize?.('provenance');
-    await verifyStagingImage(target, request.commitSha, request.imageDigest, provenanceVerifier);
   }
   await targetValidator(target);
   await authorize?.('transport');

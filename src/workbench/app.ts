@@ -608,17 +608,32 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return String(connector.id);
     }
     function stagingReservationScope(projectId:string,targetId:string){return `staging-target:${projectId}:${targetId}`;}
+    async function validateStagingBuildRun(run:Run,tx:Sql){
+        const op=run.operation;if(run.kind!=='delivery'||op?.action!=='deploy_staging'||op.phase!=='build_discovery'||!op.targetId||!op.sourceMergeRunId||!op.commitSha||!op.actorId||op.actorId!==run.requestedBy)fail(409,'Staging build discovery is unavailable');
+        const capsRows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${run.connectorId!}`;const caps=capsRows[0]?.capabilities as Record<string,unknown>|undefined;
+        if(!caps||!Array.isArray(caps.deploymentTargets)||!caps.deploymentTargets.includes(op.targetId)||!Array.isArray(caps.deliveryActions)||!caps.deliveryActions.includes('deploy_staging'))fail(409,'Configured staging Connector capability is unavailable');
+        if(!await actorAuthorized(run,tx))fail(403,'Staging actor authorization was revoked');
+        const users=await tx`SELECT role FROM wb_users WHERE id=${run.requestedBy??''}`;if(!users[0]||!['owner','admin'].includes(String(users[0].role)))fail(403,'Staging action requires a project administrator');
+        const membership=await tx`SELECT role FROM wb_memberships WHERE user_id=${run.requestedBy??''} AND project_id=${run.projectId}`;if(users[0]!.role!=='owner'&&(!membership[0]||!['owner','admin'].includes(String(membership[0].role))))fail(403,'Staging project authorization was revoked');
+        await stagingTargetPolicy(run.projectId,op.targetId,tx,op.targetPolicyVersion);
+        const source=await store.get<Run>('run',op.sourceMergeRunId,tx);if(!source||source.status!=='completed'||source.kind!=='delivery'||source.operation?.action!=='merge_pr'||source.operation.phase!=='merged'||source.operation.external?.mergeSha!==op.commitSha||source.connectorId!==source.targetConnectorId)fail(409,'Exact merged source receipt is unavailable');
+        if(!source.requestedBy||!await actorAuthorized({...source,requestedBy:source.requestedBy},tx))fail(403,'Original merge actor authorization was revoked');
+        return op;
+    }
     async function resumeStagingIntent(saved:{run:Run;operationId:string},requestScope:string,requestId:string,workId:string,targetId:string,sourceMergeRunId:string,tx:Sql,previousDeploymentRunId?:string){
         const run=await store.get<Run>('run',saved.run.id,tx);if(!run||run.workId!==workId||run.operation?.targetId!==targetId||run.operation.sourceMergeRunId!==sourceMergeRunId||previousDeploymentRunId&&run.operation.previousDeploymentRunId!==previousDeploymentRunId)fail(409,'Saved staging operation identity changed');
         const op=run.operation!,hasIntent=Boolean(op.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase);
-        if(!hasIntent)return undefined;
+        const buildDiscovery=op.action==='deploy_staging'&&op.phase==='build_discovery'&&!hasIntent;
+        if(!hasIntent&&!buildDiscovery)return undefined;
         const reservationScope=stagingReservationScope(run.projectId,targetId);const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
         if(['completed'].includes(run.status))return {run,operationId:run.id};
         if(!reservation[0]||(reservation[0].result as {runId?:string}).runId!==run.id)fail(409,'Saved staging intent no longer owns the target reservation');
         if(['failed','interrupted','cancelled'].includes(run.status)){
-            if(['interrupted','cancelled'].includes(run.status)&&!run.stoppedAt)fail(409,'Connector process must be confirmed stopped before staging status reconciliation');
+            if(!buildDiscovery&&['interrupted','cancelled'].includes(run.status)&&!run.stoppedAt)fail(409,'Connector process must be confirmed stopped before staging status reconciliation');
             if(run.operation.stagingEffectStage==='transport_intent'&&!run.stoppedAt&&!run.operation.stagingReceipt)fail(409,'Staging transport stop must be confirmed before status reconciliation');
-            run.generation++;run.status='queued';run.stoppedAt=undefined;run.error=undefined;run.updatedAt=now();await store.put('run',run,tx);
+            run.generation++;run.status='queued';run.stoppedAt=undefined;run.error=undefined;run.updatedAt=now();
+            if(buildDiscovery){run.operation.buildStatus=run.operation.buildReceipt?'verified':'discovering';run.operation.buildMessage=undefined;}
+            await store.put('run',run,tx);
         }else if(run.status!=='queued'&&run.status!=='running'&&run.status!=='paused')fail(409,'Staging operation cannot be reconciled from its current state');
         const result={run,operationId:run.id};await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${requestId},${tx.json(result as never)}) ON CONFLICT(scope,request_id) DO UPDATE SET result=EXCLUDED.result`;return result;
     }
@@ -628,13 +643,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             .sort((a,b)=>String(b.updatedAt).localeCompare(String(a.updatedAt)))[0];
     }
     async function requestStagingDeploy(user:Member,workId:string,raw:unknown,tx=sql,projectBoundary?:string){
-        const b=z.object({sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
+        const b=z.object({sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
         const work=await store.get<Work>('work',workId,tx);if(!work||projectBoundary&&work.projectId!==projectBoundary)fail(404,'Work missing');
         await grant(user,work!.projectId,true,tx);
-        const requestScope=`staging-request:${work!.projectId}:${user.id}:${b.targetId}`;const canonicalScope=`staging-operation:${work!.projectId}:${b.targetId}:${b.sourceMergeRunId}:${b.imageDigest}`;
-        const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        const requestScope=`staging-request:${work!.projectId}:${user.id}:${b.targetId}`;const canonicalScope=`staging-operation:${work!.projectId}:${b.targetId}:${b.sourceMergeRunId}`;
+        const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;let canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        if(!canonical[0])canonical=await tx`SELECT result FROM wb_requests WHERE scope LIKE ${`${canonicalScope}:%`} AND request_id='canonical' ORDER BY scope LIMIT 1`;
         const savedRequest=prior[0]?(prior[0].result as {run:Run;operationId:string}):canonical[0]?(canonical[0].result as {run:Run;operationId:string}):undefined;
-        if(savedRequest){if(savedRequest.run.operation?.imageDigest!==b.imageDigest||savedRequest.run.operation?.sourceMergeRunId!==b.sourceMergeRunId)fail(409,'Staging request is already bound to another image or merged commit');const reconciled=await resumeStagingIntent(savedRequest,requestScope,b.requestId,workId,b.targetId,b.sourceMergeRunId,tx);if(reconciled)return reconciled;}
+        if(savedRequest){if(savedRequest.run.operation?.sourceMergeRunId!==b.sourceMergeRunId||savedRequest.run.operation?.targetId!==b.targetId)fail(409,'Staging request is already bound to another merged source');const reconciled=await resumeStagingIntent(savedRequest,requestScope,b.requestId,workId,b.targetId,b.sourceMergeRunId,tx);if(reconciled)return reconciled;}
         const actor=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;if(!actor[0]||!['owner','admin'].includes(String(actor[0].role)))fail(403,'Staging deployment requires a project administrator');
         const source=await store.get<Run>('run',b.sourceMergeRunId,tx);const sourceOp=source?.operation;
         if(!source||source.projectId!==work!.projectId||source.workId!==workId||source.kind!=='delivery'||source.status!=='completed'||sourceOp?.action!=='merge_pr'||sourceOp.phase!=='merged'||!sourceOp.external?.mergeSha||source.connectorId!==source.targetConnectorId)fail(409,'Verified merged source receipt is unavailable');
@@ -644,12 +660,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const connectorId=await stagingConnector(work!.projectId,b.targetId,'deploy_staging',tx);
         const latest=await latestStagingDeployment(work!.projectId,b.targetId,tx);
         const expectedCurrentDeploymentId=latest?.operation?.stagingReceipt?.deploymentId??null;
-        if(prior[0]){const saved=prior[0].result as {run?:Run};if(saved.run?.operation?.sourceMergeRunId!==source.id||saved.run.operation.imageDigest!==b.imageDigest)fail(409,'Request ID was already used for another staging image');return saved;}
+        if(prior[0]){const saved=prior[0].result as {run?:Run};if(saved.run?.operation?.sourceMergeRunId!==source.id)fail(409,'Request ID was already used for another merged source');return saved;}
         if(canonical[0]){
             const saved=canonical[0].result as {run:Run;operationId:string};const current=await store.get<Run>('run',saved.run.id,tx);if(!current)fail(409,'Staging operation is unavailable');
             const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${stagingReservationScope(work!.projectId,b.targetId)} AND request_id='reservation'`;
             if(reservation[0]&&(reservation[0].result as {runId?:string}).runId!==current.id)fail(409,'Another staging operation owns this target');
-            if(['failed','interrupted','cancelled'].includes(current.status)){
+            if(['failed','interrupted','cancelled'].includes(current.status)&&current.operation?.phase==='build_discovery'){
+                current.generation++;current.status='queued';current.stoppedAt=undefined;current.error=undefined;current.operation.buildStatus=current.operation.buildReceipt?'verified':'discovering';current.operation.buildMessage=undefined;current.updatedAt=now();await store.put('run',current,tx);saved.run=current;
+            }else if(['failed','interrupted','cancelled'].includes(current.status)){
                 if(['interrupted','cancelled'].includes(current.status)&&!current.stoppedAt)fail(409,'Connector process must be confirmed stopped before status reconciliation');
                 current.generation++;current.status='queued';current.stoppedAt=undefined;current.error=undefined;current.updatedAt=now();await store.put('run',current,tx);saved.run=current;
             }
@@ -660,7 +678,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
         if(reservation[0])fail(409,'Staging target is reserved by an unresolved operation');
         const deploySource={...sourceOp!};delete deploySource.effectIntentGeneration;delete deploySource.stagingEffectStage;delete deploySource.stagingReceipt;delete deploySource.previousDeploymentRunId;delete deploySource.previousDeploymentId;delete deploySource.rollbackToImageDigest;
-        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Deploy this exact merged commit to the configured staging target. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:source.targetRunId,targetRevision:source.targetRevision,targetConnectorId:connectorId,operation:{...deploySource,action:'deploy_staging',actorId:user.id,commitSha,candidateRunId:sourceOp.candidateRunId,candidateRevision:sourceOp.candidateRevision,artifactRevision:sourceOp.artifactRevision,phase:'queued',sourceMergeRunId:source.id,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,imageDigest:b.imageDigest,expectedCurrentDeploymentId}};
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Discover the fixed image receipt for this exact merged commit, then deploy only after provenance verification. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:source.targetRunId,targetRevision:source.targetRevision,targetConnectorId:connectorId,operation:{...deploySource,action:'deploy_staging',actorId:user.id,commitSha,candidateRunId:sourceOp.candidateRunId,candidateRevision:sourceOp.candidateRevision,artifactRevision:sourceOp.artifactRevision,phase:'build_discovery',buildStatus:'discovering',sourceMergeRunId:source.id,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,expectedCurrentDeploymentId}};
         const saved={run,operationId:run.id};await store.put('run',run,tx);
         await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'deploy_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;
         return saved;
@@ -1169,10 +1187,24 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(operation!.actorId!==run.requestedBy||body.generation!==run.generation)fail(409,'Draft PR authorization changed');
         return {authorized:true,repositoryUrl:project!.repositoryUrl};
     }));
+    app.post('/api/workbench/connector/runs/:id/staging-build-status',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const body=z.object({generation:z.number(),status:z.enum(['discovering','unavailable','running','failed','receipt_missing','receipt_expired','provenance_failed'])}).strict().parse(req.body);
+        const run=await leased(req,tx);const op=await validateStagingBuildRun(run,tx);if(body.generation!==run.generation||op.buildStatus==='verified'&&(!op.buildReceipt||!['unavailable','receipt_missing','receipt_expired','provenance_failed'].includes(body.status)))fail(409,'Staging build receipt is already frozen');
+        op.buildStatus=body.status;run.operation=op;run.updatedAt=now();await store.put('run',run,tx);return {run};
+    }));
+    app.post('/api/workbench/connector/runs/:id/staging-build-receipt',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
+        const body=z.object({generation:z.number(),receipt:z.object({schemaVersion:z.literal(1),repository:z.literal('blossomsai/menoteam'),repositoryId:z.string().regex(/^\d+$/u),workflowPath:z.literal('.github/workflows/build-workbench-image.yml'),runId:z.number().int().positive(),runAttempt:z.number().int().positive(),artifactId:z.number().int().positive(),archiveDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),artifactExpiresAt:z.string().datetime(),sourceSha:z.string().regex(/^[a-f0-9]{40}$/u),imageRepository:z.literal('ghcr.io/blossomsai/menoteam-work-map'),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),runUrl:z.string().url()}).strict()}).strict().parse(req.body);
+        const run=await leased(req,tx);const op=await validateStagingBuildRun(run,tx);const receipt=body.receipt;
+        if(body.generation!==run.generation||receipt.sourceSha!==op.commitSha||receipt.repositoryId.length>20||receipt.runUrl!==`https://github.com/blossomsai/menoteam/actions/runs/${receipt.runId}`||Date.parse(receipt.artifactExpiresAt)<=Date.now())fail(409,'Staging build receipt does not match the exact merged source');
+        if(op.buildReceipt){if(!isDeepStrictEqual(op.buildReceipt,{...receipt,verifiedAt:op.buildReceipt.verifiedAt,verifiedGeneration:op.buildReceipt.verifiedGeneration})||op.imageDigest!==receipt.imageDigest)fail(409,'Staging build receipt is immutable');const artifact=await store.get<Artifact>('artifact',`artifact:${run.id}:staging-build:${op.buildReceipt.verifiedGeneration}`,tx);if(!artifact)fail(409,'Frozen staging build artifact is unavailable');op.buildStatus='verified';op.buildMessage=undefined;run.operation=op;run.updatedAt=now();await store.put('run',run,tx);return {run,artifact};}
+        if(op.imageDigest&&op.imageDigest!==receipt.imageDigest)fail(409,'Staging image digest is already bound to another build receipt');
+        const saved={...receipt,verifiedAt:now(),verifiedGeneration:run.generation};op.buildReceipt=saved;op.buildStatus='verified';op.imageDigest=receipt.imageDigest;run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
+        const artifactId=`artifact:${run.id}:staging-build:${run.generation}`;const artifact:Artifact={id:artifactId,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{phase:'build_verified',sourceMergeRunId:op.sourceMergeRunId,commitSha:op.commitSha,targetId:op.targetId,receipt:saved},createdAt:now()};await store.put('artifact',artifact,tx);return {run,artifact};
+    }));
     app.post('/api/workbench/connector/runs/:id/staging-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
-        const c=await connector(req);const run=await store.get<Run>('run',(req.params as {id:string}).id,tx);const body=z.object({generation:z.number(),effect:z.enum(['provenance','transport','status'])}).strict().parse(req.body);
+        const c=await connector(req);const run=await store.get<Run>('run',(req.params as {id:string}).id,tx);const body=z.object({generation:z.number(),effect:z.enum(['discovery','provenance','transport','status'])}).strict().parse(req.body);
         if(!run||run.kind!=='delivery'||!run.operation||!['deploy_staging','rollback_staging'].includes(run.operation.action)||run.connectorId!==c.id||!c.projectIds.includes(run.projectId))fail(403,'Staging operation unavailable');
-        const op=run.operation,targetId=op.targetId;if(!targetId||!op.sourceMergeRunId||!op.imageDigest||!op.commitSha)fail(409,'Staging operation identity is incomplete');
+        const op=run.operation,targetId=op.targetId;if(!targetId||!op.sourceMergeRunId||!op.commitSha||op.action==='rollback_staging'&&!op.imageDigest||op.action==='deploy_staging'&&op.phase!=='build_discovery'&&!op.imageDigest)fail(409,'Staging operation identity is incomplete');
         const capsRows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${c.id}`;const caps=capsRows[0]?.capabilities as Record<string,unknown>|undefined;
         const hasIntent=Boolean(op.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase);
         const statusOnly=body.effect==='status'||run.generation!==body.generation||run.status!=='running'||Date.parse(run.leaseUntil??'')<Date.now()||(['deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase));
@@ -1190,13 +1222,22 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(op.actorId!==run.requestedBy)fail(409,'Staging actor binding changed');
         const {project}=await stagingTargetPolicy(run.projectId,targetId,tx,op.targetPolicyVersion);
         const source=await store.get<Run>('run',op.sourceMergeRunId,tx);
-        if(!source||source.status!=='completed'||source.kind!=='delivery'||source.operation?.action!=='merge_pr'||source.operation.phase!=='merged'||source.operation.external?.mergeSha!==op.commitSha)fail(409,'Exact merged source receipt is unavailable');
+        if(!source||source.status!=='completed'||source.kind!=='delivery'||source.operation?.action!=='merge_pr'||source.operation.phase!=='merged'||source.operation.external?.mergeSha!==op.commitSha||source.connectorId!==source.targetConnectorId)fail(409,'Exact merged source receipt is unavailable');
+        if(!source.requestedBy||!await actorAuthorized({...source,requestedBy:source.requestedBy},tx))fail(403,'Original merge actor authorization was revoked');
         if(op.action==='rollback_staging'){
             const previous=op.previousDeploymentRunId?await store.get<Run>('run',op.previousDeploymentRunId,tx):undefined;
             if(!previous?.operation?.stagingReceipt||previous.operation.stagingReceipt.phase!=='health_passed'||previous.operation.stagingReceipt.imageDigest!==op.imageDigest||previous.operation.stagingReceipt.commitSha!==op.commitSha)fail(409,'Previous verified deployment receipt changed');
         }
+        if(op.action==='deploy_staging'&&op.phase==='build_discovery'&&body.effect==='discovery'){
+            if(op.buildStatus==='verified'&&!op.buildReceipt||op.effectIntentGeneration)fail(409,'Staging build discovery has already completed');
+            return {authorized:true as const,action:'discover' as const};
+        }
         const nextPhase=op.action==='deploy_staging'?'deploy_intent':'rollback_intent';
-        if(op.phase==='queued'){
+        if(op.action==='deploy_staging'&&op.phase==='build_discovery'){
+            if(body.effect!=='provenance'||op.buildStatus!=='verified'||!op.buildReceipt||!op.imageDigest||op.buildReceipt.imageDigest!==op.imageDigest||op.buildReceipt.sourceSha!==op.commitSha)fail(409,'Verified staging build receipt is required before mutation');
+            op.phase=nextPhase;op.effectIntentGeneration=run.generation;op.stagingEffectStage='intent';run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
+            const intent:Artifact={id:`artifact:${run.id}:staging-intent:${run.generation}`,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{operationId:run.id,action:op.action,phase:op.phase,targetId,commitSha:op.commitSha,imageDigest:op.imageDigest,sourceMergeRunId:op.sourceMergeRunId,actorId:op.actorId,targetPolicyVersion:op.targetPolicyVersion,generation:run.generation,buildReceipt:op.buildReceipt},createdAt:now()};await store.put('artifact',intent,tx);
+        }else if(op.phase==='queued'){
             if(body.effect!=='provenance')fail(409,'A staging mutation must begin with provenance authorization');
             op.phase=nextPhase;op.effectIntentGeneration=run.generation;op.stagingEffectStage='intent';run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
             const intent:Artifact={id:`artifact:${run.id}:staging-intent:${run.generation}`,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{operationId:run.id,action:op.action,phase:op.phase,targetId,commitSha:op.commitSha,imageDigest:op.imageDigest,sourceMergeRunId:op.sourceMergeRunId,actorId:op.actorId,targetPolicyVersion:op.targetPolicyVersion,generation:run.generation},createdAt:now()};await store.put('artifact',intent,tx);
@@ -1612,7 +1653,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             result=await requestMergePr(actors[0] as unknown as Member,prior!.workId!,input,tx,r.projectId);
         }
         else if (b.action === 'request_staging_deploy') {
-            const input=z.object({workId:text,sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
+            const input=z.object({workId:text,sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
             const {workId,...request}=input;result=await requestStagingDeploy(actors[0] as unknown as Member,workId,request,tx,r.projectId);
         }
         else if (b.action === 'request_staging_rollback') {
