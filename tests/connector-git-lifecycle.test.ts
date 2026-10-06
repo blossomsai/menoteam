@@ -126,10 +126,25 @@ it('retains an unconfirmed Git reservation during recovery even when old native 
   const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey('run', '1')}.json`);
   const spool = { runId: 'run', generation: 1, events: [], artifacts: [], gitStopUnconfirmed: true, processIdentity: { pid: 123, processGroupId: 123, startedAt: 'old', command: 'codex app-server' } };
   await writeSecureJson(spoolPath, spool);
+  const savedSpool = await readFile(spoolPath, 'utf8');
   const native = { start: async () => ['gpt-6-luna'], stop: async () => {} } as unknown as CodexAppServer;
-  const acknowledge = vi.fn(); const client = { claim: async () => { await runner.stop(); return undefined; }, readRun: async () => { throw new Error('Unconfirmed Git cannot be released through native proof'); }, stopped: acknowledge } as unknown as WorkbenchConnectorClient;
-  runner = new ConnectorRunner(f.config, { native: () => native, client:()=>withRecoveryState(client)}); await runner.run();
-  expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(spool); expect(acknowledge).not.toHaveBeenCalled();
+  const recoveryState = vi.fn(async (runId: string, generation: number) => {
+    expect(runId).toBe('run'); expect(generation).toBe(1);
+    return { id: 'run', generation: 1, status: 'interrupted', preEffectStaging: false, stagingRetired: false, merged: false };
+  });
+  const readRun = vi.fn(async () => { throw new Error('Unconfirmed Git cannot be released through native proof'); });
+  const acknowledge = vi.fn(); const client = { claim: async () => { await runner.stop(); return undefined; }, recoveryState, readRun, stopped: acknowledge } as unknown as WorkbenchConnectorClient;
+  const signalling = vi.spyOn(process, 'kill');
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  runner = new ConnectorRunner(f.config, { native: () => native, client: () => client });
+  try {
+    await runner.run();
+    expect(recoveryState).toHaveBeenCalledWith('run', 1); expect(readRun).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith('Git process group stop remains unconfirmed; manual Connector recovery is required');
+    expect(signalling).not.toHaveBeenCalled(); expect(acknowledge).not.toHaveBeenCalled();
+    expect(await readFile(spoolPath, 'utf8')).toBe(savedSpool);
+    expect(JSON.parse(await readFile(spoolPath, 'utf8'))).toEqual(spool);
+  } finally { signalling.mockRestore(); log.mockRestore(); await runner.stop(); }
 });
 
 it('stops active native on remote cancel even when its Git fingerprint group cannot be confirmed stopped', async () => {
