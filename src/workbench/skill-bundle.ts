@@ -51,7 +51,7 @@ export function skillMarkdown(bundle: SkillBundle): string {
     try { return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(f.data, 'base64')); }
     catch { return fail('SKILL.md must be complete UTF-8'); }
 }
-export async function collectSkillBundle(tree: SkillTreeEntry[], root: string, commit: string, read: (entry: SkillTreeEntry) => Promise<Uint8Array>, concurrency = 4): Promise<SkillBundle> {
+export async function collectSkillBundle(tree: SkillTreeEntry[], root: string, commit: string, read: (entry: SkillTreeEntry, signal: AbortSignal) => Promise<Uint8Array>, concurrency = 4): Promise<SkillBundle> {
     if (root !== '') bundlePath(root);
     const names = new Set<string>();
     for (const entry of tree) {
@@ -72,18 +72,24 @@ export async function collectSkillBundle(tree: SkillTreeEntry[], root: string, c
         total += e.size!;
     }
     if (total > SKILL_BOUNDS.totalBytes || !entries.some(e => e.path === `${prefix}SKILL.md`)) fail('Skill bundle is oversized or SKILL.md missing');
-    const files: SkillFile[] = new Array(entries.length); let cursor = 0;
-    const workers = Array.from({ length: Math.max(1, Math.min(4, concurrency, entries.length)) }, async () => {
-        while (cursor < entries.length) {
+    const files: SkillFile[] = new Array(entries.length); let cursor = 0; let failed = false; let firstError: unknown;
+    const controller = new AbortController();
+    const workerCount = Math.max(1, Math.min(4, Number.isSafeInteger(concurrency) ? concurrency : 4, entries.length));
+    const workers = Array.from({ length: workerCount }, async () => {
+        while (!controller.signal.aborted && cursor < entries.length) {
             const index = cursor++; const e = entries[index]!;
-            const bytes = await read(e);
-            if (bytes.length !== e.size || gitBlobHash(bytes) !== e.sha) fail('Git blob is incomplete or does not match immutable tree');
-            files[index] = { path: e.path.slice(prefix.length), mode: e.mode as SkillFile['mode'], encoding: 'base64', data: Buffer.from(bytes).toString('base64'), bytes: bytes.length, sha256: bytesHash(bytes), sourceBlobSha: e.sha };
+            try {
+                const bytes = await read(e, controller.signal);
+                if (bytes.length !== e.size || gitBlobHash(bytes) !== e.sha) fail('Git blob is incomplete or does not match immutable tree');
+                files[index] = { path: e.path.slice(prefix.length), mode: e.mode as SkillFile['mode'], encoding: 'base64', data: Buffer.from(bytes).toString('base64'), bytes: bytes.length, sha256: bytesHash(bytes), sourceBlobSha: e.sha };
+            } catch (error) {
+                if (!failed) { failed = true; firstError = error; }
+                controller.abort(error);
+            }
         }
     });
-    const results = await Promise.allSettled(workers);
-    const failed = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
-    if (failed) throw failed.reason;
+    await Promise.allSettled(workers);
+    if (failed) throw firstError;
     return sealBundle(root, commit, files);
 }
 export function editBundleMarkdown(input: unknown, content: string): SkillBundle {

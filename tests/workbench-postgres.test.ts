@@ -569,6 +569,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         };
         sourceFetch = vi.fn<typeof fetch>(async input => {
             const path = new URL(String(input)).pathname;
+            if (path === '/repos/example/catalog' || path === '/repos/example/plugins') return Response.json({ private: true, default_branch: 'main' });
             if (overflowCatalog && path.endsWith('/commits/main')) return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(300_000)); }, cancel() { streamedBodyCancelled = true; } }));
             const legacyRepo = path.includes('/example/legacy/');
             const legacyBytes = fixtureBytes('legacy'); const legacySha = gitBlobHash(legacyBytes);
@@ -599,7 +600,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const scope = { scope: 'project' as const, projectId: projectIdForCase, catalogUrl };
             const listed = await user('POST', '/skills/catalog', scope);
             expect(listed.statusCode).toBe(200);
-            const previewResponse = await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' });
+            const metadataResponse = await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' });
+            expect(metadataResponse.statusCode).toBe(200);
+            expect(metadataResponse.json().skills.every((skill: any) => !Object.hasOwn(skill, 'bundleFiles'))).toBe(true);
+            const previewResponse = await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper', selectedPaths: metadataResponse.json().skills.map((skill: any) => skill.path) });
             expect(previewResponse.statusCode).toBe(200);
             const preview = previewResponse.json();
             expect(preview.plugin.commit).toBe(pluginCommit);
@@ -821,15 +825,15 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const malformedRef = await user('POST', '/skills/catalog/import', { ...scope, pluginName: 'helper', selectedPaths: ['../escape/SKILL.md'], previewCommit: preview.plugin.commit, previewCatalogCommit: preview.catalog.commit });
             expect(malformedRef.statusCode).toBe(400);
             missingNested = true;
-            const reducedPreview = (await user('POST','/skills/catalog/preview',{...scope,pluginName:'helper'})).json();
+            const reducedPreview = (await user('POST','/skills/catalog/preview',{...scope,pluginName:'helper',selectedPaths:[preview.skills[1].path]})).json();
             expect(reducedPreview.skills[1].bundleFiles.some((file:any)=>file.path==='references/nested.md')).toBe(false);
             missingNested = false;
             invalidDescription = true;
-            expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).json().skills[2].unsupportedDependency).toContain('frontmatter');
+            expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper', selectedPaths: ['plugins/helper/skills/unsupported-dependency/SKILL.md'] })).json().skills[2].unsupportedDependency).toContain('frontmatter');
             invalidDescription = false; invalidManifest = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).statusCode).toBe(400);
             invalidManifest = false; invalidRef = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).statusCode).toBe(502);
-            invalidRef = false; oversizedSkill = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).json().skills[0].unsupportedDependency).toContain('too large');
-            oversizedSkill = false; invalidUtf8 = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper' })).json().skills[0].unsupportedDependency).toContain('UTF-8');
+            invalidRef = false; oversizedSkill = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper', selectedPaths: ['plugins/helper/skills/first-skill/SKILL.md'] })).json().skills[0].unsupportedDependency).toContain('too large');
+            oversizedSkill = false; invalidUtf8 = true; expect((await user('POST', '/skills/catalog/preview', { ...scope, pluginName: 'helper', selectedPaths: ['plugins/helper/skills/first-skill/SKILL.md'] })).json().skills[0].unsupportedDependency).toContain('UTF-8');
             invalidUtf8 = false; overflowCatalog = true;
             expect((await user('POST', '/skills/catalog', scope)).statusCode).toBe(400);
             expect(streamedBodyCancelled).toBe(true);

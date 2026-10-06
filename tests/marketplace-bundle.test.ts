@@ -37,12 +37,24 @@ async function fixture() {
       if(url.pathname.includes('/commits/'))return Response.json({sha:catalog?catalogCommit:commit});
       if(url.pathname.includes('/git/trees/'))return Response.json({truncated:state.truncated,tree:[...files].filter(([p])=>catalog?p==='marketplace.json':p!=='marketplace.json').map(([p,b])=>({path:p,type:'blob',mode:state.symlink&&p.endsWith('scripts/check')?'120000':p.endsWith('scripts/check')?'100755':'100644',sha:gitBlobHash(b),size:b.length}))});
       if(url.pathname.includes('/git/blobs/')){const b=[...files.values()].find(b=>gitBlobHash(b)===url.pathname.split('/').at(-1));if(b)return Response.json({encoding:'base64',content:b.toString('base64'),size:b.length});}
-      if(url.hostname==='raw.githubusercontent.com'){state.activeRaw++;state.maxRaw=Math.max(state.maxRaw,state.activeRaw);await new Promise(resolve=>setTimeout(resolve,1));const path=decodeURIComponent(url.pathname.split('/').slice(4).join('/'));if(state.rawTimeout&&(!state.rawFailurePath||state.rawFailurePath===path)){state.activeRaw--;throw Object.assign(new Error('timed out'),{name:'TimeoutError'});}const original=files.get(path);const body=original&&state.rawCorrupt&&path.startsWith('skills/one/')?Buffer.from(original):original;if(body&&body!==original)body[0]=(body[0]??0)^1;const response=state.rawStatus!==200&&(!state.rawFailurePath||state.rawFailurePath===path)?new Response(null,{status:state.rawStatus}):new Response(body??null);state.activeRaw--;return response;}
+      if(url.hostname==='raw.githubusercontent.com'){
+        const path=decodeURIComponent(url.pathname.split('/').slice(4).join('/'));state.activeRaw++;state.maxRaw=Math.max(state.maxRaw,state.activeRaw);
+        await new Promise(resolve=>setTimeout(resolve,state.rawFailurePath===path?0:10));
+        if(init?.signal?.aborted){state.activeRaw--;throw Object.assign(new Error('aborted'),{name:'AbortError'});}
+        if(state.rawTimeout&&(!state.rawFailurePath||state.rawFailurePath===path)){state.activeRaw--;throw Object.assign(new Error('timed out'),{name:'TimeoutError'});}
+        const original=files.get(path);const body=original&&state.rawCorrupt&&path.startsWith('skills/one/')?Buffer.from(original):original;if(body&&body!==original)body[0]=(body[0]??0)^1;
+        const response=state.rawStatus!==200&&(!state.rawFailurePath||state.rawFailurePath===path)?new Response(null,{status:state.rawStatus}):new Response(body??null);state.activeRaw--;return response;
+      }
       return new Response(null,{status:404});
     },
   });
   const payload={scope:'project',projectId:'p',catalogUrl:'https://github.com/example/catalog/blob/fixed/marketplace.json',pluginName:'fixture',previewCommit:commit,previewCatalogCommit:catalogCommit,selectedPaths:['skills/one/SKILL.md','skills/two/SKILL.md']};
   return {app,state,files,payload,requests,rawAuthorization,rawRedirects,apiAuthorization,records:()=>records};
+}
+function add71FileSkill(files: Map<string, Buffer>) {
+  const markdownBytes=files.get('skills/one/SKILL.md')!.byteLength;
+  for(let index=0;index<69;index++)files.set(`skills/one/references/${index}.md`,Buffer.alloc(2924,65));
+  files.set('skills/one/references/69.md',Buffer.alloc(204_725-markdownBytes-69*2924,65));
 }
 it('imports exact full regular-file bundles through production preview/import and direct GitHub routes',async()=>{
   const f=await fixture();try{
@@ -73,16 +85,22 @@ it('rejects whole multiselection on incomplete/unsafe files, permission denial a
 it('lists metadata without skill reads and hydrates only the selected public 71-file skill from pinned raw bytes',async()=>{
   const f=await fixture();
   try {
-    for(let index=0;index<70;index++) f.files.set(`skills/one/references/${index}.md`,Buffer.from(`reference ${index}`));
+    add71FileSkill(f.files);
     f.state.publicRepo=true;
     const metadata=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture'}});
     expect(metadata.statusCode).toBe(200); expect(metadata.json().skills).toHaveLength(2);
     expect(metadata.json().skills[0]).not.toHaveProperty('bundleSha256');
     expect(f.requests.some(url=>url.includes('/git/blobs/'))).toBe(false);
+    expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/')&&new URL(url).pathname.includes('/skills/'))).toBe(false);
+    const invalidPaths=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/missing/SKILL.md']}});
+    expect(invalidPaths.statusCode).toBe(400);expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/')&&new URL(url).pathname.includes('/skills/'))).toBe(false);
+    const duplicatePaths=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md','skills/one/SKILL.md']}});
+    expect(duplicatePaths.statusCode).toBe(400);expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/')&&new URL(url).pathname.includes('/skills/'))).toBe(false);
     const original=f.app;
     // The fixture fetcher returns raw bytes; enforce and observe its bounded concurrency through the request list.
     const hydrated=await original.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
     expect(hydrated.statusCode).toBe(200); expect(hydrated.json().skills[0].bundleFiles).toHaveLength(71);
+    expect(hydrated.json().skills[0].bundleFiles.reduce((total:number,file:{bytes:number})=>total+file.bytes,0)).toBe(204_725);
     expect(f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/'))).toHaveLength(73); // catalog, plugin manifest, then 71 selected files
     expect(f.state.maxRaw).toBeLessThanOrEqual(4);
     expect(f.rawRedirects.every(value=>value==='error')).toBe(true);
@@ -97,6 +115,7 @@ it('lists metadata without skill reads and hydrates only the selected public 71-
 it('reports public raw 403 and never forwards the configured token to raw hosts',async()=>{
   const f=await fixture();
   try {
+    add71FileSkill(f.files);
     f.state.publicRepo=true;
     f.state.rawStatus=403;
     f.state.rawFailurePath='skills/one/SKILL.md';
@@ -104,6 +123,7 @@ it('reports public raw 403 and never forwards the configured token to raw hosts'
     expect(response.statusCode).toBe(502); expect(response.json().message).toContain('403');
     expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/')&&url.endsWith('/skills/one/SKILL.md'))).toBe(true);
     expect(f.rawAuthorization.every(value=>value==='')); expect(f.apiAuthorization.every(value=>value==='Bearer fixture-token')).toBe(true);
+    expect(f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/')&&new URL(url).pathname.includes('/skills/one/'))).toHaveLength(4);
     f.state.rawStatus=200; f.state.rawTimeout=true;
     const timeout=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
     expect(timeout.statusCode).toBe(502); expect(timeout.json().message).toMatch(/timed out/u); expect(f.records()).toEqual([]); expect(f.state.activeRaw).toBe(0);
@@ -147,7 +167,7 @@ async function codexLocalFixture(options: { path?: string; dual?: boolean; ident
     ['plugins/airtable/skills/airtable-overview/SKILL.md',Buffer.from('---\nname: airtable-overview\ndescription: Explains Airtable structure.\n---\nInstructions only.')],
   ]);
   if(options.dual) files.set('plugins/airtable/plugin.json',Buffer.from(JSON.stringify({$schema:'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',name:'airtable',version:'0.2.0',description:'Portable canonical identity',extensions:{'com.openai':{interface:{displayName:'Inline OpenAI overlay'}}}})));
-  const state={denied:false,truncated:false,symlink:false,commitMismatch:false,failWrite:0,writes:0};
+  const state={denied:false,truncated:false,symlink:false,commitMismatch:false,catalogMoved:false,failWrite:0,writes:0};
   let records:Setting[]=[];
   const store=new WorkbenchStore(null as unknown as Sql);
   vi.spyOn(store,'list').mockImplementation(async()=>structuredClone(records));
@@ -160,6 +180,7 @@ async function codexLocalFixture(options: { path?: string; dual?: boolean; ident
     fetcher:async input=>{
       const url=new URL(String(input));requests.push(url.href);
       if(url.pathname.startsWith('/repos/') && !/\/(commits|git)\//u.test(url.pathname))return Response.json({private:true});
+      if(url.pathname.endsWith('/commits/main'))return Response.json({sha:state.catalogMoved?'c'.repeat(40):commit});
       if(url.pathname.includes('/commits/'))return Response.json({sha:state.commitMismatch?'c'.repeat(40):commit});
       if(url.pathname.includes('/git/trees/'))return Response.json({truncated:state.truncated,tree:[...files].map(([path,bytes])=>({path,type:'blob',mode:'100644',sha:gitBlobHash(bytes),size:bytes.length}))});
       if(url.pathname.includes('/git/blobs/')){const bytes=[...files.values()].find(bytes=>gitBlobHash(bytes)===url.pathname.split('/').at(-1));if(bytes)return Response.json({encoding:'base64',content:bytes.toString('base64'),size:bytes.length});}
@@ -180,7 +201,7 @@ it('resolves the official same-repository local catalog entry at its immutable c
     expect(preview.json().skills.map((skill:{path:string})=>skill.path)).toEqual(f.payload.selectedPaths);
     expect(f.requests.filter(url=>new URL(url).pathname==='/repos/openai/plugins')).toHaveLength(1);
     expect(preview.json().unsupported).toEqual(expect.arrayContaining(['.codex-plugin/plugin.json:apps','plugins/airtable/.app.json','plugins/airtable/.mcp.json']));
-    expect(f.requests.every(url=>new URL(url).pathname.startsWith('/repos/openai/plugins/'))).toBe(true);
+    expect(f.requests.every(url=>{const path=new URL(url).pathname;return path==='/repos/openai/plugins'||path.startsWith('/repos/openai/plugins/');})).toBe(true);
     expect(f.requests.some(url=>url.includes('/commits/5fd93af4cd0c623e020d0cc7e9ce178b4ac1f70f'))).toBe(true);
     expect(f.requests.filter(url=>url.includes('/git/trees/')).every(url=>url.includes(`/git/trees/${f.payload.previewCatalogCommit}?recursive=1`))).toBe(true);
     const result=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:f.payload});
@@ -194,7 +215,7 @@ it('resolves the official same-repository local catalog entry at its immutable c
       expect(skill.data.unsupportedPluginComponents).toEqual(expect.arrayContaining(['plugins/airtable/.app.json','plugins/airtable/.mcp.json']));
       expect(skill.data.provider).toBeUndefined();
     }
-    expect(f.requests.every(url=>new URL(url).pathname.startsWith('/repos/openai/plugins/'))).toBe(true);
+    expect(f.requests.every(url=>{const path=new URL(url).pathname;return path==='/repos/openai/plugins'||path.startsWith('/repos/openai/plugins/');})).toBe(true);
   }finally{await f.app.close();}
 });
 
@@ -275,8 +296,11 @@ it('rejects local path escape and conflicting dual-manifest identity before impo
     expect(response.statusCode).toBe(502);expect(response.json().message).toMatch(/immutable commit SHA/u);
   }finally{await f.app.close();}
   const changed=await codexLocalFixture();try{
-    changed.state.commitMismatch=true;
-    const response=await changed.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:changed.payload});
+    const request={scope:changed.payload.scope,projectId:'p',catalogUrl:changed.payload.catalogUrl.replace(/\/blob\/[a-f0-9]{40}\//u,'/blob/main/'),pluginName:'airtable'};
+    const preview=await changed.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:request});
+    expect(preview.statusCode).toBe(200);
+    changed.state.catalogMoved=true;
+    const response=await changed.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:{...request,selectedPaths:changed.payload.selectedPaths,previewCommit:preview.json().plugin.commit,previewCatalogCommit:preview.json().catalog.commit}});
     expect(response.statusCode).toBe(409);expect(response.json().message).toMatch(/changed after preview/u);expect(changed.records()).toEqual([]);
   }finally{await changed.app.close();}
 });

@@ -4,7 +4,8 @@ import type { Sql } from 'postgres';
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { WorkbenchStore } from "./store.js";
-import { collectSkillBundle, skillMarkdown, bytesHash, SKILL_BOUNDS } from "./skill-bundle.js";
+import { collectSkillBundle, skillMarkdown, bytesHash, gitBlobHash, SKILL_BOUNDS } from "./skill-bundle.js";
+import type { SkillTreeEntry } from "./skill-bundle-types.js";
 import type { Project, Message, Setting } from "./types.js";
 import { verifySlackRequest } from "../gateway/slack-events.js";
 interface SourceOptions {
@@ -227,14 +228,21 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         const skillFiles = entries.filter(item => item.path.startsWith(`${prefix}skills/`) && item.path.endsWith('/SKILL.md'));
         if (skillFiles.length > MAX_SKILLS) fail(400, 'Plugin exceeds supported skill count');
         const skills: Array<{ name: string; description: string; license?: string; sourcePath: string; content: string; bundle?: Awaited<ReturnType<typeof collectSkillBundle>>; dependencyError?: string; contentSha256: string; sourceContentSha256?: string }> = [];
-        const readResource = async (entry: typeof tree[number]) => !privateRepo
-            ? publicGitBytes(plugin.owner!, plugin.repo!, commit, entry, SKILL_BOUNDS.fileBytes, deadline)
-            : gitBytes(plugin.owner!, plugin.repo!, entry.sha, SKILL_BOUNDS.fileBytes, deadline);
+        const selectedSet = new Set(selectedPaths);
+        if (selectedSet.size !== selectedPaths.length) fail(400, 'Duplicate selected skills are not allowed');
+        const availablePaths = new Set(skillFiles.map(file => file.path));
+        if (selectedPaths.some(path => !availablePaths.has(path))) fail(400, 'One or more selected skills are unavailable or invalid');
+        const readResource = async (entry: SkillTreeEntry, readSignal: AbortSignal) => {
+            const signal = AbortSignal.any([deadline, readSignal]);
+            return !privateRepo
+                ? publicGitBytes(plugin.owner!, plugin.repo!, commit, entry, SKILL_BOUNDS.fileBytes, signal)
+                : gitBytes(plugin.owner!, plugin.repo!, entry.sha, SKILL_BOUNDS.fileBytes, signal);
+        };
         for (const file of skillFiles) {
             const sourcePath = file.path;
             const root = sourcePath.slice(0, -'/SKILL.md'.length);
             const name = root.split('/').at(-1)!;
-            if (selectedPaths.length && !selectedPaths.includes(sourcePath)) { skills.push({ name, description: '', sourcePath, content: '', contentSha256: bytesHash('') }); continue; }
+            if (!selectedSet.has(sourcePath)) { skills.push({ name, description: '', sourcePath, content: '', contentSha256: bytesHash('') }); continue; }
             let bundle: Awaited<ReturnType<typeof collectSkillBundle>> | undefined;
             let content = ''; let metadata = { name, description: '', license: undefined as string | undefined };
             try {
@@ -367,11 +375,12 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         const [owner,repo,,ref,...path]=parts;
         if(!owner||!repo||!ref||![owner,repo].every(p=>/^[A-Za-z0-9_.-]+$/.test(p)))fail(400,'Invalid skill repository');
         const requestedRef = decodeURIComponent(ref!);
-        const commit = await resolveCommit(owner!, repo!, requestedRef);
-        const tree = await gitTree(owner!, repo!, commit);
+        const deadline = AbortSignal.timeout(45_000);
+        const commit = await resolveCommit(owner!, repo!, requestedRef, deadline);
+        const tree = await gitTree(owner!, repo!, commit, deadline);
         const sourcePath = safeRepoPath(path.join('/'));
         const root = sourcePath === 'SKILL.md' ? '' : sourcePath.slice(0, -'/SKILL.md'.length);
-        const bundle = await collectSkillBundle(tree, root, commit, entry => gitBytes(owner!, repo!, entry.sha, SKILL_BOUNDS.fileBytes));
+        const bundle = await collectSkillBundle(tree, root, commit, (entry, readSignal) => gitBytes(owner!, repo!, entry.sha, SKILL_BOUNDS.fileBytes, AbortSignal.any([deadline, readSignal])));
         const content = skillMarkdown(bundle);
         const metadata = parseSkillMarkdown(content, root ? root.split('/').at(-1)! : undefined);
         const skill:Setting={id:`setting_${crypto.randomUUID()}`,kind:'skill',projectId,name:input.name??metadata.name,data:{content,bundle,sourceUrl:input.url,enabled:true,installed:true,requestedRef,resolvedSha:commit,sourcePath,provenance:`${owner}/${repo}@${commit}:${sourcePath}`,contentSha256:bytesHash(content),sourceContentSha256:bundle.sha256},updatedAt:new Date().toISOString()};return store.transaction('skill-import',async tx=>{

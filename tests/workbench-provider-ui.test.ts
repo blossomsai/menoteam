@@ -54,12 +54,82 @@ async function typeInput(input: HTMLInputElement | HTMLTextAreaElement, value: s
 }
 async function choose(selector: string, value: string) { const select = host.querySelector<HTMLSelectElement>(selector)!; await flush(() => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }); }
 async function chooseSelect(select: HTMLSelectElement, value: string) { await flush(() => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }); }
+function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
 
 beforeEach(() => {
   vi.useFakeTimers(); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('Unexpected live fetch in mounted UI test'))));
   sessionStorage.clear();
   window.history.replaceState(null, '', '/workbench/?view=model-providers');
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
+});
+
+describe('mounted marketplace skill selection', () => {
+  const catalogUrl = 'https://github.com/example/catalog/blob/main/marketplace.json';
+  const listing = { name: 'Catalog', url: catalogUrl, commit: 'catalog-a', plugins: [{ name: 'alpha', description: '', category: 'Test' }, { name: 'beta', description: '', category: 'Test' }] };
+  const pluginPreview = (pluginName = 'alpha', catalogCommit = 'catalog-a', pluginCommit = 'plugin-a') => ({
+    catalog: { name: listing.name, url: catalogUrl, commit: catalogCommit },
+    plugin: { name: pluginName, description: '', commit: pluginCommit, version: null }, unsupported: [],
+    skills: ['one', 'two'].map(name => ({ name, description: `Metadata ${name}`, license: null, path: `skills/${name}/SKILL.md` })),
+  });
+  const hydratedPreview = (catalogCommit = 'catalog-a', pluginCommit = 'plugin-a') => ({
+    ...pluginPreview('alpha', catalogCommit, pluginCommit),
+    skills: ['one', 'two'].map(name => ({ name, description: `Verified ${name}`, license: null, path: `skills/${name}/SKILL.md`, content: `---\nname: ${name}\ndescription: Verified ${name}\n---\n`, includedReferences: [], bundleFiles: [{ path: 'SKILL.md', mode: '100644', bytes: 42, sha256: 'a'.repeat(64) }], bundleSha256: `${name === 'one' ? 'b' : 'c'}${'0'.repeat(63)}`, contentSha256: 'd'.repeat(64) })),
+  });
+  async function openMarketplace(current = snapshot()) {
+    localStorage.clear();
+    window.history.replaceState(null, '', '/workbench/?view=skills&project=project');
+    vi.spyOn(workbenchApi, 'listCatalog').mockResolvedValue(listing);
+    await mount(current);
+    await type('#marketplace-url-project', catalogUrl);
+    const form = host.querySelector<HTMLInputElement>('#marketplace-url-project')!.closest('form')!;
+    await flush(() => form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+    await choose('#marketplace-plugin-project', 'alpha');
+  }
+  async function inspectPlugin() { await flush(() => button('Inspect plugin').click()); }
+  async function selectFirstSkill() { await flush(() => host.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click()); }
+
+  it('drops hydration results after the selection, plugin or project changes', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>>();
+    const previewCall = vi.spyOn(workbenchApi, 'previewCatalogPlugin').mockImplementation(input => input.selectedPaths ? pending.promise : Promise.resolve(pluginPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>));
+    const projects = [project, { ...project, id: 'project-b', name: 'Project B' }];
+    await openMarketplace({ ...snapshot(), projects });
+    await inspectPlugin(); await selectFirstSkill(); await flush(() => button('Load selected skill details').click());
+    expect(previewCall.mock.calls.at(-1)?.[0].selectedPaths).toEqual(['skills/one/SKILL.md']);
+    await flush(() => host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[1]!.click());
+    pending.resolve(hydratedPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>);
+    await flush();
+    expect(host.textContent).not.toContain('Inspect verified SKILL.md');
+    expect(button('Import 2 selected skills').disabled).toBe(true);
+
+    const nextPending = deferred<Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>>();
+    previewCall.mockImplementation(input => input.selectedPaths ? nextPending.promise : Promise.resolve(pluginPreview(input.pluginName) as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>));
+    await flush(() => button('Load selected skill details').click());
+    await choose('#marketplace-plugin-project', 'beta');
+    nextPending.resolve(hydratedPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>);
+    await flush();
+    expect(host.textContent).not.toContain('Verified one');
+    expect(host.textContent).not.toContain('Inspect verified SKILL.md');
+
+    await choose('#marketplace-plugin-project', 'alpha'); await inspectPlugin(); await selectFirstSkill();
+    const projectPending = deferred<Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>>();
+    previewCall.mockImplementation(input => input.selectedPaths ? projectPending.promise : Promise.resolve(pluginPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>));
+    await flush(() => button('Load selected skill details').click());
+    window.history.replaceState(null, '', '/workbench/?view=skills&project=project-b');
+    await flush(() => root.render(createElement(App)));
+    projectPending.resolve(hydratedPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>);
+    await flush();
+    expect(host.textContent).not.toContain('Inspect verified SKILL.md');
+    expect(host.textContent).not.toContain('Verified one');
+  });
+
+  it.each(['catalog', 'plugin'] as const)('invalidates selection when hydrated %s commit moves', async moved => {
+    vi.spyOn(workbenchApi, 'previewCatalogPlugin').mockImplementation(input => Promise.resolve(input.selectedPaths ? hydratedPreview(moved === 'catalog' ? 'catalog-b' : 'catalog-a', moved === 'plugin' ? 'plugin-b' : 'plugin-a') : pluginPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>));
+    await openMarketplace(); await inspectPlugin(); await selectFirstSkill();
+    await flush(() => button('Load selected skill details').click());
+    expect(host.textContent).toContain('changed. Inspect the plugin again');
+    expect(host.textContent).not.toContain('Inspect verified SKILL.md');
+    expect(host.textContent).not.toContain('Import 1 selected skill');
+  });
 });
 afterEach(async () => { await flush(() => root.unmount()); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
