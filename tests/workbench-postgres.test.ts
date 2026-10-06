@@ -548,11 +548,20 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(stopped.status).toBe('interrupted');expect(stopped.stoppedAt).toBeTruthy();
     });
     it('Master and UI share scoped optimistic settings updates with original actor authority',async()=>{
+        const fixture={projectId:'',memberEmail:'settings-member@test.example',memberDigest:'',settingIds:[] as string[]};
+        const deniedProjectName=`Denied project ${randomUUID()}`;
+        const deniedWorkspaceName=`Denied workspace ${randomUUID()}`;
+        const preservedMemberships=(await sql`SELECT user_id,role FROM wb_memberships WHERE project_id=${projectId} ORDER BY user_id`).map(row=>[String(row.user_id),String(row.role)]);
+        try{
         const p=(await user('POST','/projects',{name:'Settings operations'})).json();
+        fixture.projectId=p.id;
         const credential=(await enrollProvider('settings-connector',[p.id])).token;
         const skill=(await user('POST','/settings',{projectId:p.id,kind:'skill',name:'Original',data:{content:'Original instructions'}})).json();
+        fixture.settingIds.push(skill.id);
         const outside=(await user('POST','/settings',{projectId,kind:'skill',name:'Outside project',data:{content:'Protected'}})).json();
+        fixture.settingIds.push(outside.id);
         const profile=(await user('POST','/settings',{kind:'profile',name:'Workspace profile',data:{model:'gpt-6-luna',reasoning:'medium',skillIds:[]}})).json();
+        fixture.settingIds.push(profile.id);
         await user('POST',`/projects/${p.id}/messages`,{text:'Update the project skill',requestId:'settings-owner-master'});
         const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:connectorFixturePayload(path,payload) as never});
         const run=(await send('/claim',{})).json().run;
@@ -574,10 +583,264 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const accepted=await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invite.token,name:'Member',password:'member-test-password'}});
         expect(accepted.json().email).toBe('settings-member@test.example');
         const login=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:accepted.json().email,password:'member-test-password'}});
-        await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:String(login.headers['set-cookie']).split(';')[0]!},payload:{text:'Change settings',requestId:'settings-member-master'}});
+        const memberCookie=String(login.headers['set-cookie']).split(';')[0]!;
+        fixture.memberDigest=digest(memberCookie.slice('menoteam_session='.length));
+        const memberMessage=await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:memberCookie},payload:{text:'Change settings',requestId:'settings-member-master'}});
+        expect(memberMessage.statusCode).toBe(200);
         const memberRun=(await send('/claim',{})).json().run;
+        const memberId=(await app.inject({method:'GET',url:'/api/workbench/me',headers:{cookie:memberCookie}})).json().id;
+        expect(memberRun).toMatchObject({kind:'master',projectId:p.id,requestedBy:memberId,id:memberMessage.json().run.id});
+        const connectorGrant=await sql`SELECT project_ids FROM wb_connectors WHERE id='settings-connector'`;
+        expect(connectorGrant[0]?.project_ids).toContain(p.id);
+        const memberSkill=(scope:string,requestId:string)=>send(`/runs/${memberRun.id}/tools`,{generation:memberRun.generation,action:'create_skill',input:{scope,name:scope==='project'?deniedProjectName:deniedWorkspaceName,data:{content:'Must not persist'}},requestId});
+        expect((await memberSkill('project','member-skill-project')).statusCode).toBe(403);
+        expect((await memberSkill('workspace','member-skill-workspace')).statusCode).toBe(403);
         expect((await tool(memberRun,{settingId:profile.id,expectedUpdatedAt:profile.updatedAt,name:'Escalate'},'member-workspace')).statusCode).toBe(403);
         expect((await tool(memberRun,{settingId:skill.id,expectedUpdatedAt:updated.updatedAt,name:'Escalate'},'member-project')).statusCode).toBe(403);
+        expect(await sql`SELECT id FROM wb_records WHERE kind='setting' AND data->>'name'=ANY(${[deniedProjectName,deniedWorkspaceName]})`).toHaveLength(0);
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`tools:${memberRun.id}`} AND request_id IN ('member-skill-project','member-skill-workspace','member-workspace','member-project')`).toHaveLength(0);
+        const afterDenied=await send(`/runs/${memberRun.id}/tools`,{generation:memberRun.generation,action:'read_context',input:{},requestId:'member-skill-readback-context'});
+        expect(afterDenied.json().settings.some((setting:any)=>setting.name===deniedProjectName||setting.name===deniedWorkspaceName)).toBe(false);
+        const memberWork=await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/works`,headers:{cookie:memberCookie},payload:{title:'Member created Work'}});
+        expect(memberWork.statusCode).toBe(200);
+        const workMessage=await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:memberCookie},payload:{workId:memberWork.json().id,text:'Member can continue Work',requestId:'settings-member-work-message'}});
+        expect(workMessage.statusCode).toBe(200);
+        const completedMember=await send(`/runs/${memberRun.id}/complete`,{generation:memberRun.generation,threadId:'settings-member-thread'});
+        expect(completedMember.statusCode).toBe(200);
+        const workRun=workMessage.json().run as Run;
+        const claimedWorkRun=checkedJson(await send('/claim',{})).run as Run;
+        expect(claimedWorkRun.id).toBe(workRun.id);
+        expect((await send(`/runs/${claimedWorkRun.id}/complete`,{generation:claimedWorkRun.generation,threadId:'settings-member-work-thread'})).statusCode).toBe(200);
+        }finally{
+            if(fixture.projectId){
+                const runs=await sql`SELECT id FROM wb_records WHERE kind='run' AND project_id=${fixture.projectId}`;
+                const runIds=runs.map(row=>String(row.id));
+                await sql`DELETE FROM wb_bridge_tokens WHERE run_id=ANY(${runIds})`;
+                await sql`DELETE FROM wb_requests WHERE scope=${`message:${fixture.projectId}`} OR scope=ANY(${runIds.map(id=>`tools:${id}`)})`;
+                await sql`DELETE FROM wb_records WHERE project_id=${fixture.projectId}`;
+                await sql`DELETE FROM wb_records WHERE id=${fixture.projectId} AND kind='project'`;
+                await sql`DELETE FROM wb_records WHERE id=ANY(${fixture.settingIds}) AND kind='setting'`;
+                await sql`DELETE FROM wb_records WHERE kind='setting' AND ((project_id=${fixture.projectId} AND data->>'name'=${deniedProjectName}) OR (project_id IS NULL AND data->>'name'=${deniedWorkspaceName}))`;
+                const providerSettingId=fixtureConnections.get('settings-connector');
+                if(providerSettingId)await sql`DELETE FROM wb_records WHERE id=${providerSettingId} AND kind='setting'`;
+                await sql`DELETE FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'='Fixture settings-connector'`;
+                await sql`DELETE FROM wb_connectors WHERE id='settings-connector'`;
+                await sql`DELETE FROM wb_invites WHERE email=${fixture.memberEmail} AND project_id=${fixture.projectId}`;
+                await sql`DELETE FROM wb_sessions WHERE digest=${fixture.memberDigest} OR user_id IN (SELECT id FROM wb_users WHERE email=${fixture.memberEmail})`;
+                await sql`DELETE FROM wb_memberships WHERE project_id=${fixture.projectId}`;
+                await sql`DELETE FROM wb_users WHERE email=${fixture.memberEmail}`;
+                expect(await sql`SELECT user_id FROM wb_memberships WHERE project_id=${fixture.projectId}`).toHaveLength(0);
+                expect((await sql`SELECT user_id,role FROM wb_memberships WHERE project_id=${projectId} ORDER BY user_id`).map(row=>[String(row.user_id),String(row.role)])).toEqual(preservedMemberships);
+            }
+        }
+    });
+    it('creates Master skills only in an explicitly authorized scope and reads back the same setting ID',async()=>{
+        const projectAdminWorkspaceSkillName=`Project admin escalation ${randomUUID()}`;
+        const projectAdminUiWorkspaceSkillName=`Project role workspace escalation ${randomUUID()}`;
+        const adminWorkspaceSkillName=`Admin workspace skill ${randomUUID()}`;
+        const fixture={projectId:'',settingIds:[] as string[],projectAdminEmail:'explicit-project-admin@test.example',workspaceAdminEmail:'explicit-workspace-admin@test.example',projectAdminDigest:'',workspaceAdminDigest:''};
+        const preservedMemberships=(await sql`SELECT user_id,role FROM wb_memberships WHERE project_id=${projectId} ORDER BY user_id`).map(row=>[String(row.user_id),String(row.role)]);
+        try{
+        const p=checkedJson(await user('POST','/projects',{name:'Explicit skill scope'})) as Project;
+        fixture.projectId=p.id;
+        const credential=(await enrollProvider('explicit-skill-scope-connector',[p.id])).token;
+        await user('POST',`/projects/${p.id}/messages`,{text:'Create two scoped skills',requestId:'explicit-skill-scopes'});
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${credential}`},payload:connectorFixturePayload(path,payload) as never});
+        const run=checkedJson(await send('/claim',{})).run as Run;
+        const create=(input:unknown,requestId:string)=>send(`/runs/${run.id}/tools`,{generation:run.generation,action:'create_skill',input,requestId});
+        expect((await create({name:'Implicit scope',data:{content:'Rejected without scope'}},'skill-no-scope')).statusCode).toBe(400);
+        expect((await create({scope:'workspace',projectId:p.id,name:'Mismatched scope',data:{content:'Rejected mismatch'}},'skill-mismatch')).statusCode).toBe(400);
+        const projectSkill=checkedJson(await create({scope:'project',name:'Project guidance',data:{content:'Project only'}},'skill-project'));
+        const workspaceSkill=checkedJson(await create({scope:'workspace',name:'Shared guidance',data:{content:'Workspace reusable'}},'skill-workspace'));
+        fixture.settingIds.push(workspaceSkill.id);
+        expect(checkedJson(await create({scope:'project',name:'Project guidance',data:{content:'Project only'}},'skill-project')).id).toBe(projectSkill.id);
+        expect(checkedJson(await create({scope:'workspace',name:'Shared guidance',data:{content:'Workspace reusable'}},'skill-workspace')).id).toBe(workspaceSkill.id);
+        expect((await create({scope:'workspace',name:'Project guidance',data:{content:'Project only'}},'skill-project')).statusCode).toBe(409);
+        expect((await create({scope:'project',name:'Shared guidance',data:{content:'Workspace reusable'}},'skill-workspace')).statusCode).toBe(409);
+        expect((await create({scope:'project',name:'Project guidance renamed',data:{content:'Project only'}},'skill-project')).statusCode).toBe(409);
+        expect((await create({scope:'project',name:'Project guidance',data:{content:'Changed'}},'skill-project')).statusCode).toBe(409);
+        expect(await sql`SELECT id FROM wb_records WHERE kind='setting' AND data->>'name' IN ('Project guidance','Shared guidance')`).toHaveLength(2);
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`tools:${run.id}`} AND request_id IN ('skill-project','skill-workspace')`).toHaveLength(2);
+        expect(projectSkill).toMatchObject({kind:'skill',projectId:p.id,name:'Project guidance'});
+        expect(workspaceSkill).toMatchObject({kind:'skill',name:'Shared guidance'});
+        expect(workspaceSkill).not.toHaveProperty('projectId');
+        const context=checkedJson(await send(`/runs/${run.id}/tools`,{generation:run.generation,action:'read_context',input:{},requestId:'explicit-skill-readback'}));
+        expect(context.settings.find((setting:any)=>setting.id===projectSkill.id)).toMatchObject({id:projectSkill.id,projectId:p.id});
+        expect(context.settings.find((setting:any)=>setting.id===workspaceSkill.id)).toMatchObject({id:workspaceSkill.id,name:'Shared guidance'});
+        expect(context.settings.find((setting:any)=>setting.id===workspaceSkill.id)).not.toHaveProperty('projectId');
+        const legacyProjectSkill={...projectSkill,id:'legacy-skill-project-replay',name:'Legacy scoped project',data:{content:'Legacy project content',enabled:true}};
+        const legacyWorkspaceSkill={...workspaceSkill,id:'legacy-skill-workspace-replay',name:'Legacy scoped workspace',data:{content:'Legacy workspace content',enabled:true}};
+        const legacyRequestIds=['legacy-project-request','legacy-workspace-request'];
+        const legacyRunScope=`tools:${run.id}`;
+        let actorDemoted=false;
+        let projectMembershipRole:string|undefined;
+        let projectMembershipDemoted=false;
+        try {
+            await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${legacyProjectSkill.id},'setting',${p.id},${sql.json(legacyProjectSkill as never)})`;
+            await sql`INSERT INTO wb_requests(scope,request_id,result) VALUES (${legacyRunScope},${legacyRequestIds[0]},${sql.json(legacyProjectSkill as never)})`;
+            await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${legacyWorkspaceSkill.id},'setting',NULL,${sql.json(legacyWorkspaceSkill as never)})`;
+            await sql`INSERT INTO wb_requests(scope,request_id,result) VALUES (${legacyRunScope},${legacyRequestIds[1]},${sql.json(legacyWorkspaceSkill as never)})`;
+            expect(checkedJson(await create({scope:'project',name:legacyProjectSkill.name,data:{content:'Legacy project content'}},legacyRequestIds[0])).id).toBe(legacyProjectSkill.id);
+            expect(checkedJson(await create({scope:'workspace',name:legacyWorkspaceSkill.name,data:{content:'Legacy workspace content'}},legacyRequestIds[1])).id).toBe(legacyWorkspaceSkill.id);
+            expect(checkedJson(await create({name:legacyProjectSkill.name,data:{content:'Legacy project content'}},legacyRequestIds[0])).id).toBe(legacyProjectSkill.id);
+            expect((await create({name:legacyWorkspaceSkill.name,data:{content:'Legacy workspace content'}},legacyRequestIds[1])).statusCode).toBe(409);
+            expect((await create({scope:'workspace',name:legacyProjectSkill.name,data:{content:'Legacy project content'}},legacyRequestIds[0])).statusCode).toBe(409);
+            expect((await create({scope:'project',name:legacyWorkspaceSkill.name,data:{content:'Legacy workspace content'}},legacyRequestIds[1])).statusCode).toBe(409);
+            expect((await create({scope:'project',name:'Changed legacy name',data:{content:'Legacy project content'}},legacyRequestIds[0])).statusCode).toBe(409);
+            expect((await create({scope:'workspace',name:legacyWorkspaceSkill.name,data:{content:'Changed legacy content'}},legacyRequestIds[1])).statusCode).toBe(409);
+            const projectMembership=await sql`SELECT role FROM wb_memberships WHERE project_id=${p.id} AND user_id=${run.requestedBy}`;
+            expect(projectMembership).toHaveLength(1);
+            projectMembershipRole=String(projectMembership[0]!.role);
+            expect(['owner','admin']).toContain(projectMembershipRole);
+            projectMembershipDemoted=true;
+            await sql`UPDATE wb_memberships SET role='member' WHERE project_id=${p.id} AND user_id=${run.requestedBy}`;
+            actorDemoted=true;
+            await sql`UPDATE wb_users SET role='member' WHERE id=${run.requestedBy}`;
+            expect((await create({scope:'project',name:legacyProjectSkill.name,data:{content:'Legacy project content'}},legacyRequestIds[0])).statusCode).toBe(403);
+            expect((await create({scope:'workspace',name:legacyWorkspaceSkill.name,data:{content:'Legacy workspace content'}},legacyRequestIds[1])).statusCode).toBe(403);
+            expect(await sql`SELECT id FROM wb_records WHERE id=ANY(${[legacyProjectSkill.id,legacyWorkspaceSkill.id]}) AND kind='setting'`).toHaveLength(2);
+            const unchangedLegacyRequests=await sql`SELECT request_id,result FROM wb_requests WHERE scope=${legacyRunScope} AND request_id=ANY(${legacyRequestIds})`;
+            expect(unchangedLegacyRequests).toHaveLength(2);
+            expect(unchangedLegacyRequests.every(row=>!(row.result as Record<string,unknown>).__toolRequest)).toBe(true);
+            expect((await create({name:'Fresh implicit scope',data:{content:'Must not create'}},'fresh-implicit-scope')).statusCode).toBe(400);
+            expect(await sql`SELECT id FROM wb_records WHERE id=ANY(${[legacyProjectSkill.id,legacyWorkspaceSkill.id]}) AND kind='setting'`).toHaveLength(2);
+            expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${legacyRunScope} AND request_id=ANY(${legacyRequestIds})`).toHaveLength(2);
+            expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${legacyRunScope} AND request_id='fresh-implicit-scope'`).toHaveLength(0);
+            expect(await sql`SELECT id FROM wb_records WHERE kind='setting' AND data->>'name'='Fresh implicit scope'`).toHaveLength(0);
+        } finally {
+            if(projectMembershipDemoted&&projectMembershipRole)await sql`UPDATE wb_memberships SET role=${projectMembershipRole} WHERE project_id=${p.id} AND user_id=${run.requestedBy}`;
+            if(actorDemoted)await sql`UPDATE wb_users SET role='owner' WHERE id=${run.requestedBy}`;
+            await sql`DELETE FROM wb_requests WHERE scope=${legacyRunScope} AND request_id=ANY(${legacyRequestIds})`;
+            await sql`DELETE FROM wb_records WHERE kind='setting' AND ((id=${legacyProjectSkill.id} AND project_id=${p.id}) OR (id=${legacyWorkspaceSkill.id} AND project_id IS NULL))`;
+        }
+        await send(`/runs/${run.id}/complete`,{generation:run.generation,threadId:'explicit-skill-scope-thread'});
+        const projectAdminInvite=checkedJson(await user('POST','/invites',{email:'explicit-project-admin@test.example',projectId:p.id,role:'admin'}));
+        checkedJson(await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:projectAdminInvite.token,name:'Project Admin',password:'explicit-project-admin-password'}}));
+        const projectAdminLogin=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:'explicit-project-admin@test.example',password:'explicit-project-admin-password'}});
+        const projectAdminCookie=String(projectAdminLogin.headers['set-cookie']).split(';')[0]!;
+        fixture.projectAdminDigest=digest(projectAdminCookie.slice('menoteam_session='.length));
+        await app.inject({method:'POST',url:`/api/workbench/projects/${p.id}/messages`,headers:{cookie:projectAdminCookie},payload:{text:'Create project scoped skill',requestId:'project-admin-skill'}});
+        const projectAdminRun=checkedJson(await send('/claim',{})).run as Run;
+        const projectAdminTool=(input:unknown,requestId:string)=>send(`/runs/${projectAdminRun.id}/tools`,{generation:projectAdminRun.generation,action:'create_skill',input,requestId});
+        expect((await projectAdminTool({scope:'workspace',name:projectAdminWorkspaceSkillName,data:{content:'Forbidden'}},'project-admin-workspace')).statusCode).toBe(403);
+        expect(checkedJson(await projectAdminTool({scope:'project',name:'Project admin skill',data:{content:'Allowed'}},'project-admin-project'))).toMatchObject({projectId:p.id,name:'Project admin skill'});
+        expect((await app.inject({method:'POST',url:'/api/workbench/settings',headers:{cookie:projectAdminCookie},payload:{kind:'skill',name:projectAdminUiWorkspaceSkillName,data:{content:'Forbidden'}}})).statusCode).toBe(403);
+        expect(await sql`SELECT id FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'=ANY(${[projectAdminWorkspaceSkillName,projectAdminUiWorkspaceSkillName]})`).toHaveLength(0);
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`tools:${projectAdminRun.id}`} AND request_id='project-admin-workspace'`).toHaveLength(0);
+        await send(`/runs/${projectAdminRun.id}/complete`,{generation:projectAdminRun.generation,threadId:'project-admin-skill-thread'});
+        const workspaceAdminInvite=checkedJson(await user('POST','/invites',{email:'explicit-workspace-admin@test.example',role:'admin'}));
+        checkedJson(await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:workspaceAdminInvite.token,name:'Workspace Admin',password:'explicit-scope-admin-password'}}));
+        const adminLogin=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:'explicit-workspace-admin@test.example',password:'explicit-scope-admin-password'}});
+        const adminCookie=String(adminLogin.headers['set-cookie']).split(';')[0]!;
+        fixture.workspaceAdminDigest=digest(adminCookie.slice('menoteam_session='.length));
+        expect(adminLogin.statusCode).toBe(200);
+        const adminSkill=await app.inject({method:'POST',url:'/api/workbench/settings',headers:{cookie:adminCookie},payload:{kind:'skill',name:adminWorkspaceSkillName,data:{content:'Authorized'}}});
+        if(adminSkill.statusCode===200)fixture.settingIds.push(String(adminSkill.json().id));
+        expect(adminSkill.statusCode).toBe(200);
+        expect(adminSkill.json()).toMatchObject({kind:'skill',name:adminWorkspaceSkillName});
+        expect(adminSkill.json()).not.toHaveProperty('projectId');
+        const adminSnapshot=await app.inject({method:'GET',url:'/api/workbench/snapshot',headers:{cookie:adminCookie}});
+        expect(adminSnapshot.json().settings.find((setting:any)=>setting.id===adminSkill.json().id)).toMatchObject({id:adminSkill.json().id,kind:'skill',name:adminWorkspaceSkillName});
+        expect(adminSnapshot.json().settings.find((setting:any)=>setting.id===adminSkill.json().id)).not.toHaveProperty('projectId');
+        }finally{
+            if(fixture.projectId){
+                const runs=await sql`SELECT id FROM wb_records WHERE kind='run' AND project_id=${fixture.projectId}`;
+                const runIds=runs.map(row=>String(row.id));
+                await sql`DELETE FROM wb_bridge_tokens WHERE run_id=ANY(${runIds})`;
+                await sql`DELETE FROM wb_requests WHERE scope=${`message:${fixture.projectId}`} OR scope=ANY(${runIds.map(id=>`tools:${id}`)})`;
+                await sql`DELETE FROM wb_records WHERE project_id=${fixture.projectId}`;
+                await sql`DELETE FROM wb_records WHERE id=${fixture.projectId} AND kind='project'`;
+                await sql`DELETE FROM wb_records WHERE id=ANY(${fixture.settingIds}) AND kind='setting'`;
+                await sql`DELETE FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'=ANY(${[projectAdminWorkspaceSkillName,projectAdminUiWorkspaceSkillName,adminWorkspaceSkillName]})`;
+                const providerSettingId=fixtureConnections.get('explicit-skill-scope-connector');
+                if(providerSettingId)await sql`DELETE FROM wb_records WHERE id=${providerSettingId} AND kind='setting'`;
+                await sql`DELETE FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'='Fixture explicit-skill-scope-connector'`;
+                await sql`DELETE FROM wb_connectors WHERE id='explicit-skill-scope-connector'`;
+                await sql`DELETE FROM wb_invites WHERE email=${fixture.projectAdminEmail} AND project_id=${fixture.projectId}`;
+                await sql`DELETE FROM wb_invites WHERE email=${fixture.workspaceAdminEmail} AND project_id IS NULL`;
+                await sql`DELETE FROM wb_sessions WHERE digest IN (${fixture.projectAdminDigest||null},${fixture.workspaceAdminDigest||null}) OR user_id IN (SELECT id FROM wb_users WHERE email=ANY(${[fixture.projectAdminEmail,fixture.workspaceAdminEmail]}))`;
+                await sql`DELETE FROM wb_memberships WHERE project_id=${fixture.projectId}`;
+                await sql`DELETE FROM wb_users WHERE email=ANY(${[fixture.projectAdminEmail,fixture.workspaceAdminEmail]})`;
+                expect(await sql`SELECT user_id FROM wb_memberships WHERE project_id=${fixture.projectId}`).toHaveLength(0);
+                expect((await sql`SELECT user_id,role FROM wb_memberships WHERE project_id=${projectId} ORDER BY user_id`).map(row=>[String(row.user_id),String(row.role)])).toEqual(preservedMemberships);
+            }
+        }
+    });
+    it('revalidates the live session and current role after waiting for the settings transaction lock',async()=>{
+        const logoutSettingName=`Revoked session barrier ${randomUUID()}`;
+        const roleSettingName=`Demoted role barrier ${randomUUID()}`;
+        const ownerLogin=async(remote:string)=>app.inject({method:'POST',url:'/api/workbench/session',remoteAddress:remote,payload:{email:'owner@test.example',password:'workbench-test-password'}});
+        const waitForSettingsLock=async(before:Set<number>,blockerPid:number)=>{
+            for(let attempt=0;attempt<200;attempt++){
+                const waiting=await sql`SELECT pid,query FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%'`;
+                const newWaiters=waiting.filter(row=>Number(row.pid)!==blockerPid&&!before.has(Number(row.pid))&&String(row.query).includes('pg_advisory_xact_lock'));
+                if(newWaiters.length===1)return Number(newWaiters[0]!.pid);
+                await new Promise<void>(resolve=>setImmediate(resolve));
+            }
+            throw new Error('The single new settings request did not reach its advisory-lock barrier');
+        };
+        let ownerSessionDigest='';
+        let ownerId='';
+        let blocker:Awaited<ReturnType<typeof sql.reserve>>|undefined;
+        let pending:Promise<Awaited<ReturnType<typeof app.inject>>>|undefined;
+        try{
+            const ownerLoginResponse=await ownerLogin('127.0.0.61');
+            expect(checkedJson(ownerLoginResponse).authenticated).toBe(true);
+            const ownerCookie=String(ownerLoginResponse.headers['set-cookie']).split(';')[0]!;
+            ownerSessionDigest=digest(ownerCookie.slice('menoteam_session='.length));
+            ownerId=(await app.inject({method:'GET',url:'/api/workbench/me',headers:{cookie:ownerCookie}})).json().id as string;
+            blocker=await sql.reserve();
+            await blocker`BEGIN`;
+            await blocker`SELECT pg_advisory_xact_lock(hashtext('menoteam-workbench-state'))`;
+            const blockerPid=Number((await blocker`SELECT pg_backend_pid() AS pid`)[0]!.pid);
+            const existing=await sql`SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%'`;
+            const before=new Set(existing.map(row=>Number(row.pid)));
+            pending=app.inject({method:'POST',url:'/api/workbench/settings',remoteAddress:'127.0.0.63',headers:{cookie:ownerCookie},payload:{kind:'skill',name:logoutSettingName,data:{content:'Must not persist'}}});
+            expect(await waitForSettingsLock(before,blockerPid)).toBeGreaterThan(0);
+            expect((await app.inject({method:'POST',url:'/api/workbench/logout',remoteAddress:'127.0.0.64',headers:{cookie:ownerCookie}})).statusCode).toBe(200);
+            await blocker`COMMIT`;
+            expect((await pending).statusCode).toBe(401);
+            expect(await sql`SELECT id FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'=${logoutSettingName}`).toHaveLength(0);
+        }finally{
+            if(blocker){try{await blocker`ROLLBACK`;}catch{}blocker.release();}
+            if(pending)try{await pending;}catch{}
+            if(ownerSessionDigest)await sql`DELETE FROM wb_sessions WHERE digest=${ownerSessionDigest}`;
+            await sql`DELETE FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'=${logoutSettingName}`;
+        }
+        let refreshedSessionDigest='';
+        let roleSettingId='';
+        let roleBlocker:Awaited<ReturnType<typeof sql.reserve>>|undefined;
+        let rolePending:Promise<Awaited<ReturnType<typeof app.inject>>>|undefined;
+        let actorDemoted=false;
+        try{
+            const refreshed=await ownerLogin('127.0.0.65');
+            const refreshedCookie=String(refreshed.headers['set-cookie']).split(';')[0]!;
+            refreshedSessionDigest=digest(refreshedCookie.slice('menoteam_session='.length));
+            const roleSettingResponse=await app.inject({method:'POST',url:'/api/workbench/settings',remoteAddress:'127.0.0.67',headers:{cookie:refreshedCookie},payload:{kind:'skill',name:roleSettingName,data:{content:'Before role revocation'}}});
+            const roleSetting=checkedJson(roleSettingResponse);
+            roleSettingId=roleSetting.id;
+            roleBlocker=await sql.reserve();
+            await roleBlocker`BEGIN`;
+            await roleBlocker`SELECT pg_advisory_xact_lock(hashtext('menoteam-workbench-state'))`;
+            const blockerPid=Number((await roleBlocker`SELECT pg_backend_pid() AS pid`)[0]!.pid);
+            const existing=await sql`SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%'`;
+            const before=new Set(existing.map(row=>Number(row.pid)));
+            rolePending=app.inject({method:'PATCH',url:`/api/workbench/settings/${roleSetting.id}`,remoteAddress:'127.0.0.66',headers:{cookie:refreshedCookie},payload:{expectedUpdatedAt:roleSetting.updatedAt,data:{content:'Must not persist'}}});
+            const waiterPid=await waitForSettingsLock(before,blockerPid);
+            expect(waiterPid).toBeGreaterThan(0);
+            await sql`UPDATE wb_users SET role='member' WHERE id=${ownerId}`;
+            actorDemoted=true;
+            await roleBlocker`COMMIT`;
+            expect((await rolePending).statusCode).toBe(403);
+            expect((await sql`SELECT data FROM wb_records WHERE id=${roleSetting.id} AND kind='setting'`)[0]?.data).toMatchObject({name:roleSettingName,data:{content:'Before role revocation'}});
+        }finally{
+            if(roleBlocker){try{await roleBlocker`ROLLBACK`;}catch{}roleBlocker.release();}
+            if(rolePending)try{await rolePending;}catch{}
+            if(actorDemoted)await sql`UPDATE wb_users SET role='owner' WHERE id=${ownerId}`;
+            if(refreshedSessionDigest)await sql`DELETE FROM wb_sessions WHERE digest=${refreshedSessionDigest}`;
+            if(roleSettingId)await sql`DELETE FROM wb_records WHERE id=${roleSettingId} AND kind='setting' AND project_id IS NULL`;
+            await sql`DELETE FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'name'=${roleSettingName}`;
+        }
     });
     it('reflects active Work progress and kind-filtered capacity without treating a turn as done',async()=>{
         const p=(await user('POST','/projects',{name:'Work activity proof'})).json();

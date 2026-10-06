@@ -378,4 +378,80 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('Recorded Connector or model identities disagree'); expect(host.textContent).not.toContain('continues on its recorded Connector');
   });
 
+  it.each([
+    [{ totalFiles: 1, truncated: false }, 'Showing 1 of 1 changed file', 'This diff is untruncated'],
+    [{ totalFiles: 4, truncated: true }, 'Showing 1 of 4 changed files', 'This diff was truncated'],
+    [{ truncated: true }, 'Showing 1 changed file · total unknown', 'This diff was truncated'],
+    [{ truncated: false }, 'Showing 1 changed file · total unknown', 'This diff is untruncated'],
+    [{}, 'Showing 1 changed file · total unknown', 'Truncation status is unknown'],
+    [{ totalFiles: 0, truncated: false }, 'Showing 1 changed file · total unknown', 'This diff is untruncated'],
+    [{ totalFiles: 1.5, truncated: 'true' }, 'Showing 1 changed file · total unknown', 'Truncation status is unknown'],
+  ])('renders authoritative shown/total count and truncation honestly', async (metadata, label, truncated) => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work = { id: 'work-1', projectId: project.id, title: 'Diff proof', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const artifact = { id: 'diff-1', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'diff' as const, revision: 'diff-revision', createdAt: '2026-10-06T10:00:00.000Z', data: { ...metadata, baseRevision: 'base-sha', additions: 1, deletions: 1, files: [{ path: 'src/example.ts', status: 'modified', binary: false, additions: 1, deletions: 1, hunks: [{ header: '@@ -2 +2 @@', lines: [{ type: 'remove', oldLine: 2, text: 'old' }, { type: 'add', newLine: 2, text: 'new' }] }] }] } };
+    const current = { ...snapshot(), works: [work], artifacts: [artifact] } as Snapshot;
+    vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(artifact);
+    await mount(current);
+    await flush();
+    expect(host.textContent).toContain(label);
+    expect(host.querySelector('[role="status"]')?.textContent).toContain(truncated);
+    expect(host.textContent).toContain('old'); expect(host.textContent).toContain('new');
+    expect(host.querySelector('.bg-red-50')).not.toBeNull(); expect(host.querySelector('.bg-emerald-50')).not.toBeNull();
+    expect(host.querySelector('.bg-red-50')?.children[0]?.textContent).toBe('2');
+    expect(host.querySelector('.bg-emerald-50')?.children[1]?.textContent).toBe('2');
+  });
+
+  it('keeps QA evidence bound to the latest diff revision', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'QA binding', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { files: [], totalFiles: 0, truncated: false } };
+    const staleQa = { id: 'qa-stale', projectId: project.id, workId: work.id, runId: 'review-stale', kind: 'qa' as const, revision: 'revision-old', createdAt: '2026-10-06T12:00:00.000Z', data: { verification: 'current', checks: [] } };
+    const currentQa = { id: 'qa-current', projectId: project.id, workId: work.id, runId: 'review-current', kind: 'qa' as const, revision: 'revision-current', createdAt: '2026-10-06T09:00:00.000Z', data: { verification: 'current', checks: [] } };
+    vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(currentQa);
+    await mount({ ...snapshot(), works: [work], artifacts: [diff, staleQa, currentQa] } as Snapshot);
+    await flush();
+    expect(workbenchApi.artifact).toHaveBeenCalledWith(currentQa.id);
+    expect(workbenchApi.artifact).not.toHaveBeenCalledWith(staleQa.id);
+    expect(host.textContent).toContain('Current evidence');
+  });
+
+  it('does not present typed review QA with a candidate fingerprint mismatch as current', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'QA fingerprint binding', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { files: [], totalFiles: 0, truncated: false } };
+    const binding = { candidateRunId: 'candidate-run', commitSha: 'commit-current', candidateFingerprint: 'a'.repeat(64), diffArtifactId: diff.id, diffRevision: diff.revision, qaArtifactIds: [] };
+    const reviewRun = { id: 'review-run', projectId: project.id, workId: work.id, prompt: 'Review', kind: 'review' as const, model: 'gpt-6.1-sol', reasoning: 'medium' as const, status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', reviewBinding: binding } as Snapshot['runs'][number];
+    const mismatchedQa = { id: 'qa-mismatch', projectId: project.id, workId: work.id, runId: reviewRun.id, kind: 'qa' as const, revision: diff.revision, createdAt: '2026-10-06T11:00:00.000Z', data: { verification: 'current', typedReview: { ...binding, candidateFingerprint: 'b'.repeat(64), disposition: 'approved' } } };
+    const diffMetadata = { id: diff.id, projectId: diff.projectId, workId: diff.workId, runId: diff.runId, kind: diff.kind, revision: diff.revision, createdAt: diff.createdAt };
+    const qaMetadata = { id: mismatchedQa.id, projectId: mismatchedQa.projectId, workId: mismatchedQa.workId, runId: mismatchedQa.runId, kind: mismatchedQa.kind, revision: mismatchedQa.revision, createdAt: mismatchedQa.createdAt };
+    expect(diffMetadata).not.toHaveProperty('data'); expect(qaMetadata).not.toHaveProperty('data');
+    const artifactSpy = vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(mismatchedQa);
+    await mount({ ...snapshot(), works: [work], runs: [reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
+    await flush();
+    expect(artifactSpy).toHaveBeenCalledWith(mismatchedQa.id);
+    expect(host.textContent).toContain('does not match the latest candidate');
+    expect(host.textContent).not.toContain('Current evidence');
+    expect(host.textContent).not.toContain('Typed review');
+  });
+
+  it('fetches and displays matching typed review from metadata-only snapshot artifacts', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work = { id: 'work-1', projectId: project.id, title: 'QA metadata fetch', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const diff = { id: 'diff-current', projectId: project.id, workId: work.id, runId: 'candidate-run', kind: 'diff' as const, revision: 'revision-current', createdAt: '2026-10-06T10:00:00.000Z', data: { files: [], totalFiles: 0, truncated: false } };
+    const binding = { candidateRunId: 'candidate-run', commitSha: 'commit-current', candidateFingerprint: 'a'.repeat(64), diffArtifactId: diff.id, diffRevision: diff.revision, qaArtifactIds: ['qa-matched'] };
+    const reviewRun = { id: 'review-run', projectId: project.id, workId: work.id, prompt: 'Review', kind: 'review' as const, model: 'gpt-6.1-sol', reasoning: 'medium' as const, status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', reviewBinding: binding } as Snapshot['runs'][number];
+    const qa = { id: 'qa-matched', projectId: project.id, workId: work.id, runId: reviewRun.id, kind: 'qa' as const, revision: diff.revision, createdAt: '2026-10-06T11:00:00.000Z', data: { verification: 'current', typedReview: { ...binding, disposition: 'changes_requested', findings: [{ id: 'finding', blocking: true, summary: 'Keep evidence bound' }], reviewerRunId: reviewRun.id } } };
+    const diffMetadata = { id: diff.id, projectId: diff.projectId, workId: diff.workId, runId: diff.runId, kind: diff.kind, revision: diff.revision, createdAt: diff.createdAt };
+    const qaMetadata = { id: qa.id, projectId: qa.projectId, workId: qa.workId, runId: qa.runId, kind: qa.kind, revision: qa.revision, createdAt: qa.createdAt };
+    expect(diffMetadata).not.toHaveProperty('data'); expect(qaMetadata).not.toHaveProperty('data');
+    const artifactSpy = vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(qa);
+    await mount({ ...snapshot(), works: [work], runs: [reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
+    await flush();
+    expect(artifactSpy).toHaveBeenCalledWith(qa.id);
+    expect(host.textContent).toContain('Typed review');
+    expect(host.textContent).toContain('Keep evidence bound');
+    expect(host.textContent).toContain('Current evidence');
+  });
+
 });

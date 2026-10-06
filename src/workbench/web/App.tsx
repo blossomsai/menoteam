@@ -418,18 +418,32 @@ function WorkDetail({ work, project, snapshot, refresh, setError }: { work: Work
 
 function WorkArtifacts({ tab, work, project, artifacts, runs, settings, providerConnections, runtimeProviders, refresh, setError }: { tab: 'overview' | 'changes' | 'qa'; work: Work; project: Project; artifacts: Artifact[]; runs: Run[]; settings: Setting[]; providerConnections: NonNullable<Snapshot['providerConnections']>; runtimeProviders: Snapshot['runtimeProviders']; refresh:()=>Promise<void>; setError:(value:string)=>void }) {
   const latestDiff = [...artifacts.filter(artifact => artifact.kind === 'diff')].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  const selected = artifacts.filter(artifact => artifact.kind === (tab === 'changes' ? 'diff' : 'qa') && (tab !== 'qa' || !latestDiff || artifact.revision === latestDiff.revision));
+  const selected = artifacts.filter(artifact => {
+    if (artifact.kind !== (tab === 'changes' ? 'diff' : 'qa') || (tab === 'qa' && latestDiff && artifact.revision !== latestDiff.revision)) return false;
+    return true;
+  });
   const latest = [...selected].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+  const reviewBinding = latest && tab === 'qa' ? runs.find(run => run.id === latest.runId && run.kind === 'review')?.reviewBinding : undefined;
   const [artifact, setArtifact] = useState<Artifact | null>(null);
-  const [artifactState, setArtifactState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [artifactState, setArtifactState] = useState<'idle' | 'loading' | 'error' | 'mismatch'>('idle');
   const [requestId,setRequestId]=useState(()=>crypto.randomUUID());const [deliveryBusy,setDeliveryBusy]=useState(false);
   const [reviewEvidence,setReviewEvidence]=useState<Artifact|null>(null);const [mergeRequestId,setMergeRequestId]=useState(()=>crypto.randomUUID());
   useEffect(() => {
     if (tab === 'overview' || !latest) { setArtifact(null); setArtifactState('idle'); return; }
     let active = true; setArtifactState('loading'); setArtifact(null);
-    void workbenchApi.artifact(latest.id).then(result => { if (active) { setArtifact(result); setArtifactState('idle'); } }).catch(() => { if (active) setArtifactState('error'); });
+    void workbenchApi.artifact(latest.id).then(result => {
+      if (!active) return;
+      const typedReview = isRecord(result.data) && isRecord(result.data.typedReview) ? result.data.typedReview : null;
+      const matchesBinding = !reviewBinding || Boolean(typedReview && reviewBinding.diffRevision === latestDiff?.revision &&
+        typedReview.candidateRunId === reviewBinding.candidateRunId && typedReview.commitSha === reviewBinding.commitSha &&
+        typedReview.candidateFingerprint === reviewBinding.candidateFingerprint && typedReview.diffRevision === reviewBinding.diffRevision);
+      if (result.id !== latest.id || result.kind !== latest.kind || result.workId !== work.id || result.runId !== latest.runId || result.revision !== latest.revision || !matchesBinding) {
+        setArtifact(null); setArtifactState('mismatch'); return;
+      }
+      setArtifact(result); setArtifactState('idle');
+    }).catch(() => { if (active) setArtifactState('error'); });
     return () => { active = false; };
-  }, [latest?.id, tab]);
+  }, [latest?.id, latest?.runId, latest?.revision, latestDiff?.revision, reviewBinding?.candidateRunId, reviewBinding?.commitSha, reviewBinding?.candidateFingerprint, reviewBinding?.diffRevision, work.id, tab]);
   const relatedRuns = runs.filter(run => tab === 'changes' ? run.kind === 'implementation' : run.kind === 'review');
   const deliveries=[...artifacts.filter(item=>item.kind==='delivery')].sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
   const priorPr=[...runs].reverse().find(run=>run.kind==='delivery'&&run.operation?.action==='create_draft_pr'&&run.status==='completed'&&run.operation.phase==='pr_created');
@@ -466,7 +480,8 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, settings, provider
       {relatedRuns.map(run => <div key={run.id} className="rounded-lg border p-3"><div className="flex items-center justify-between gap-2"><strong className="text-sm">{run.kind === 'review' ? 'Review run' : 'Implementation run'}</strong><Badge variant="outline" className="capitalize">{run.status}</Badge></div>{run.error && <p className="mt-2 text-sm text-destructive">{run.error}</p>}<p className="mt-2 text-xs text-muted-foreground">Updated {new Date(run.updatedAt).toLocaleString()}</p></div>)}
       {selected.length > 0 && artifactState === 'loading' && <p role="status" className="rounded-lg border p-4 text-sm text-muted-foreground">Loading latest evidence…</p>}
       {artifactState === 'error' && <p role="alert" className="rounded-lg border border-destructive/30 p-4 text-sm text-destructive">Could not load the latest evidence.</p>}
-      {tab === 'qa' && !latest && artifacts.some(item => item.kind === 'qa') && <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">The recorded QA evidence belongs to an earlier change set. Run QA again for the latest changes.</p>}
+      {tab === 'qa' && artifactState === 'mismatch' && <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">The recorded QA evidence does not match the latest candidate. Run QA again for the latest changes.</p>}
+      {tab === 'qa' && !latest && artifacts.some(item => item.kind === 'qa') && <p className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950">The recorded QA evidence does not match the latest candidate. Run QA again for the latest changes.</p>}
       {artifact && <ArtifactCard key={artifact.id} artifact={artifact} />}
     </>}
   </section>;
@@ -479,7 +494,11 @@ function ArtifactCard({ artifact }: { artifact: Artifact }) {
   if(artifact.kind==='delivery'){const url=typeof data.pullRequestUrl==='string'?data.pullRequestUrl:'';const phase=typeof data.phase==='string'?data.phase:'queued';const action=data.action==='merge_pr'?'Merge receipt':'Draft PR delivery';return <section className="rounded-lg border p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div><strong className="text-sm">{action}</strong><p className="mt-1 text-xs text-muted-foreground">{url?<a href={url} target="_blank" rel="noreferrer">{url}</a>:`${phase} · ${String(data.operationId??artifact.runId)}`}</p></div><Badge variant={phase==='merged'?'secondary':'outline'}>{phase.replace('_',' ')}</Badge></div>{typeof data.commitSha==='string'&&<p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Candidate · {data.commitSha}</p>}{typeof data.mergeSha==='string'&&<p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">Merged commit · {data.mergeSha}</p>}</section>;}
   if (artifact.kind === 'diff') {
     const files = Array.isArray(data.files) ? data.files.filter(isDiffFile) : [];
-    return <section className="space-y-3 rounded-lg border p-3"><header className="flex flex-wrap items-center justify-between gap-3"><div><strong>{files.length} changed files</strong><p className="text-xs text-muted-foreground">Base {String(data.baseRevision ?? 'unknown')}</p></div><span className="font-mono text-sm"><span className="text-emerald-700">+{Number(data.additions) || 0}</span> <span className="text-red-700">−{Number(data.deletions) || 0}</span></span></header>{data.truncated === true && <p role="status" className="text-xs text-amber-800">This diff was truncated; some changes are not shown.</p>}{files.map(file => <details key={`${file.path}:${file.status}`} className="overflow-hidden rounded-md border"><summary className="flex cursor-pointer flex-wrap items-center gap-3 bg-muted/30 px-3 py-2 font-mono text-sm"><span aria-hidden="true">▸</span><span className="min-w-0 flex-1 break-all">{file.path}</span><span className="text-emerald-700">+{file.additions ?? '—'}</span><span className="text-red-700">−{file.deletions ?? '—'}</span><Badge variant="outline">{file.status}</Badge></summary>{file.binary ? <p className="p-3 text-sm text-muted-foreground">Binary file change</p> : <div className="max-h-[32rem] overflow-auto font-mono text-xs">{file.hunks.map((hunk, index) => <div key={index}><div className="bg-blue-50 px-3 py-1 text-blue-900">{hunk.header}</div>{hunk.lines.map((line, lineIndex) => <div key={lineIndex} className={`grid grid-cols-[3rem_3rem_1fr] whitespace-pre ${line.type === 'add' ? 'bg-emerald-50 text-emerald-900' : line.type === 'remove' ? 'bg-red-50 text-red-900' : ''}`}><span className="select-none text-right opacity-60">{line.oldLine ?? ''}</span><span className="select-none text-right opacity-60">{line.newLine ?? ''}</span><span className="px-2">{line.type === 'add' ? '+' : line.type === 'remove' ? '−' : ' '}{line.text}</span></div>)}</div>)}</div>}</details>)}</section>;
+    const totalFiles = typeof data.totalFiles === 'number' && Number.isSafeInteger(data.totalFiles) && data.totalFiles >= files.length ? data.totalFiles : undefined;
+    const shown = `${files.length} changed file${files.length === 1 ? '' : 's'}`;
+    const fileCount = totalFiles === undefined ? `Showing ${shown} · total unknown` : `Showing ${files.length} of ${totalFiles} changed file${totalFiles === 1 ? '' : 's'}`;
+    const diffStatus = data.truncated === true ? 'This diff was truncated; some changes are not shown.' : data.truncated === false ? 'This diff is untruncated.' : 'Truncation status is unknown.';
+    return <section className="space-y-3 rounded-lg border p-3"><header className="flex flex-wrap items-center justify-between gap-3"><div><strong>{fileCount}</strong><p className="text-xs text-muted-foreground">Base {String(data.baseRevision ?? 'unknown')}</p></div><span className="font-mono text-sm"><span className="text-emerald-700">+{Number(data.additions) || 0}</span> <span className="text-red-700">−{Number(data.deletions) || 0}</span></span></header><p role="status" className={`text-xs ${data.truncated === true ? 'text-amber-800' : 'text-muted-foreground'}`}>{diffStatus}</p>{files.map(file => <details key={`${file.path}:${file.status}`} className="overflow-hidden rounded-md border"><summary className="flex cursor-pointer flex-wrap items-center gap-3 bg-muted/30 px-3 py-2 font-mono text-sm"><span aria-hidden="true">▸</span><span className="min-w-0 flex-1 break-all">{file.path}</span><span className="text-emerald-700">+{file.additions ?? '—'}</span><span className="text-red-700">−{file.deletions ?? '—'}</span><Badge variant="outline">{file.status}</Badge></summary>{file.binary ? <p className="p-3 text-sm text-muted-foreground">Binary file change</p> : <div className="max-h-[32rem] overflow-auto font-mono text-xs">{file.hunks.map((hunk, index) => <div key={index}><div className="bg-blue-50 px-3 py-1 text-blue-900">{hunk.header}</div>{hunk.lines.map((line, lineIndex) => <div key={lineIndex} className={`grid grid-cols-[3rem_3rem_1fr] whitespace-pre ${line.type === 'add' ? 'bg-emerald-50 text-emerald-900' : line.type === 'remove' ? 'bg-red-50 text-red-900' : ''}`}><span className="select-none text-right opacity-60">{line.oldLine ?? ''}</span><span className="select-none text-right opacity-60">{line.newLine ?? ''}</span><span className="px-2">{line.type === 'add' ? '+' : line.type === 'remove' ? '−' : ' '}{line.text}</span></div>)}</div>)}</div>}</details>)}</section>;
   }
   if (artifact.kind === 'qa') {
     const typedReview = isRecord(data.typedReview) ? data.typedReview : null;

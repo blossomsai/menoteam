@@ -63,23 +63,30 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (origin && origin !== (options.allowedOrigin ?? `${req.protocol}://${req.headers.host}`))
             fail(403, "Origin denied");
     });
-    async function member(req: FastifyRequest): Promise<Member> {
+    async function member(req: FastifyRequest, tx: Sql = sql): Promise<Member> {
         const raw = req.headers.cookie?.split(";").map(s => s.trim()).find(s => s.startsWith("menoteam_session="))?.slice(17);
         if (!raw)
             fail(401, "Sign in required");
-        const rows = await sql `SELECT u.id,u.email,u.name,u.role FROM wb_sessions s JOIN wb_users u ON u.id=s.user_id WHERE s.digest=${digest(raw!)} AND s.expires_at>now()`;
+        const rows = await tx `SELECT u.id,u.email,u.name,u.role FROM wb_sessions s JOIN wb_users u ON u.id=s.user_id WHERE s.digest=${digest(raw!)} AND s.expires_at>now()`;
         if (!rows[0])
             fail(401, "Session expired");
         return rows[0] as unknown as Member;
     }
-    async function grant(user: Member, projectId: string, edit = false): Promise<void> {
-        if (!await store.get<Project>("project", projectId))
+    async function grant(user: Member, projectId: string, edit = false, tx: Sql = sql): Promise<void> {
+        if (!await store.get<Project>("project", projectId, tx))
             fail(404, "Project missing");
         if (user.role === "owner")
             return;
-        const rows = await sql `SELECT role FROM wb_memberships WHERE user_id=${user.id} AND project_id=${projectId}`;
+        const rows = await tx `SELECT role FROM wb_memberships WHERE user_id=${user.id} AND project_id=${projectId}`;
         if (!rows[0] || (edit && !["owner", "admin"].includes(String(rows[0].role))))
             fail(403, "Project access denied");
+    }
+    async function authorizeSettingsScope(actor: Member, projectId: string | undefined, tx: Sql = sql): Promise<void> {
+        if (projectId) {
+            await grant(actor, projectId, true, tx);
+            return;
+        }
+        if (!["owner", "admin"].includes(actor.role)) fail(403, "Workspace administrator required");
     }
     async function admin(req: FastifyRequest) {
         const u = await member(req);
@@ -87,10 +94,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             fail(403, "Administrator required");
         return u;
     }
-    async function visible(user: Member): Promise<string[]> {
+    async function visible(user: Member, tx: Sql = sql): Promise<string[]> {
         if (user.role === "owner")
-            return (await store.list<Project>("project")).map(p => p.id);
-        const rows = await sql `SELECT project_id FROM wb_memberships WHERE user_id=${user.id}`;
+            return (await store.list<Project>("project", undefined, tx)).map(p => p.id);
+        const rows = await tx `SELECT project_id FROM wb_memberships WHERE user_id=${user.id}`;
         return rows.map(r => String(r.project_id));
     }
     function cookie(value: string, maxAge = 604800) {
@@ -137,7 +144,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const user = await admin(req);
         const b = z.object({
             email: z.string().email(),
-            projectId: z.string().optional(),
+            projectId: z.string().min(1).optional(),
             role: z.enum(["admin", "member"]).default("member")
         }).parse(req.body);
         if (b.projectId)
@@ -813,14 +820,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     }
     app.post("/api/workbench/settings", async (req) => {
         const u = await member(req);
-        const b = req.body as {
-            projectId?: string;
-        };
-        if (b.projectId)
-            await grant(u, b.projectId, true);
-        else
-            await admin(req);
-        return store.transaction('setting',async tx=>{if(b.projectId)await grant(u,b.projectId,true);else await admin(req);return writeSetting(req.body,tx,u.id);});
+        const b = z.object({ projectId: z.string().min(1).optional() }).passthrough().parse(req.body);
+        await authorizeSettingsScope(u, b.projectId);
+        return store.transaction('setting',async tx=>{const current=await member(req,tx);await authorizeSettingsScope(current,b.projectId,tx);return writeSetting(req.body,tx,current.id);});
     });
     async function patchSetting(actor: Member, sid: string, input: unknown, tx: Sql, projectBoundary?: string) {
         const change = z.object({
@@ -832,8 +834,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (!setting) fail(404, 'Setting missing');
         if (projectBoundary && setting!.projectId && setting!.projectId !== projectBoundary)
             fail(403, 'Setting scope mismatch');
-        if (setting!.projectId) await grant(actor, setting!.projectId, true);
-        else if (!['owner', 'admin'].includes(actor.role)) fail(403, 'Workspace administrator required');
+        await authorizeSettingsScope(actor, setting!.projectId, tx);
         if (change.expectedUpdatedAt && change.expectedUpdatedAt !== setting!.updatedAt)
             fail(409, 'Setting changed; reload before updating');
         if(setting!.kind==='provider'&&change.data){
@@ -841,7 +842,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const cid=setting!.data.connectorId;
                 if(typeof cid!=='string')fail(409,'Unbound provider metadata cannot be enabled; add a real Connector connection');
                 const endpoints=await tx`SELECT project_ids,capabilities FROM wb_connectors WHERE id=${String(cid)}`;
-                const accessible=await visible(actor);
+                const accessible=await visible(actor,tx);
                 const pid=(endpoints[0]?.project_ids as string[]|undefined)?.find(pid=>accessible.includes(pid));
                 if(!pid)fail(403,'Selected Connector is outside accessible projects');
                 await validateSelection(pid!,String(cid),undefined,'implementation',tx);
@@ -865,9 +866,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return setting!;
     }
     app.patch("/api/workbench/settings/:id", async (req) => {
-        const actor=await member(req);
         const sid=(req.params as {id:string}).id;
-        return store.transaction('setting',tx=>patchSetting(actor,sid,req.body,tx));
+        return store.transaction('setting',async tx=>patchSetting(await member(req,tx),sid,req.body,tx));
     });
     app.post("/api/workbench/connectors", async (req) => {
         await admin(req);
@@ -1198,11 +1198,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await tx`INSERT INTO wb_bridge_tokens(digest,run_id,generation,expires_at) VALUES (${digest(raw)},${r.id},${r.generation},${expiresAt})`;
         return {token:raw,expiresAt};
     }));
-    async function toolSettingsGrant(r: Run) {
-        const rows = await sql `SELECT id,email,name,role FROM wb_users WHERE id=${r.requestedBy ?? ""}`;
+    async function toolSettingsGrant(r: Run, tx: Sql) {
+        const rows = await tx `SELECT id,email,name,role FROM wb_users WHERE id=${r.requestedBy ?? ""}`;
         if (!rows[0])
             fail(403, "Run actor unavailable");
-        await grant(rows[0] as unknown as Member, r.projectId, true);
+        await grant(rows[0] as unknown as Member, r.projectId, true, tx);
     }
     app.post("/api/workbench/connector/runs/:id/tools", async (req) => store.transaction(`run:${(req.params as {
         id: string;
@@ -1213,7 +1213,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const actors = await tx `SELECT id,email,name,role FROM wb_users WHERE id=${r.requestedBy ?? ""}`;
         if (!actors[0])
             fail(403, "Run actor unavailable");
-        await grant(actors[0] as unknown as Member, r.projectId);
+        await grant(actors[0] as unknown as Member, r.projectId, false, tx);
         const b = z.object({
             generation: z.number(),
             action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "submit_review_result", "post_message", "update_settings", "create_skill"]),
@@ -1231,12 +1231,37 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(b.action==='request_merge'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request merge');
         if(b.action==='dispatch'&&r.sourceIds?.length&&!(await store.get<Project>('project',r.projectId,tx))?.feedbackIntake?.allowExecution)fail(403,'Feedback execution grant revoked');
         if(r.allowedActions&&!r.allowedActions.includes(b.action))fail(403,'This intake grant does not authorize that action');
+        const skillInput = b.action === 'create_skill' ? z.object({ scope: z.enum(['project', 'workspace']).optional(), name: text, data: z.record(z.string(), z.unknown()) }).strict().parse(b.input) : undefined;
         const scope = `tools:${r.id}`;
         const prior = await tx `SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${b.requestId}`;
         if (prior[0]) {
+            if (skillInput) {
+                const stored = prior[0].result as Record<string, unknown>;
+                const binding = stored && typeof stored === 'object' ? stored.__toolRequest as Record<string, unknown> | undefined : undefined;
+                const setting = (binding ? stored.result : stored) as Setting;
+                const data = settingData('skill', skillInput.data);
+                if (binding) {
+                    if (!skillInput.scope) fail(409, 'Skill scope must be explicitly selected for a new retry');
+                    await authorizeSettingsScope(actors[0] as unknown as Member, skillInput.scope === 'project' ? r.projectId : undefined, tx);
+                    if (binding.action !== 'create_skill' || binding.runId !== r.id || binding.generation !== r.generation || binding.requestedBy !== r.requestedBy || binding.projectId !== r.projectId || binding.scope !== skillInput.scope || binding.name !== skillInput.name || !isDeepStrictEqual(binding.data, data)) fail(409, 'Skill request ID was reused with different scope or content');
+                    return setting;
+                }
+                // A pre-envelope result carries only the setting, not action/input provenance.
+                // Infer only its original scope from that setting and allow an exact read-only replay.
+                const storedScope = setting?.projectId === r.projectId ? 'project' : setting?.projectId === undefined ? 'workspace' : undefined;
+                const retryScope = skillInput.scope ?? (storedScope === 'project' ? 'project' : undefined);
+                if (!storedScope || retryScope !== storedScope || setting?.kind !== 'skill' || setting.name !== skillInput.name || !isDeepStrictEqual(setting.data, data)) fail(409, 'Skill request ID was reused with different scope or content');
+                await authorizeSettingsScope(actors[0] as unknown as Member, retryScope === 'project' ? r.projectId : undefined, tx);
+                const existing = await store.get<Setting>('setting', setting.id, tx);
+                if (!existing || existing.kind !== 'skill' || existing.projectId !== (retryScope === 'project' ? r.projectId : undefined) || existing.name !== skillInput.name || !isDeepStrictEqual(existing.data, data)) fail(409, 'Legacy skill result is no longer available');
+                return existing;
+            }
+            if ((prior[0].result as Record<string, unknown>)?.__toolRequest) fail(409, 'Tool request ID was reused for a different action');
             if(b.action==='submit_review_result'){const input=z.object({disposition:z.enum(['approved','changes_requested','insufficient_evidence']),findings:z.array(z.object({id:z.string().min(1).max(120),blocking:z.boolean(),summary:z.string().min(1).max(2000)}).strict()).max(100),evidenceArtifactIds:z.array(z.string().min(1).max(200)).max(100)}).strict().parse(b.input);const saved=((prior[0].result as Artifact).data as {typedReview?:Record<string,unknown>}).typedReview;if(saved?.disposition!==input.disposition||JSON.stringify(saved.findings)!==JSON.stringify(input.findings)||JSON.stringify(saved.evidenceArtifactIds)!==JSON.stringify(input.evidenceArtifactIds))fail(409,'Review request ID was reused with different content');}
             return prior[0].result;
         }
+        if (skillInput && !skillInput.scope) fail(400, 'Skill scope must be explicitly selected');
+        if (skillInput) await authorizeSettingsScope(actors[0] as unknown as Member, skillInput.scope === 'project' ? r.projectId : undefined, tx);
         let result: unknown;
         if (b.action === "read_context")
             result = {
@@ -1332,13 +1357,15 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             result = m;
         }
         else if (b.action === "create_skill") {
-            await toolSettingsGrant(r);
-            result = await writeSetting({
+            const created = await writeSetting({
                 kind: "skill",
-                projectId: r.projectId,
-                name: b.input.name,
-                data: b.input.data
+                ...(skillInput!.scope === 'project' ? { projectId: r.projectId } : {}),
+                name: skillInput!.name,
+                data: skillInput!.data
             }, tx);
+            const readBack = await store.get<Setting>('setting', created.id, tx);
+            if (!readBack || readBack.kind !== 'skill' || readBack.projectId !== (skillInput!.scope === 'project' ? r.projectId : undefined)) fail(500, 'Created skill could not be read back in its selected scope');
+            result = readBack;
         }
         else {
             if(typeof b.input.settingId==='string') {
@@ -1350,7 +1377,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 if(setting?.kind==='connection'&&change.data&&protectedConnectionKeys.some(key=>Object.hasOwn(change.data!,key)))fail(403,'Master cannot change connection or delivery authorization policy');
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);
             } else {
-                await toolSettingsGrant(r);
+                await toolSettingsGrant(r,tx);
                 const input=z.object({instructions:z.string().max(16000),expectedInstructions:z.string().max(16000)}).strict().parse(b.input);
                 const project=(await store.get<Project>('project',r.projectId,tx))!;
                 if(project.instructions!==input.expectedInstructions)fail(409,'Project instructions changed remotely. Review the latest version before saving.');
@@ -1358,7 +1385,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 await store.put('project',project,tx);result=project;
             }
         }
-        await tx `INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(result as never)})`;
+        const storedResult = skillInput ? { __toolRequest: { action: b.action, runId: r.id, generation: r.generation, requestedBy: r.requestedBy, projectId: r.projectId, scope: skillInput.scope, name: skillInput.name, data: settingData('skill', skillInput.data) }, result } : result;
+        await tx `INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(storedResult as never)})`;
         return result;
     }));
     app.post("/api/workbench/runs/:id/reconcile", async (req) => {

@@ -43,6 +43,6 @@ tool('update_settings', 'Update project instructions using the current expectedI
   z.object({ settingId: workId, expectedUpdatedAt: z.string().min(1), name: text.optional(), data: z.record(z.string(), z.unknown()).optional() }).strict().refine(input => input.name !== undefined || input.data !== undefined, 'Provide a setting name or data change.'),
   z.object({ instructions: z.string().max(16_000), expectedInstructions: z.string().max(16_000) }).strict(),
 ]), 'update_settings');
-tool('create_skill', 'Add a skill to this project.', z.object({ name: text, data: z.record(z.string(), z.unknown()) }).strict(), 'create_skill');
+tool('create_skill', 'Create a skill in the explicitly selected project or workspace settings scope. Use the requested scope; if unclear, ask instead of broadening it to workspace.', z.object({ scope: z.enum(['project', 'workspace']), name: text, data: z.record(z.string(), z.unknown()) }).strict(), 'create_skill');
 
 await server.connect(new StdioServerTransport());
