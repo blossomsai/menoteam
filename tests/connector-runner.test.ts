@@ -18,12 +18,14 @@ function claim():ClaimedRun {
 }
 const execFile=promisify(execFileCallback);
 describe('Integrated connector lifecycle',()=>{
-  it('keeps implementation edits in assigned cwd and parent captures bytes after native Git commit failure',async()=>{
+  it.each(['capture','setup-failure'])('keeps assigned-cwd capture and cleans owned fixture paths on %s',async mode=>{
     const bounded=<T>(promise:Promise<T>)=>{let timer:ReturnType<typeof setTimeout>;return Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Timed out waiting for bounded implementation capture')),5_000);})]).finally(()=>clearTimeout(timer));};
     let root:string|undefined;let dataDir:string|undefined;let runner:ConnectorRunner|undefined;let execution:Promise<void>|undefined;let executionSettled=false;let restoreQaAdapter:(()=>void)|undefined;
-    try{
+    const setupFailure=new Error('Injected setup failure before execution');
+    const runFixture=async()=>{let primaryFailure=false;try{
       root=await mkdtemp(path.join(os.tmpdir(),'menoteam-assigned-cwd-'));
       dataDir=await realpath(await mkdtemp(path.join(os.tmpdir(),'menoteam-assigned-state-')));
+      if(mode==='setup-failure')throw setupFailure;
       await git(root,'init','-q'); await git(root,'config','user.name','Fixture'); await git(root,'config','user.email','fixture@example.invalid');
       await writeFile(path.join(root,'source.txt'),'base source\n'); await git(root,'add','-A'); await git(root,'commit','-qm','base');
       const c=claim();c.run.kind='implementation';c.run.workId='work-native';c.run.threadId=undefined;c.run.execution={provider:'openai',method:'codex-host',skills:[],tools:[]};
@@ -90,15 +92,25 @@ describe('Integrated connector lifecycle',()=>{
       expect(nativeQa.data.revision).toBe(revision);
       expect(nativeQa.data.verification).toBe('unknown');
       expect(artifacts).toHaveLength(3);
-    }finally{
+    }catch(error){primaryFailure=true;throw error;}finally{
       try{
         await runner?.stop();
-        if(execution)await bounded(execution).catch(()=>undefined);
-      }finally{restoreQaAdapter?.();}
-      expect(executionSettled).toBe(true);
-      if(root)await rm(root,{recursive:true,force:true});
-      if(dataDir)await rm(dataDir,{recursive:true,force:true});
-    }
+        if(execution)await bounded(execution);
+      }catch(error){if(!primaryFailure)throw error;}finally{
+        restoreQaAdapter?.();
+        // A failed setup has no execution to stop. Unknown live execution retains its paths.
+        if(!execution||executionSettled){
+          try{if(root)await rm(root,{recursive:true,force:true});if(dataDir)await rm(dataDir,{recursive:true,force:true});}
+          catch(error){if(!primaryFailure)throw error;}
+        }
+      }
+    }};
+    if(mode==='setup-failure'){
+      await expect(runFixture()).rejects.toBe(setupFailure);
+      expect(execution).toBeUndefined();
+      await expect(stat(root!)).rejects.toMatchObject({code:'ENOENT'});
+      await expect(stat(dataDir!)).rejects.toMatchObject({code:'ENOENT'});
+    }else await runFixture();
   });
   it('resumes native thread, streams idempotent events, keeps only scoped bridge token, stops before completion',async()=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-runner-'));
