@@ -33,7 +33,7 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
@@ -43,7 +43,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'provenance' | 'tr
   const stoppedAcks:number[]=[];
   const client = {
     claim: async () => { if (!claimed) { claimed = true; return claim; } await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
-    renew: async (_id:string,generation:number) => { renewals.push(generation);return claim.run; },
+    renew: async (_id:string,generation:number) => { renewals.push(generation);if(options.pauseOnHeartbeat&&renewals.length>1){claim.run.status='paused';throw new Error('lease rejected after pause');}return claim.run; },
     authorizeStagingEffect: async (_id: string, generation: number, effect: 'provenance' | 'transport' | 'status') => {
       expect(generation).toBe(claim.run.generation);
       return authorize(effect);
@@ -135,6 +135,21 @@ describe('staging delivery Connector integration', () => {
       throw new Error('connector shutdown stopped the local transport');
     },{stopAfterMs:500,stopProcess:async value=>{stopped.push(value);releaseTransport();return true;}});
     expect(stopped).toEqual([identity]);
+    expect(result.stoppedAcks).toEqual([1]);
+    expect(result.receipts).toEqual([]);
+    expect(result.completions).toEqual([]);
+  },10_000);
+
+  it('after a lease renewal is rejected, stops the child and acknowledges pause without status or completion',async()=>{
+    let releaseTransport!:()=>void;
+    const transportStopped=new Promise<void>(resolve=>{releaseTransport=resolve;});
+    const stopCalls:unknown[]=[];
+    const result=await execute(stagingClaim(),async()=>({authorized:true,action:'deploy'}),async(_request,tracking)=>{
+      await tracking?.starting?.();await tracking?.started(identity);
+      await transportStopped;await tracking?.stopped();
+      throw new Error('pause stopped the local transport');
+    },{stopAfterMs:6_500,pauseOnHeartbeat:true,stopProcess:async value=>{stopCalls.push(value);releaseTransport();return true;}});
+    expect(stopCalls).toEqual([identity]);
     expect(result.stoppedAcks).toEqual([1]);
     expect(result.receipts).toEqual([]);
     expect(result.completions).toEqual([]);

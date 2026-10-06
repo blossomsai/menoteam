@@ -460,6 +460,11 @@ export class ConnectorRunner {
       if(initialStage){
         if(spool.stagingProcessIdentity||spool.stagingTransportStarted&&!spool.stagingTransportStopped){await this.save(spool);throw new Error('Staging SSH stop is unconfirmed; reservation retained for reconciliation');}
         if(this.closing){spool.stopped=true;await this.save(spool);try{await this.flush(spool);}catch{/* Keep exact intent and reservation for the next Connector. */}throw new Error('Staging execution stopped locally; remote outcome remains reserved for reconciliation');}
+        const remote=await client.readRun(run.id).catch(()=>undefined);
+        if(remote?.generation===run.generation&&['paused','cancelled','interrupted'].includes(remote.status)){
+          spool.stopped=true;await this.save(spool);await this.flush(spool).catch(()=>undefined);
+          throw new Error('Staging execution stopped after the run was paused or cancelled; remote outcome remains reserved');
+        }
         if(spool.stagingIntent){
           try{await this.reconcileStaging(spool);return;}catch{
             // A failed status read is not evidence of the remote state. If the local
