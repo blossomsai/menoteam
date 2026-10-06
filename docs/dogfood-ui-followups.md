@@ -1,6 +1,6 @@
 # UI follow-ups reserved for Menoteam dogfood
 
-These two changes are intentionally held for implementation through the live Menoteam workflow. Do not mark them fixed from a code-only change; start a Work in the app, assign implementation to the local Connector, review the diff and QA in Work detail, and verify the behavior in the browser.
+Both changes have been implemented through the live Menoteam workflow and integrated: Work list search from `1e45dc3` is included in `b2738cd`, and Instructions/session-recovery changes are included in `6806dd6` (see the acceptance ledger for exact commits and evidence). The original reproduction and acceptance criteria below remain the browser checklist; browser acceptance is still pending. Do not mark either follow-up accepted from a code-only change: review the integrated behavior in the browser and record the result.
 
 ## Work list text search
 
