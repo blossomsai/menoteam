@@ -710,7 +710,15 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const profile = (await user('POST', '/settings', { kind: 'profile', name: 'Marketplace reusable', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [copied.id, resourceCopy.id, createdCopy.id, legacyCopy.id] } })).json();
             recordIds.add(profile.id);
             const adminUserId = String((await sql`SELECT id FROM wb_users WHERE email=${adminEmail}`)[0]!.id);
-            const guardedWorkResponse = await user('POST', `/projects/${projectIdForCase}/works`, { title: 'Authorization recheck fixture' });
+            // This isolated fixture must enroll/discover/bind its own project before requesting Work execution.
+            // An unrelated suite default cannot authorize this newly created project.
+            const connector = checkedJson(await user('POST', '/connectors', { id: connectorIdForCase, projectIds: [projectIdForCase] }));
+            const connectorTokenForCase = connector.token as string;
+            const discovery = await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorTokenForCase}` }, payload: { capabilities: { ...fixtureCapabilities, runKinds: [] } } });
+            expect(discovery.statusCode).toBe(204);
+            const provider = checkedJson(await user('POST', '/settings', { kind: 'provider', name: 'Marketplace fixture connection', data: { provider: 'openai', method: 'codex-host', connectorId: connectorIdForCase, enabled: true, default: false } }));
+            recordIds.add(provider.id);
+            const guardedWorkResponse = await user('POST', `/projects/${projectIdForCase}/works`, { title: 'Authorization recheck fixture', connectionId: provider.id });
             const guardedWork = guardedWorkResponse.json(); if (guardedWork.id) recordIds.add(guardedWork.id);
             expect(guardedWorkResponse.statusCode).toBe(200);
             const waitForWorkbenchLock = async () => {
@@ -745,11 +753,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const deniedRun = await revokeWhileWaiting(() => adminRequest('POST', `/projects/${projectIdForCase}/messages`, { text: 'Must not queue after revocation', workId: guardedWork.id, requestId: `revoked-${randomUUID()}` }));
             expect(deniedRun.statusCode).toBe(403);
             const me = (await user('GET', '/me')).json();
-            const connector = (await user('POST', '/connectors', { id: connectorIdForCase, projectIds: [projectIdForCase] })).json();
-            const connectorTokenForCase = connector.token as string;
             const claim = () => app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${connectorTokenForCase}` }, payload: { capabilities: { models: ['gpt-6-luna'] } } });
             const submitWork = async (title: string, requestId: string) => {
-                const created = await user('POST', `/projects/${projectIdForCase}/works`, { title });
+                const created = await user('POST', `/projects/${projectIdForCase}/works`, { title, connectionId: provider.id });
                 const work = created.json(); if (work.id) recordIds.add(work.id);
                 expect(created.statusCode).toBe(200);
                 const assigned = await user('PATCH', `/works/${work.id}`, { revision: work.revision, profileId: profile.id });
