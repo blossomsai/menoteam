@@ -225,6 +225,44 @@ it('blocks rollback while another Work in the project has an unresolved run on t
   expect(rollback).not.toHaveBeenCalled();
 });
 
+it('keeps the last healthy deployment rollback available after a later build attempt is released', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = snapshot('A'); value.member = { ...member, role: 'admin' }; value.projectRoles = { project: 'admin' };
+  value.projects[0]!.repositoryUrl = 'https://github.com/org/repo';
+  value.works = [{ id: 'work', projectId: 'project', title: 'Current Work', overview: '', status: 'in_progress', revision: 1, profileId: '', connectionId: 'provider', sources: [], createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z' }];
+  value.providerConnections = [{ id: 'provider', name: 'Codex', connectorId: 'connector', enabled: true, default: true, status: 'available', models: [], projectIds: ['project'] }];
+  value.runtimeProviders = [{ provider: 'openai', method: 'codex-host', connectorId: 'stage-connector', available: true, projectIds: ['project'], deploymentTargets: ['stage-safe'], deliveryActions: ['rollback_staging'], models: [], lastSeen: '2026-10-07T00:00:00.000Z' }];
+  value.settings = [{ id: 'delivery', kind: 'connection', projectId: 'project', name: 'GitHub delivery', data: { provider: 'github', purpose: 'delivery', url: 'https://github.com/org/repo', allowStagingDeploy: true, stagingTargets: ['stage-safe'] }, updatedAt: '2026-10-07T00:00:00.000Z' }];
+  const healthy = healthyStagingRun('healthy-a', 'work');
+  const retired = stoppedBuildRun({ id: 'released-b', generation: 4, createdAt: '2026-10-07T00:02:00.000Z', operation: { ...stoppedBuildRun().operation!, stagingRetired: { at: '2026-10-07T00:03:00.000Z', by: 'owner', generation: 3 } } });
+  value.runs = [healthy, retired]; responses = [Promise.resolve(value)];
+  const rollback = vi.spyOn(workbenchApi, 'requestStagingRollback').mockResolvedValue({ operationId: 'rollback', run: healthy });
+  await mount();
+  expect(host.textContent).toContain('Health check passed');
+  expect(host.textContent).toContain('Stopped · Target released');
+  expect(host.textContent).toContain('Roll back to previous verified version');
+  expect(button('Roll back to previous verified version').disabled).toBe(false);
+  expect(rollback).not.toHaveBeenCalled();
+});
+
+it('keeps the prior deployment rollback blocked while a later target outcome is unknown', async () => {
+  window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
+  const value = snapshot('A'); value.member = { ...member, role: 'admin' }; value.projectRoles = { project: 'admin' };
+  value.projects[0]!.repositoryUrl = 'https://github.com/org/repo';
+  value.works = [{ id: 'work', projectId: 'project', title: 'Current Work', overview: '', status: 'in_progress', revision: 1, profileId: '', connectionId: 'provider', sources: [], createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z' }];
+  value.providerConnections = [{ id: 'provider', name: 'Codex', connectorId: 'connector', enabled: true, default: true, status: 'available', models: [], projectIds: ['project'] }];
+  value.runtimeProviders = [{ provider: 'openai', method: 'codex-host', connectorId: 'stage-connector', available: true, projectIds: ['project'], deploymentTargets: ['stage-safe'], deliveryActions: ['rollback_staging'], models: [], lastSeen: '2026-10-07T00:00:00.000Z' }];
+  value.settings = [{ id: 'delivery', kind: 'connection', projectId: 'project', name: 'GitHub delivery', data: { provider: 'github', purpose: 'delivery', url: 'https://github.com/org/repo', allowStagingDeploy: true, stagingTargets: ['stage-safe'] }, updatedAt: '2026-10-07T00:00:00.000Z' }];
+  const healthy = healthyStagingRun('healthy-a', 'work');
+  const unknown = { ...healthyStagingRun('unknown-b', 'other-work'), status: 'failed' as const, createdAt: '2026-10-06T23:59:00.000Z', operation: { ...healthyStagingRun('unknown-b', 'other-work').operation!, phase: 'deploy_unknown', stagingReceipt: { ...healthyStagingRun('unknown-b', 'other-work').operation!.stagingReceipt!, phase: 'unknown' } } } as Snapshot['runs'][number];
+  value.runs = [healthy, unknown]; responses = [Promise.resolve(value)];
+  const rollback = vi.spyOn(workbenchApi, 'requestStagingRollback');
+  await mount();
+  expect(host.textContent).toContain('Health check passed');
+  expect(button('Roll back to previous verified version').disabled).toBe(true);
+  expect(rollback).not.toHaveBeenCalled();
+});
+
 it.each([
   { workspaceRole: 'member' as const, projectRole: 'admin' as const, allowed: false },
   { workspaceRole: 'admin' as const, projectRole: 'member' as const, allowed: false },

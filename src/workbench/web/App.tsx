@@ -542,7 +542,7 @@ function StagingOverview({work,project,runs,allRuns,settings,runtimeProviders,ca
     return run.status;
   };
   const unresolvedFor=(targetId:string,exceptRunId?:string)=>allRuns.some(run=>run.id!==exceptRunId&&!run.operation?.stagingRetired&&run.operation?.targetId===targetId&&['deploy_staging','rollback_staging'].includes(run.operation.action)&&!['health_passed','rolled_back'].includes(run.operation.phase));
-  const latestByTarget=(targetId:string)=>[...allRuns].filter(run=>run.operation?.targetId===targetId&&['deploy_staging','rollback_staging'].includes(run.operation.action)).sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id)).at(-1);
+  const latestByTarget=(targetId:string)=>[...allRuns].filter(run=>!run.operation?.stagingRetired&&run.operation?.targetId===targetId&&['deploy_staging','rollback_staging'].includes(run.operation.action)).sort((a,b)=>a.createdAt.localeCompare(b.createdAt)||a.id.localeCompare(b.id)).at(-1);
   const retryFor=(targetId:string,sourceMergeRunId:string|undefined):Run|undefined=>sourceMergeRunId?allRuns.find(run=>run.projectId===work.projectId&&run.workId===work.id&&run.operation?.action==='deploy_staging'&&run.operation.targetId===targetId&&run.operation.sourceMergeRunId===sourceMergeRunId&&run.operation.phase==='build_discovery'&&run.operation.effectIntentGeneration===undefined&&!run.operation.stagingEffectStage&&!run.operation.stagingReceipt&&!run.operation.stagingRetired&&run.status==='failed'):undefined;
   const rollbackAvailable=(run:Run)=>{
     const op=run.operation,receipt=op?.stagingReceipt;
