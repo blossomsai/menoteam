@@ -1,10 +1,9 @@
 import { createHash } from 'node:crypto';
-import { execFile as execFileCb } from 'node:child_process';
+import { execFileJoined as execFile } from './exec-file.js';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { isDeepStrictEqual, promisify } from 'node:util';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 
-const execFile = promisify(execFileCb);
 const REPOSITORY = 'blossomsai/menoteam';
 const WORKFLOW_FILE = 'build-workbench-image.yml';
 const WORKFLOW_PATH = '.github/workflows/build-workbench-image.yml';

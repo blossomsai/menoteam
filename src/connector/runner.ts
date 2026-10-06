@@ -8,6 +8,7 @@ import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
 import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit, GitCommandError, type GitOptions } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
 import { assertExecutionSelection } from './selection.js';
+import { isPreEffectStagingRun } from '../workbench/types.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
 import { createDraftPullRequest } from './github-draft-pr.js';
 import { captureRequiredLocalQa } from './local-qa.js';
@@ -27,6 +28,7 @@ interface Spool {
   deliveryProgress?: {phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string};
   stagingIntent?: Omit<StagingRequest,'action'|'operationId'>;
   stagingReceipt?: StagingReceipt;
+  stagingDiscoveryStopped?:boolean;
   stagingTransportStarted?:boolean;
   stagingTransportStopped?:boolean;
   threadId?: string;
@@ -188,6 +190,10 @@ export class ConnectorRunner {
     if(spool.deliveryProgress){await client.deliveryProgress(spool.runId,spool.generation,spool.deliveryProgress);spool.deliveryProgress=undefined;await this.save(spool);}
     if (spool.stopped) await client.stopped(spool.runId,spool.generation,spool.threadId);
     else if (spool.completion) await client.complete(spool.runId,spool.generation,spool.completion);
+    if(spool.completion&&spool.stagingDiscoveryStopped&&!spool.stagingTransportStarted){
+      const remote=await client.readRun(spool.runId);
+      if(remote.generation===spool.generation&&isPreEffectStagingRun(remote)&&!remote.operation?.stagingRetired)await client.stopped(spool.runId,spool.generation);
+    }
     if (spool.stopped || spool.completion) await unlink(this.spoolPath(spool.runId,spool.generation));
   }
   private async reconcileStaging(spool:Spool):Promise<void>{
@@ -264,6 +270,10 @@ export class ConnectorRunner {
         if(!spool.qaExecution||!qaExecutorStopped(spool.qaExecution)||!await stopQaExecution(spool.qaExecution))continue;
         try{assertQaResourcePolicy(spool.qaExecution,remote.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);}catch{continue;}
         spool.qaExecution.phase='stopped';spool.qaInFlight=false;spool.stopped=true;await this.save(spool);
+      }
+      if(isPreEffectStagingRun(remote)&&!spool.stagingIntent&&!spool.stagingDiscoveryStopped)continue;
+      if(remote.status==='failed'&&isPreEffectStagingRun(remote)&&!remote.operation?.stagingRetired&&spool.stagingDiscoveryStopped&&!spool.stagingIntent){
+        if(!spool.completion)spool.stopped=true;await this.save(spool);await this.flush(spool);continue;
       }
       if (['completed','failed'].includes(remote.status)) {
         if(spool.skillDirectory) {
@@ -485,8 +495,9 @@ export class ConnectorRunner {
       if(run.operation?.action!=='merge_pr'||run.operation.phase!=='merge_intent')await client.renew(run.id,run.generation);
       if(initialStage){
         if(run.operation?.action==='deploy_staging'&&run.operation.phase==='build_discovery'){
-          const refreshed=await this.discoverStagingReceipt(claim);
-          claim.run=refreshed;
+          spool.stagingDiscoveryStopped=false;await this.save(spool);
+          try{claim.run=await this.discoverStagingReceipt(claim);}
+          finally{spool.stagingDiscoveryStopped=true;await this.save(spool);}
         }
         await this.executeStaging(claim,spool);return;
       }
@@ -530,6 +541,7 @@ export class ConnectorRunner {
           }
           throw new Error('Staging operation could not be verified; inspect its durable status');
         }
+        if(spool.stagingDiscoveryStopped){spool.completion={error:'Staging build discovery failed; inspect its recorded build status'};await this.save(spool);await this.flush(spool).catch(()=>undefined);}
         throw error;
       }
       if(spool.deliveryProcessIdentity||(error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){await this.save(spool);throw new Error('Draft PR transport stop is unconfirmed; reconciliation is required');}

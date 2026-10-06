@@ -111,3 +111,19 @@ the A15 prerequisite, an immutable build/provenance source, a separately
 authorized isolated target, and operator verification of the exact deployed
 digest, version endpoint, health, V1 non-interference, bootstrap behavior, and
 a second-version-to-first-verified-digest rollback drill.
+
+A terminal pre-effect deploy at `build_discovery` may be explicitly retired by
+its workspace owner, or a workspace administrator who is also a project owner
+or administrator. The same-generation Connector must confirm local cleanup;
+failed status or an expired lease alone is not stop proof. An unclaimed queue
+cancelled before execution already has that proof. Retirement does not require
+re-enabling a revoked delivery policy. It releases only this Run's reservation,
+records `stagingRetired`, advances generation, and preserves the original Run,
+receipt and canonical source identity. Old retries cannot revive it. Mutation
+intent, transport intent and any staging receipt must use status reconciliation
+and can never be released through retirement.
+
+The fixed read-only discovery subprocesses wait for child `close`, including
+abort/error paths, before the Connector records discovery cleanup as stopped.
+That proof and the subsequent stopped acknowledgement remain in the outbox
+until acknowledged by the server.

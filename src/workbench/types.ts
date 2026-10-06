@@ -82,6 +82,7 @@ export interface Run {
         sourceMergeRunId?: string;
         buildStatus?: 'discovering' | 'unavailable' | 'running' | 'failed' | 'receipt_missing' | 'receipt_expired' | 'provenance_failed' | 'verified';
         buildMessage?: string;
+        stagingRetired?: { at: string; by: string; generation: number };
         buildReceipt?: {
             schemaVersion: 1;
             repository: 'blossomsai/menoteam';
@@ -196,4 +197,11 @@ export interface RuntimeProvider {
     lastSeen: string;
     verifiedRunId?: string;
     verifiedAt?: string;
+}
+
+/** Pre-effect retirement cannot resolve an ambiguous staging mutation. */
+export function isPreEffectStagingRun(run: Run): boolean {
+    const op = run.operation;
+    return run.kind === 'delivery' && op?.action === 'deploy_staging' && op.phase === 'build_discovery'
+        && op.effectIntentGeneration === undefined && op.stagingEffectStage === undefined && op.stagingReceipt === undefined;
 }

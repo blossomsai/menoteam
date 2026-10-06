@@ -307,6 +307,20 @@ describe('staging delivery Connector integration', () => {
     expect(result.buildStatuses).toEqual(['discovering']);expect(result.buildReceipts).toEqual([]);expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);expect(result.stoppedAcks).toEqual([1]);expect(result.spools).toEqual([]);
   });
 
+  it('acknowledges a failed pre-effect discovery only after its local cleanup has joined',async()=>{
+    const claim=stagingClaim();claim.run.operation!.phase='build_discovery';claim.run.operation!.imageDigest=undefined;
+    let cleanup=false;
+    const result=await execute(claim,async()=>({authorized:true,action:'discover'}),async()=>{throw new Error('SSH must not start');},{buildDiscovery:async()=>{try{throw new Error('build unavailable');}finally{cleanup=true;}},stopAck:async(_attempt,spool)=>{expect(cleanup).toBe(true);expect(spool).toMatchObject({stagingDiscoveryStopped:true,completion:{error:expect.any(String)}});}});
+    expect(result.completions).toHaveLength(1);expect(result.stoppedAcks).toEqual([1]);expect(result.receipts).toEqual([]);expect(result.spools).toEqual([]);
+  });
+
+  it('confirms local stop when mutation permission is revoked after build discovery but before intent',async()=>{
+    const claim=stagingClaim();claim.run.operation!.phase='build_discovery';claim.run.operation!.imageDigest=undefined;
+    const discovered:StagingBuildReceipt={schemaVersion:1,repository:'blossomsai/menoteam',repositoryId:'88',workflowPath:'.github/workflows/build-workbench-image.yml',runId:123,runAttempt:2,artifactId:456,archiveDigest:`sha256:${'e'.repeat(64)}`,artifactExpiresAt:new Date(Date.now()+60_000).toISOString(),sourceSha:commitSha,imageRepository:repository,imageDigest,runUrl:'https://github.com/blossomsai/menoteam/actions/runs/123'};
+    const result=await execute(claim,async effect=>{if(effect==='discovery')return{authorized:true,action:'discover'};throw new Error('policy revoked before mutation intent');},async()=>{throw new Error('SSH must not start');},{buildDiscovery:async()=>discovered});
+    expect(result.buildReceipts).toHaveLength(1);expect(result.completions).toHaveLength(1);expect(result.stoppedAcks).toEqual([1]);expect(result.receipts).toEqual([]);expect(result.spools).toEqual([]);
+  });
+
   it('aborts discovery provenance on lease loss without freezing a receipt or starting SSH',async()=>{
     const claim=stagingClaim();claim.run.operation!.phase='build_discovery';claim.run.operation!.imageDigest=undefined;
     const discovered:StagingBuildReceipt={schemaVersion:1,repository:'blossomsai/menoteam',repositoryId:'88',workflowPath:'.github/workflows/build-workbench-image.yml',runId:123,runAttempt:2,artifactId:456,archiveDigest:`sha256:${'e'.repeat(64)}`,artifactExpiresAt:new Date(Date.now()+60_000).toISOString(),sourceSha:commitSha,imageRepository:repository,imageDigest,runUrl:'https://github.com/blossomsai/menoteam/actions/runs/123'};

@@ -1290,6 +1290,78 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const cross=(await memberReq('POST',`/works/${otherWork.id}/delivery`,{candidateRunId:candidateId,candidateRevision:revision,action:'create_draft_pr',requestId:'cross-project'}));
         expect(cross.statusCode).toBe(403);
     });
+    it('retires only stopped pre-effect staging reservations without reviving their canonical source',async()=>{
+        const p=checkedJson(await user('POST','/projects',{name:'Staging retirement proof',repositoryUrl:'https://github.com/example/retire-proof'})) as Project;
+        const enrolled=await enrollProvider('staging-retire-connector',[p.id]);
+        const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Retire old source'})) as Work;
+        const actorId=checkedJson(await user('GET','/me')).id as string;
+        const caps={...fixtureCapabilities,runKinds:[],git:true,githubWrite:true,deliveryActions:['deploy_staging'],deploymentTargets:['staging']};
+        const connectorPost=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${enrolled.token}`},payload:payload as never});
+        expect((await connectorPost('/claim',{capabilities:caps})).statusCode).toBe(204);
+        const policy=checkedJson(await user('POST','/settings',{projectId:p.id,kind:'connection',name:'Retire delivery policy',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',baseBranch:'main',allowDraftPr:true,allowStagingDeploy:true,stagingTargets:['staging'],configuredBy:actorId}}));
+        const source=(sha:string):Run=>({id:randomUUID(),projectId:p.id,workId:work.id,prompt:'verified merged source',requestedBy:actorId,kind:'delivery',model:'internal',reasoning:'none',status:'completed',generation:1,connectorId:enrolled.id,targetConnectorId:enrolled.id,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),operation:{action:'merge_pr',actorId,candidateRunId:randomUUID(),candidateRevision:'fixture',artifactRevision:'fixture',commitSha:'a'.repeat(40),candidateFingerprint:'b'.repeat(64),repositoryUrl:p.repositoryUrl,baseRevision:'c'.repeat(40),baseBranch:'main',remoteBranch:'codex/retire',workTitle:work.title,changeSummary:'verified',qaStatus:'current',phase:'merged',effectIntentGeneration:1,external:{mergeSha:sha}}});
+        const a=source('d'.repeat(40)),b=source('e'.repeat(40));
+        for(const run of [a,b])await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${run.id},'run',${p.id},${sql.json(run as never)})`;
+        const request=(sourceMergeRunId:string,requestId:string)=>user('POST',`/works/${work.id}/staging`,{sourceMergeRunId,targetId:'staging',requestId});
+        const retire=(run:Run)=>user('POST',`/runs/${run.id}/staging/retire`,{generation:run.generation});
+        const reservationScope=`staging-target:${p.id}:staging`;
+        const reserved=async()=>sql`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation'`;
+        const read=async(id:string)=>(await sql`SELECT data FROM wb_records WHERE id=${id} AND kind='run'`)[0]!.data as Run;
+        checkedJson(await request(a.id,'retire-a'));
+        const claimed=checkedJson(await connectorPost('/claim',{capabilities:{...caps,runKinds:['delivery']}})).run as Run;
+        checkedJson(await connectorPost(`/runs/${claimed.id}/staging-build-status`,{generation:claimed.generation,status:'failed'}));
+        checkedJson(await connectorPost(`/runs/${claimed.id}/complete`,{generation:claimed.generation,error:'old source has no fixed build'}));
+        expect((await retire(claimed)).statusCode).toBe(409); // Failed/expired lease alone is never stop proof.
+        expect((await request(b.id,'blocked-b')).statusCode).toBe(409);
+        checkedJson(await connectorPost(`/runs/${claimed.id}/stopped`,{generation:claimed.generation}));
+        const disabled=checkedJson(await user('PATCH',`/settings/${policy.id}`,{expectedUpdatedAt:policy.updatedAt,data:{enabled:false}}));
+        const [retired,lateGrant]=await Promise.all([retire(claimed),connectorPost(`/runs/${claimed.id}/staging-authorize`,{generation:claimed.generation,effect:'provenance'})]);
+        expect(lateGrant.statusCode).toBe(409);
+        const saved=checkedJson(retired).run as Run;
+        expect(saved).toMatchObject({status:'failed',generation:claimed.generation+1,operation:{phase:'build_discovery',stagingRetired:{by:actorId,generation:claimed.generation},buildStatus:'failed'}});
+        expect(await reserved()).toHaveLength(0);
+        expect(checkedJson(await retire(claimed)).run).toEqual(saved); // Same-generation retirement retry is idempotent.
+        expect((await request(a.id,'retire-a')).statusCode).toBe(409);
+        expect((await request(a.id,'retire-a-new-request')).statusCode).toBe(409);
+        expect((await connectorPost(`/runs/${claimed.id}/staging-build-status`,{generation:claimed.generation,status:'discovering'})).statusCode).toBe(409);
+        const receipt={schemaVersion:1,repository:'blossomsai/menoteam',repositoryId:'123',workflowPath:'.github/workflows/build-workbench-image.yml',runId:123,runAttempt:1,artifactId:456,archiveDigest:`sha256:${'1'.repeat(64)}`,artifactExpiresAt:new Date(Date.now()+86400000).toISOString(),sourceSha:a.operation!.external!.mergeSha,imageRepository:'ghcr.io/blossomsai/menoteam-work-map',imageDigest:`sha256:${'2'.repeat(64)}`,runUrl:'https://github.com/blossomsai/menoteam/actions/runs/123'};
+        expect((await connectorPost(`/runs/${claimed.id}/staging-build-receipt`,{generation:claimed.generation,receipt})).statusCode).toBe(409);
+        checkedJson(await user('PATCH',`/settings/${policy.id}`,{expectedUpdatedAt:disabled.updatedAt,data:{enabled:true}}));
+        const next=checkedJson(await request(b.id,'unblocked-b')).run as Run;
+        expect(next.id).not.toBe(claimed.id);expect((await reserved())[0]!.result).toMatchObject({runId:next.id});
+        checkedJson(await user('POST',`/runs/${next.id}/cancel`)); // Unclaimed queue can confirm its own local stop.
+        await sql`UPDATE wb_requests SET result=${sql.json({runId:'foreign-operation'} as never)} WHERE scope=${reservationScope} AND request_id='reservation'`;
+        expect((await retire(next)).statusCode).toBe(409);expect((await reserved())[0]!.result).toMatchObject({runId:'foreign-operation'});
+        await sql`UPDATE wb_requests SET result=${sql.json({runId:next.id} as never)} WHERE scope=${reservationScope} AND request_id='reservation'`;
+        const cancelled=await read(next.id);
+        for(const delta of [{phase:'deploy_unknown',effectIntentGeneration:next.generation},{phase:'deploy_intent',effectIntentGeneration:0},{stagingEffectStage:'transport_intent'},{stagingReceipt:{phase:'unknown'}}]){
+            const altered={...cancelled,operation:{...cancelled.operation!,...delta}};
+            await sql`UPDATE wb_records SET data=${sql.json(altered as never)} WHERE id=${next.id}`;
+            expect((await retire(next)).statusCode).toBe(409);expect((await reserved())[0]!.result).toMatchObject({runId:next.id});
+        }
+        await sql`UPDATE wb_records SET data=${sql.json(cancelled as never)} WHERE id=${next.id}`;
+        const invitation=checkedJson(await user('POST','/invites',{email:'retire-workspace-admin@test.example',role:'admin'}));
+        checkedJson(await app.inject({method:'POST',url:'/api/workbench/invites/accept',payload:{token:invitation.token,name:'Retire Admin',password:'retire-admin-password'}}));
+        const adminSession=await app.inject({method:'POST',url:'/api/workbench/session',payload:{email:'retire-workspace-admin@test.example',password:'retire-admin-password'}});
+        const adminCookie=String(adminSession.headers['set-cookie']).split(';')[0]!;
+        const adminId=(await sql`SELECT id FROM wb_users WHERE email='retire-workspace-admin@test.example'`)[0]!.id as string;
+        const adminRetire=()=>app.inject({method:'POST',url:`/api/workbench/runs/${next.id}/staging/retire`,headers:{cookie:adminCookie},payload:{generation:next.generation}});
+        expect((await adminRetire()).statusCode).toBe(403);
+        await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES (${adminId},${p.id},'member')`;
+        expect((await adminRetire()).statusCode).toBe(403);
+        await sql`UPDATE wb_memberships SET role='admin' WHERE user_id=${adminId} AND project_id=${p.id}`;
+        checkedJson(await adminRetire());expect(await reserved()).toHaveLength(0);
+        const c=source('f'.repeat(40));await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${c.id},'run',${p.id},${sql.json(c as never)})`;
+        checkedJson(await request(c.id,'intent-wins-c'));
+        const intentClaim=checkedJson(await connectorPost('/claim',{capabilities:{...caps,runKinds:['delivery']}})).run as Run;
+        checkedJson(await connectorPost(`/runs/${intentClaim.id}/staging-build-receipt`,{generation:intentClaim.generation,receipt:{...receipt,sourceSha:c.operation!.external!.mergeSha}}));
+        checkedJson(await connectorPost(`/runs/${intentClaim.id}/staging-authorize`,{generation:intentClaim.generation,effect:'provenance'}));
+        checkedJson(await user('POST',`/runs/${intentClaim.id}/cancel`));
+        checkedJson(await connectorPost(`/runs/${intentClaim.id}/stopped`,{generation:intentClaim.generation}));
+        expect((await retire(intentClaim)).statusCode).toBe(409);expect((await reserved())[0]!.result).toMatchObject({runId:intentClaim.id});
+        const canonical=await sql`SELECT result FROM wb_requests WHERE scope=${`staging-operation:${p.id}:staging:${a.id}`} AND request_id='canonical'`;
+        expect(canonical).toHaveLength(1);expect(canonical[0]!.result.run.id).toBe(claimed.id);
+    });
     it('reserves staging by target, authorizes effects against the merged receipt, and keeps revoked intents read-only',async()=>{
         const p=checkedJson(await user('POST','/projects',{name:'Staging authorization proof',repositoryUrl:'https://github.com/example/staging-proof'})) as Project;
         const enrolled=await enrollProvider('staging-proof-connector',[p.id]);

@@ -1,11 +1,10 @@
-import { execFile as execFileCb, spawn } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
+import { execFileJoined as execFile } from './exec-file.js';
 import { lstat, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { StagingDeploymentTarget } from './types.js';
 import { readProcessIdentity, terminateProcessGroup, waitProcessGroup, type CodexProcessIdentity } from './codex.js';
 
-const execFile = promisify(execFileCb);
 const HELPER = '/usr/local/libexec/menoteam-staging-delivery';
 const SHA = /^[a-f0-9]{40}$/u;
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;

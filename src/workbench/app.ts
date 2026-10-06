@@ -11,7 +11,7 @@ import { registerSourceRoutes } from "./sources.js";
 import { WorkbenchStore } from "./store.js";
 import { requiresLocalWorktree } from "./execution-capabilities.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
-import { isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
+import { isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
@@ -609,7 +609,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     }
     function stagingReservationScope(projectId:string,targetId:string){return `staging-target:${projectId}:${targetId}`;}
     async function validateStagingBuildRun(run:Run,tx:Sql){
-        const op=run.operation;if(run.kind!=='delivery'||op?.action!=='deploy_staging'||op.phase!=='build_discovery'||!op.targetId||!op.sourceMergeRunId||!op.commitSha||!op.actorId||op.actorId!==run.requestedBy)fail(409,'Staging build discovery is unavailable');
+        const op=run.operation;if(op?.stagingRetired||run.kind!=='delivery'||op?.action!=='deploy_staging'||op.phase!=='build_discovery'||!op.targetId||!op.sourceMergeRunId||!op.commitSha||!op.actorId||op.actorId!==run.requestedBy)fail(409,'Staging build discovery is unavailable');
         const capsRows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${run.connectorId!}`;const caps=capsRows[0]?.capabilities as Record<string,unknown>|undefined;
         if(!caps||!Array.isArray(caps.deploymentTargets)||!caps.deploymentTargets.includes(op.targetId)||!Array.isArray(caps.deliveryActions)||!caps.deliveryActions.includes('deploy_staging'))fail(409,'Configured staging Connector capability is unavailable');
         if(!await actorAuthorized(run,tx))fail(403,'Staging actor authorization was revoked');
@@ -622,6 +622,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     }
     async function resumeStagingIntent(saved:{run:Run;operationId:string},requestScope:string,requestId:string,workId:string,targetId:string,sourceMergeRunId:string,tx:Sql,previousDeploymentRunId?:string){
         const run=await store.get<Run>('run',saved.run.id,tx);if(!run||run.workId!==workId||run.operation?.targetId!==targetId||run.operation.sourceMergeRunId!==sourceMergeRunId||previousDeploymentRunId&&run.operation.previousDeploymentRunId!==previousDeploymentRunId)fail(409,'Saved staging operation identity changed');
+        if(run.operation?.stagingRetired)fail(409,'Staging operation was retired; use a different merged source');
         const op=run.operation!,hasIntent=Boolean(op.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase);
         const buildDiscovery=op.action==='deploy_staging'&&op.phase==='build_discovery'&&!hasIntent;
         if(!hasIntent&&!buildDiscovery)return undefined;
@@ -682,6 +683,23 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const saved={run,operationId:run.id};await store.put('run',run,tx);
         await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'deploy_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;
         return saved;
+    }
+    async function retireStagingDeploy(user:Member,runId:string,raw:unknown,tx:Sql,projectBoundary?:string){
+        const body=z.object({generation:z.number().int().nonnegative()}).strict().parse(raw);
+        const run=await store.get<Run>('run',runId,tx);
+        if(!run||projectBoundary&&run.projectId!==projectBoundary)fail(404,'Staging Run missing');
+        const users=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;
+        const memberships=await tx`SELECT role FROM wb_memberships WHERE user_id=${user.id} AND project_id=${run.projectId}`;
+        if(users[0]?.role!=='owner'&&(users[0]?.role!=='admin'||!['owner','admin'].includes(String(memberships[0]?.role))))fail(403,'Staging retirement requires a workspace owner or project administrator');
+        if(run.operation?.stagingRetired){if(run.operation.stagingRetired.generation!==body.generation)fail(409,'Staging retirement generation changed');return {run,operationId:run.id};}
+        if(run.generation!==body.generation||!isPreEffectStagingRun(run)||!run.operation?.targetId||!['failed','cancelled','interrupted'].includes(run.status)||!run.stoppedAt)fail(409,'Only a stopped pre-effect staging Run can be retired');
+        const reservationScope=stagingReservationScope(run.projectId,run.operation.targetId);
+        const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
+        if(!reservation[0]||(reservation[0].result as {runId?:string}).runId!==run.id)fail(409,'Staging Run no longer owns the target reservation');
+        run.operation.stagingRetired={at:now(),by:user.id,generation:run.generation};
+        run.generation++;run.leaseUntil=undefined;run.updatedAt=now();await store.put('run',run,tx);
+        await tx`DELETE FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' AND result->>'runId'=${run.id}`;
+        return {run,operationId:run.id};
     }
     async function requestStagingRollback(user:Member,workId:string,raw:unknown,tx=sql,projectBoundary?:string){
         const b=z.object({deploymentRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
@@ -753,6 +771,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     });
     app.post('/api/workbench/works/:id/merge',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`delivery:${workId}`,tx=>requestMergePr(user,workId,req.body,tx));});
     app.post('/api/workbench/works/:id/staging',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,tx=>requestStagingDeploy(user,workId,req.body,tx));});
+    app.post('/api/workbench/runs/:id/staging/retire',async req=>{const runId=(req.params as {id:string}).id;return store.transaction(`run:${runId}`,async tx=>retireStagingDeploy(await member(req,tx),runId,req.body,tx));});
     app.post('/api/workbench/works/:id/staging/rollback',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,tx=>requestStagingRollback(user,workId,req.body,tx));});
     app.get("/api/workbench/works/:id", async (req) => {
         const w = await store.get<Work>("work", (req.params as {
@@ -1204,7 +1223,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.post('/api/workbench/connector/runs/:id/staging-authorize',async req=>store.transaction(`run:${(req.params as {id:string}).id}`,async tx=>{
         const c=await connector(req);const run=await store.get<Run>('run',(req.params as {id:string}).id,tx);const body=z.object({generation:z.number(),effect:z.enum(['discovery','provenance','transport','status'])}).strict().parse(req.body);
         if(!run||run.kind!=='delivery'||!run.operation||!['deploy_staging','rollback_staging'].includes(run.operation.action)||run.connectorId!==c.id||!c.projectIds.includes(run.projectId))fail(403,'Staging operation unavailable');
-        const op=run.operation,targetId=op.targetId;if(!targetId||!op.sourceMergeRunId||!op.commitSha||op.action==='rollback_staging'&&!op.imageDigest||op.action==='deploy_staging'&&op.phase!=='build_discovery'&&!op.imageDigest)fail(409,'Staging operation identity is incomplete');
+        const op=run.operation,targetId=op.targetId;if(op.stagingRetired)fail(409,'Staging operation was retired');if(!targetId||!op.sourceMergeRunId||!op.commitSha||op.action==='rollback_staging'&&!op.imageDigest||op.action==='deploy_staging'&&op.phase!=='build_discovery'&&!op.imageDigest)fail(409,'Staging operation identity is incomplete');
         const capsRows=await tx`SELECT capabilities FROM wb_connectors WHERE id=${c.id}`;const caps=capsRows[0]?.capabilities as Record<string,unknown>|undefined;
         const hasIntent=Boolean(op.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase);
         const statusOnly=body.effect==='status'||run.generation!==body.generation||run.status!=='running'||Date.parse(run.leaseUntil??'')<Date.now()||(['deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase));
@@ -1274,7 +1293,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             const runs = await store.list<Run>("run", undefined, tx);
             const isStagingStatusOnly=(run:Run)=>!!run.operation&&['deploy_staging','rollback_staging'].includes(run.operation.action)&&Boolean(run.operation.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(run.operation.phase);
             const canClaimDelivery=(run:Run)=>{
-                const op=run.operation;if(!op)return false;
+                const op=run.operation;if(!op||op.stagingRetired)return false;
                 if(isStagingStatusOnly(run))return Array.isArray(body.capabilities?.deploymentTargets)&&!!op.targetId&&body.capabilities.deploymentTargets.includes(op.targetId);
                 return body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&body.capabilities.deliveryActions.includes(op.action);
             };
@@ -1540,7 +1559,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await grant(actors[0] as unknown as Member, r.projectId, false, tx);
         const b = z.object({
             generation: z.number(),
-            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "request_staging_deploy", "request_staging_rollback", "submit_review_result", "post_message", "update_settings", "create_skill"]),
+            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "request_staging_deploy", "request_staging_rollback", "retire_staging_deploy", "submit_review_result", "post_message", "update_settings", "create_skill"]),
             input: z.record(z.string(), z.unknown()),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
@@ -1553,7 +1572,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         }
         if(b.action==='request_delivery'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request delivery');
         if(b.action==='request_merge'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request merge');
-        if((b.action==='request_staging_deploy'||b.action==='request_staging_rollback')&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request staging delivery');
+        if((b.action==='request_staging_deploy'||b.action==='request_staging_rollback'||b.action==='retire_staging_deploy')&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request staging delivery');
         if(b.action==='dispatch'&&r.sourceIds?.length&&!(await store.get<Project>('project',r.projectId,tx))?.feedbackIntake?.allowExecution)fail(403,'Feedback execution grant revoked');
         if(r.allowedActions&&!r.allowedActions.includes(b.action))fail(403,'This intake grant does not authorize that action');
         const skillInput = b.action === 'create_skill' ? z.object({ scope: z.enum(['project', 'workspace']).optional(), name: text, data: z.record(z.string(), z.unknown()) }).strict().parse(b.input) : undefined;
@@ -1656,6 +1675,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             const input=z.object({workId:text,sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
             const {workId,...request}=input;result=await requestStagingDeploy(actors[0] as unknown as Member,workId,request,tx,r.projectId);
         }
+        else if (b.action === 'retire_staging_deploy') {
+            const input=z.object({runId:text,generation:z.number().int().nonnegative()}).strict().parse(b.input);
+            result=await retireStagingDeploy(actors[0] as unknown as Member,input.runId,{generation:input.generation},tx,r.projectId);
+        }
         else if (b.action === 'request_staging_rollback') {
             const input=z.object({workId:text,deploymentRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(b.input);
             const {workId,...request}=input;result=await requestStagingRollback(actors[0] as unknown as Member,workId,request,tx,r.projectId);
@@ -1738,6 +1761,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             if (r!.status !== "interrupted")
                 fail(409, "Only interrupted runs require reconciliation");
             if (!r!.stoppedAt) fail(409,'Connector must verify the old process stopped before resuming');
+            if(r!.operation?.stagingRetired)fail(409,'Staging operation was retired');
             if(r!.kind!=='delivery')await validateRunSelection(r!,tx);
             r!.status = "queued";
             r!.updatedAt = now();
@@ -1868,7 +1892,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 r!.status='interrupted';
                 r!.error='Connector confirmed unexpected process stop; reconciliation required';
                 r!.updatedAt=now();
-            } else if (!["paused", "cancelled", "interrupted"].includes(r!.status))
+            } else if (!["paused", "cancelled", "interrupted"].includes(r!.status) && !(r!.status === 'failed' && isPreEffectStagingRun(r!) && !r!.operation?.stagingRetired))
                 fail(409, "Stop acknowledgement not expected");
             r!.stoppedAt = now();
             r!.threadId = body.threadId ?? r!.threadId;
@@ -1888,6 +1912,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             await grant(u, r!.projectId);
             if (r!.status !== "paused" || !r!.stoppedAt)
                 fail(409, "Paused execution must confirm stopped before resume");
+            if(r!.operation?.stagingRetired)fail(409,'Staging operation was retired');
             if(r!.kind!=='delivery')await validateRunSelection(r!,tx);
             r!.status = "queued";
             r!.updatedAt = now();
