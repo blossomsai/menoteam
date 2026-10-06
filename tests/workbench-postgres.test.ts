@@ -1308,6 +1308,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(invalid.json().issues).toEqual([{path:['prompt'],code:'too_big'}]);
         expect(invalid.body).not.toContain('x'.repeat(100));
         const masterWork=await send(`/runs/${master.id}/tools`,{generation:master.generation,action:'read_work',input:{workId:work.id},requestId:'master-read-work'});
+        expect(masterWork.statusCode).toBe(200);
         expect(masterWork.json().reviewAssignment).toBeUndefined();
         const review=(await send(`/runs/${master.id}/tools`,{generation:master.generation,action:'dispatch',input:{workId:work.id,kind:'review',model:'gpt-6.1-sol',prompt:'Review exact evidence'},requestId:'dispatch-review'})).json();
         await send(`/runs/${master.id}/complete`,{generation:master.generation,threadId:'master-thread'});
