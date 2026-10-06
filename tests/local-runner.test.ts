@@ -27,6 +27,7 @@ async function waitForFile(file: string, timeoutMs = 2_000, process?: Promise<un
     () => Promise.reject(new Error(`Process exited before file was created: ${file}`)),
     (error) => Promise.reject(error),
   );
+  void exited?.catch(() => undefined);
   while (Date.now() < deadline) {
     try { return await readFile(file, 'utf8'); } catch { /* Keep waiting until the bounded deadline. */ }
     const delay = new Promise((resolve) => setTimeout(resolve, Math.min(20, deadline - Date.now())));
@@ -59,6 +60,14 @@ let input=''; process.stdin.on('data',c=>input+=c); process.stdin.on('end',()=>{
     await expect(handle.result).resolves.toEqual({ output: 'final reply', threadId: 'thread_one' });
     expect(events.map((event) => event.type)).toEqual(['thread.started', 'agent_message']);
     expect(events[1]?.threadId).toBe('thread_one');
+  });
+
+  it('handles an existing readiness file when the runner exits afterward', async () => {
+    const { handle, folder } = await fake(`process.stdin.resume(); setTimeout(()=>process.exit(0),50);`);
+    const heartbeat = join(folder, 'heartbeat');
+    await writeFile(heartbeat, 'ready');
+    await expect(waitForFile(heartbeat, 1_000, handle.result)).resolves.toBe('ready');
+    await expect(handle.result).resolves.toEqual({ output: '' });
   });
 
   it.each([0, 1])('reports stdout turn.failed even when exit code is %s', async (code) => {
