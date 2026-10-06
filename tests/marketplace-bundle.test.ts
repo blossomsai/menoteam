@@ -98,10 +98,11 @@ it('lists metadata without skill reads and hydrates only the selected public 71-
     expect(duplicatePaths.statusCode).toBe(400);expect(f.requests.some(url=>url.startsWith('https://raw.githubusercontent.com/')&&new URL(url).pathname.includes('/skills/'))).toBe(false);
     const original=f.app;
     // The fixture fetcher returns raw bytes; enforce and observe its bounded concurrency through the request list.
+    const rawRequestsBeforeHydration=f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/')).length;
     const hydrated=await original.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'fixture',selectedPaths:['skills/one/SKILL.md']}});
     expect(hydrated.statusCode).toBe(200); expect(hydrated.json().skills[0].bundleFiles).toHaveLength(71);
     expect(hydrated.json().skills[0].bundleFiles.reduce((total:number,file:{bytes:number})=>total+file.bytes,0)).toBe(204_725);
-    expect(f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/'))).toHaveLength(73); // catalog, plugin manifest, then 71 selected files
+    expect(f.requests.filter(url=>url.startsWith('https://raw.githubusercontent.com/'))).toHaveLength(rawRequestsBeforeHydration+73); // catalog, plugin manifest, then 71 selected files
     expect(f.state.maxRaw).toBeLessThanOrEqual(4);
     expect(f.rawRedirects.every(value=>value==='error')).toBe(true);
     expect(f.records()).toEqual([]);
