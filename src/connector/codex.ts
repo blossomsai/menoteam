@@ -12,7 +12,8 @@ const execFile = promisify(execFileCb);
 type RpcMessage = { id?: number | string; method?: string; params?: any; result?: any; error?: { message?: string; code?: number } };
 type ToolHandler = (name: string, input: Record<string, unknown>, requestId: string) => Promise<unknown>;
 
-const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','request_merge','post_message','update_settings','create_skill'];
+const STAGING_BRIDGE_TOOLS = ['request_staging_deploy','request_staging_rollback','retire_staging_deploy'];
+const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','request_merge',...STAGING_BRIDGE_TOOLS,'post_message','update_settings','create_skill'];
 const REVIEW_BRIDGE_TOOLS = ['read_work','read_run','submit_review_result'];
 
 function scopedBridgeConfig(contextFile: string, tools: string[]) {
@@ -91,7 +92,9 @@ export class CodexAppServer {
     if ((claim.run.kind === 'master' || claim.run.kind === 'review') && !bridgeContextFile) {
       throw new Error(`${claim.run.kind} run needs its scoped MCP context file`);
     }
-    const bridgeTools = claim.run.kind === 'master' ? MASTER_BRIDGE_TOOLS : claim.run.kind === 'review' ? REVIEW_BRIDGE_TOOLS : undefined;
+    const bridgeTools = claim.run.kind === 'master' ? MASTER_BRIDGE_TOOLS.filter(tool =>
+      (!claim.run.allowedActions || claim.run.allowedActions.includes(tool)) &&
+      (!claim.run.sourceIds?.length || !STAGING_BRIDGE_TOOLS.includes(tool))) : claim.run.kind === 'review' ? REVIEW_BRIDGE_TOOLS : undefined;
     const config = bridgeTools ? scopedBridgeConfig(bridgeContextFile!, bridgeTools) : undefined;
     const sandbox = claim.run.kind === 'implementation' ? 'workspace-write' : 'read-only';
     const boundary = { cwd, sandbox, approvalPolicy: 'never', model: claim.run.model, ...(config ? { config } : {}) };

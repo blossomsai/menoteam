@@ -5,6 +5,40 @@ import path from 'node:path';
 import { expect, it, vi } from 'vitest';
 import { CodexAppServer } from '../src/connector/codex.js';
 import type { ClaimedRun } from '../src/connector/types.js';
+import type { Run } from '../src/workbench/types.js';
+
+async function generatedThreadConfig(run:Partial<Run>){
+ const native=new CodexAppServer();let boundary:any;
+ const internals=native as unknown as {child:unknown;events:EventEmitter;request:(method:string,params:any)=>Promise<any>};
+ internals.child={};native.models=['gpt-6.1-sol'];
+ internals.request=async(method,params)=>{
+  if(method==='thread/start'){boundary=params;return{thread:{id:'configured-thread'}};}
+  if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{turn:{id:'configured-turn',status:'completed'}}}),0);return{turn:{id:'configured-turn'}};}
+  throw new Error('Unexpected RPC');
+ };
+ await native.run({run:{model:'gpt-6.1-sol',reasoning:'medium',...run}} as ClaimedRun,'/isolated-config','bounded request',undefined,()=>{},'/private-context.json');
+ return boundary.config?.mcp_servers.menoteam;
+}
+
+it('enables the three registered staging tools in the generated Project Master config',async()=>{
+ const config=await generatedThreadConfig({kind:'master'});
+ const staging=['request_staging_deploy','request_staging_rollback','retire_staging_deploy'];
+ expect(config.enabled_tools).toEqual(['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','request_merge',...staging,'post_message','update_settings','create_skill']);
+ const bridge=await readFile(new URL('../src/connector/mcp-bridge.ts',import.meta.url),'utf8');
+ for(const tool of staging){expect(config.tools[tool]).toEqual({approval_mode:'approve'});expect(bridge).toContain(`tool('${tool}',`);}
+});
+
+it('limits generated Master config to its explicit allowedActions and keeps feedback staging unavailable',async()=>{
+ expect((await generatedThreadConfig({kind:'master',allowedActions:['read_work','retire_staging_deploy']})).enabled_tools).toEqual(['read_work','retire_staging_deploy']);
+ expect((await generatedThreadConfig({kind:'master',sourceIds:['untrusted-feedback'],allowedActions:['read_work','request_staging_deploy','request_staging_rollback','retire_staging_deploy']})).enabled_tools).toEqual(['read_work']);
+ expect((await generatedThreadConfig({kind:'master',allowedActions:[]})).enabled_tools).toEqual([]);
+});
+
+it.each(['review','implementation','delivery'] as const)('does not expose staging tools to a %s native run',async kind=>{
+ const config=await generatedThreadConfig({kind});
+ if(kind==='review')expect(config.enabled_tools).toEqual(['read_work','read_run','submit_review_result']);
+ else expect(config).toBeUndefined();
+});
 
 it('resumes the same persisted native thread without hydrating its growing history response',async()=>{
  const native=new CodexAppServer();
