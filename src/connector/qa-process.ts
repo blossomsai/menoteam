@@ -20,7 +20,7 @@ function assertResourceSet(state:QaExecution):void {
   const locks=explicit?state.resourceLocks!:(state.resourceLock?[state.resourceLock]:[]);
   if(typeof state.nonce!=='string'||!state.nonce||locks.some(lock=>!lock||!validDirectory(lock.directory)||lock.owner!==state.nonce)||new Set(locks.map(lock=>lock.directory)).size!==locks.length)throw new Error('QA resource ownership set is invalid; no GO or release permitted');
   if(expected!==undefined){
-    const directories=locks.map(lock=>lock.directory).sort();
+    const directories=locks.map(lock=>lock.directory);
     if(!Array.isArray(expected)||expected.some(value=>!validDirectory(value))||new Set(expected).size!==expected.length||JSON.stringify(expected)!==JSON.stringify([...expected].sort())||JSON.stringify(directories)!==JSON.stringify(expected))throw new Error('QA resource ownership set does not match frozen intent; no GO or release permitted');
   }
   // Only old single-resource/no-resource states lack this new persisted expectation.
@@ -35,7 +35,7 @@ export function assertQaResourcePolicy(state:QaExecution,policy?:QaPolicy):void 
     return; // Legacy single-resource recovery and generic unconfigured/no-DB state.
   }
   const expected=[...new Set([policy.resource,policy.providerResource].filter(resource=>!!resource).map(resource=>path.join(RESOURCE_ROOT,stateKey(resource!.hostname==='localhost'?'127.0.0.1':resource!.hostname,String(resource!.port),resource!.database))))].sort();
-  const actual=(state.resourceLocks??(state.resourceLock?[state.resourceLock]:[])).map(lock=>lock.directory).sort();
+  const actual=(state.resourceLocks??(state.resourceLock?[state.resourceLock]:[])).map(lock=>lock.directory);
   if(JSON.stringify(actual)!==JSON.stringify(expected))throw new Error('QA resource ownership does not match frozen policy; no GO or release permitted');
 }
 export function qaChildEnvironment(resourceUrl?:string,providerUrl?:string):NodeJS.ProcessEnv {

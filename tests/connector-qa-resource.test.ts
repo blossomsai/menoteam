@@ -18,7 +18,7 @@ const executor={pid:process.pid,processGroupId:process.pid,startedAt:'fixture-ex
 describe('QA resource authorization and conservative startup recovery',()=>{
   beforeEach(()=>{vi.spyOn(processes,'readProcessIdentity').mockResolvedValue(executor);});
   afterEach(()=>vi.restoreAllMocks());
-  it.each(['empty','missing','mismatched','missing-expectation','duplicate','empty-single-fallback'])('rejects %s resource state without GO, claim or releasing either reservation',async mode=>fixture(async directory=>{
+  it.each(['empty','missing','mismatched','missing-expectation','duplicate','reversed','empty-single-fallback'])('rejects %s resource state without GO, claim or releasing either reservation',async mode=>fixture(async directory=>{
     const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
     const execution=state(directory);await acquireQaResource(execution,policy);await claimQaResource(execution,policy);
     const damaged=structuredClone(execution);
@@ -27,8 +27,10 @@ describe('QA resource authorization and conservative startup recovery',()=>{
     if(mode==='mismatched')damaged.expectedResourceDirectories=[execution.resourceLocks![0]!.directory];
     if(mode==='missing-expectation')delete damaged.expectedResourceDirectories;
     if(mode==='duplicate')damaged.resourceLocks!.push(damaged.resourceLocks![0]!);
+    if(mode==='reversed')damaged.resourceLocks!.reverse();
     if(mode==='empty-single-fallback'){damaged.resourceLock=damaged.resourceLocks![0];damaged.resourceLocks=[];delete damaged.expectedResourceDirectories;}
     try{
+      expect(()=>assertQaResourcePolicy(damaged,policy)).toThrow('resource ownership set');
       let go=false;await expect(withQaOwnership(damaged,async()=>{go=true;})).rejects.toThrow('resource ownership set');expect(go).toBe(false);
       await expect(claimQaResource(damaged)).rejects.toThrow('resource ownership set');await expect(releaseQaResource(damaged)).rejects.toThrow('resource ownership set');
       for(const lock of execution.resourceLocks!)expect(JSON.parse(await readFile(path.join(lock.directory,'owner.json'),'utf8')).owner).toBe(execution.nonce);
