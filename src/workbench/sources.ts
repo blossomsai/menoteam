@@ -116,14 +116,31 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         let data: { name?: unknown; plugins?: unknown };
         try { data = JSON.parse(await gitText(catalog.owner, catalog.repo, catalogFile.sha, MAX_CATALOG_BYTES)) as typeof data; } catch { return fail(400, 'Marketplace JSON is invalid'); }
         if (typeof data.name !== 'string' || !data.name.trim() || data.name.length > 120 || !Array.isArray(data.plugins) || data.plugins.length > 300) fail(400, 'Marketplace metadata is invalid');
-        const plugins = data.plugins.map(raw => {
-            const item = z.object({ name: z.string().min(1).max(120), category: z.string().min(1).max(80), policy: z.object({ installation: z.enum(['AVAILABLE', 'INSTALLED_BY_DEFAULT', 'NOT_AVAILABLE']), authentication: z.enum(['ON_INSTALL', 'ON_FIRST_USE']) }).strict(), source: z.unknown() }).passthrough().parse(raw);
+        const plugins = data.plugins.map((raw, index) => {
+            const itemResult = z.object({ name: z.string().min(1).max(120), category: z.string().min(1).max(80), policy: z.unknown(), source: z.unknown() }).passthrough().safeParse(raw);
+            if (!itemResult.success) fail(400, `Marketplace entry ${index + 1} metadata is invalid`);
+            const item = itemResult.data;
+            const policyResult = z.object({ installation: z.enum(['AVAILABLE', 'INSTALLED_BY_DEFAULT', 'NOT_AVAILABLE']), authentication: z.enum(['ON_INSTALL', 'ON_FIRST_USE', 'ON_USE']), products: z.array(z.literal('CODEX')).optional() }).strict().safeParse(item.policy);
+            if (!policyResult.success) {
+                const issue = policyResult.error.issues[0]!;
+                const field = issue.path.length ? `policy.${issue.path.join('.')}` : 'policy';
+                if (issue.code === 'unrecognized_keys') fail(400, `Marketplace entry "${item.name}" policy contains unknown field${issue.keys.length === 1 ? '' : 's'}: ${issue.keys.map(key => `policy.${key}`).join(', ')}`);
+                if (issue.path[0] === 'products') fail(400, `Marketplace entry "${item.name}" policy.products must be an array containing only CODEX values`);
+                fail(400, `Marketplace entry "${item.name}" has invalid ${field}`);
+            }
+            const policy = policyResult.data;
             const description = typeof (raw as Record<string, unknown>).description === 'string' ? String((raw as Record<string, unknown>).description).slice(0, 1024) : '';
             const unsupported = (sourceKind: string, reason = `Source type ${sourceKind} is catalog metadata only and is not installable here`) => ({ name: item.name, description, category: item.category, owner: '', repo: '', pluginPath: '', requestedRef: '', sourceKind, unsupportedReason: reason });
             if (typeof item.source === 'string') { safeRepoPath(item.source); return unsupported('local'); }
             if (!item.source || typeof item.source !== 'object' || Array.isArray(item.source)) fail(400, `Marketplace source is invalid for ${item.name}`);
             const sourceKind = (item.source as Record<string, unknown>).source;
-            if (sourceKind === 'local') { z.object({ source: z.literal('local'), path: z.string().min(1).max(1000) }).strict().parse(item.source); return unsupported('local'); }
+            if (sourceKind === 'local') {
+                const source = z.object({ source: z.literal('local'), path: z.string().min(1).max(1000) }).strict().parse(item.source);
+                if (!source.path.startsWith('./')) fail(400, `Local plugin ${item.name} must use a repository-relative ./ path`);
+                const pluginPath = safeRepoPath(source.path);
+                if (policy.installation === 'NOT_AVAILABLE') return unsupported('local', 'Marketplace policy marks this plugin NOT_AVAILABLE');
+                return { name: item.name, description, category: item.category, owner: catalog.owner, repo: catalog.repo, pluginPath, requestedRef: commit, sourceSha: commit, sourceKind: 'local', unsupportedReason: undefined };
+            }
             if (sourceKind === 'npm') { z.object({ source: z.literal('npm'), package: z.string().min(1).max(255), version: z.string().max(255).optional(), registry: publicHttpsUrl.optional() }).strict().parse(item.source); return unsupported('npm'); }
             const source = z.object({ source: z.enum(['url', 'git-subdir']), url: githubRepo, path: z.string().optional(), ref: z.string().min(1).max(255).optional(), sha: z.string().regex(/^[a-f0-9]{40}$/u).optional() }).strict().parse(item.source);
             const sourceUrl = new URL(source.url); const [owner, rawRepo] = sourceUrl.pathname.split('/').filter(Boolean); const repo = rawRepo?.replace(/\.git$/u, '');
@@ -131,7 +148,7 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
             if (source.ref && source.sha) fail(400, 'Specify either ref or sha for a GitHub plugin source');
             const pluginPath = source.source === 'url' ? '' : safeRepoPath(source.path ?? '');
             if (!owner || !repo) fail(400, 'Invalid plugin repository URL');
-            if (item.policy.installation === 'NOT_AVAILABLE') return unsupported(source.source, 'Marketplace policy marks this plugin NOT_AVAILABLE');
+            if (policy.installation === 'NOT_AVAILABLE') return unsupported(source.source, 'Marketplace policy marks this plugin NOT_AVAILABLE');
             return { name: item.name, description, category: item.category, owner, repo, pluginPath, requestedRef: source.sha ?? source.ref ?? '', sourceSha: source.sha, sourceKind: source.source, unsupportedReason: undefined };
         });
         if (new Set(plugins.map(plugin => plugin.name)).size !== plugins.length) fail(400, 'Marketplace plugin names must be unique');
@@ -147,15 +164,34 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
         const entries = tree.filter(item => item.path.startsWith(prefix));
         const paths = entries.filter(item => item.type === 'blob' && item.mode !== '120000');
         const manifestPath = `${prefix}plugin.json`; const manifestFile = paths.find(item => item.path === manifestPath);
-        if (!manifestFile || (manifestFile.size ?? MAX_SOURCE_BYTES + 1) > MAX_SOURCE_BYTES) fail(400, `Plugin ${plugin.name} has no supported root plugin.json`);
-        let manifest: Record<string, unknown>;
-        try { manifest = JSON.parse(await gitText(plugin.owner!, plugin.repo!, manifestFile.sha)) as Record<string, unknown>; } catch { return fail(400, `Plugin ${plugin.name} manifest JSON is invalid`); }
+        const codexManifestPath = `${prefix}.codex-plugin/plugin.json`; const codexManifestFile = paths.find(item => item.path === codexManifestPath);
+        if (!manifestFile && !codexManifestFile) fail(400, `Plugin ${plugin.name} has no supported plugin manifest`);
+        if ([manifestFile, codexManifestFile].some(file => file && (file.size ?? MAX_SOURCE_BYTES + 1) > MAX_SOURCE_BYTES)) fail(400, `Plugin ${plugin.name} manifest is too large`);
+        const readManifest = async (file: typeof manifestFile) => {
+            if (!file) return undefined;
+            try { return JSON.parse(await gitText(plugin.owner!, plugin.repo!, file.sha)) as Record<string, unknown>; } catch { return fail(400, `Plugin ${plugin.name} manifest JSON is invalid`); }
+        };
+        const [portable, codex] = await Promise.all([readManifest(manifestFile), readManifest(codexManifestFile)]);
         const pluginManifest = z.object({ $schema: z.literal('https://agent-plugins.org/schemas/1.0.0/plugin.schema.json'), name: z.string().min(1).max(64).regex(/^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u), version: z.string().optional(), description: z.string().optional(), author: z.object({ name: z.string().optional(), email: z.string().optional(), url: z.string().optional() }).strict().optional(), homepage: z.string().optional(), repository: z.string().optional(), license: z.string().optional(), keywords: z.array(z.string()).optional(), extensions: z.record(z.string(), z.record(z.string(), z.unknown())).optional() }).strict();
-        const parsedManifest = pluginManifest.safeParse(manifest);
-        if (!parsedManifest.success || manifest.name !== plugin.name) fail(400, `Plugin ${plugin.name} manifest is invalid`);
+        const codexPluginManifest = z.object({ name: z.string().min(1).max(64).regex(/^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u), version: z.string().optional(), description: z.string().optional(), apps: z.union([z.string(), z.array(z.string())]).optional(), skills: z.union([z.string(), z.array(z.string())]).optional(), hooks: z.unknown().optional(), mcpServers: z.unknown().optional(), agents: z.unknown().optional(), commands: z.unknown().optional(), interface: z.record(z.string(), z.unknown()).optional() }).passthrough();
+        if (portable && !pluginManifest.safeParse(portable).success) fail(400, `Plugin ${plugin.name} portable manifest is invalid`);
+        if (codex && !codexPluginManifest.safeParse(codex).success) fail(400, `Plugin ${plugin.name} Codex compatibility manifest is invalid`);
+        if (portable && codex && portable.name !== codex.name) fail(400, `Plugin ${plugin.name} manifests have conflicting identities`);
+        const manifest = portable ?? codex!;
+        if (manifest.name !== plugin.name) fail(400, `Plugin ${plugin.name} manifest identity does not match the catalog`);
+        const extensions = portable?.extensions as Record<string, unknown> | undefined;
+        const inlineOpenAi = extensions?.['com.openai'];
+        if (inlineOpenAi !== undefined && (!inlineOpenAi || typeof inlineOpenAi !== 'object' || Array.isArray(inlineOpenAi))) fail(400, `Plugin ${plugin.name} OpenAI extension must be an object`);
+        const overlay = (inlineOpenAi ?? codex ?? {}) as Record<string, unknown>;
+        const overlayPath = inlineOpenAi !== undefined ? 'plugin.json:extensions.com.openai' : '.codex-plugin/plugin.json';
+        // Official precedence: inline OpenAI settings replace, never merge with, the Codex fallback.
+        const declaredSkills = overlay.skills;
+        if (declaredSkills !== undefined && declaredSkills !== './skills/' && declaredSkills !== './skills') fail(400, `Plugin ${plugin.name} declares an unsupported skill path`);
         const unsupported: string[] = [];
-        const extensions = manifest.extensions as Record<string, Record<string, unknown>> | undefined;
-        for (const [namespace, values] of Object.entries(extensions ?? {})) for (const component of ['mcpServers', 'apps', 'hooks']) if (values[component] !== undefined) unsupported.push(`plugin.json:extensions.${namespace}.${component}`);
+        if (portable && codex && inlineOpenAi !== undefined) unsupported.push('.codex-plugin/plugin.json ignored: replaced by plugin.json extensions.com.openai');
+        for (const component of ['mcpServers', 'apps', 'hooks', 'agents', 'commands']) if (overlay[component] !== undefined) unsupported.push(`${overlayPath}:${component}`);
+        for (const component of ['agents', 'commands']) if (entries.some(item => item.path.startsWith(`${prefix}${component}/`))) unsupported.push(`${component}/`);
+        for (const [namespace, values] of Object.entries(extensions ?? {})) if (namespace !== 'com.openai' && values && typeof values === 'object' && !Array.isArray(values)) for (const component of ['mcpServers', 'apps', 'hooks', 'agents', 'commands']) if ((values as Record<string, unknown>)[component] !== undefined) unsupported.push(`plugin.json:extensions.${namespace}.${component}`);
         const skillFiles = entries.filter(item => item.path.startsWith(`${prefix}skills/`) && item.path.endsWith('/SKILL.md'));
         if (skillFiles.length > MAX_SKILLS) fail(400, 'Plugin exceeds supported skill count');
         const skills: Array<{ name: string; description: string; license?: string; sourcePath: string; content: string; bundle?: Awaited<ReturnType<typeof collectSkillBundle>>; dependencyError?: string; contentSha256: string; sourceContentSha256?: string }> = [];
@@ -174,7 +210,7 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
             skills.push({ ...metadata, sourcePath, content, bundle, dependencyError, contentSha256: bytesHash(content), sourceContentSha256: bundle?.sha256 });
         }
         // Skill regular files are supported bytes; plugin-level components remain uninstalled.
-        unsupported.push(...entries.filter(item => item.type !== 'tree' && !skills.some(skill => item.path.startsWith(`${skill.sourcePath.slice(0, -'/SKILL.md'.length)}/`)) && item.path !== manifestPath && !item.path.endsWith('/README.md') && !item.path.endsWith('/LICENSE')).map(item => item.path));
+        unsupported.push(...entries.filter(item => item.type !== 'tree' && !skills.some(skill => item.path.startsWith(`${skill.sourcePath.slice(0, -'/SKILL.md'.length)}/`)) && item.path !== manifestPath && item.path !== codexManifestPath && !item.path.endsWith('/README.md') && !item.path.endsWith('/LICENSE')).map(item => item.path));
         return { plugin: { ...plugin, description: plugin.description || String(manifest.description ?? '') , requestedRef }, commit, manifest, skills, unsupported: [...new Set(unsupported)] };
     }
     const catalogRequest = z.object({ scope: z.enum(['project', 'workspace']), projectId: z.string().min(1).optional(), catalogUrl: z.string().url().max(2000) }).superRefine((value, context) => {

@@ -62,3 +62,146 @@ it('rejects whole multiselection on incomplete/unsafe files, permission denial a
     const failed=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:f.payload});expect(failed.statusCode).toBe(500);expect(f.records()).toEqual([]);
   }finally{await f.app.close();}
 });
+
+async function codexLocalFixture(options: { path?: string; dual?: boolean; identityConflict?: boolean; components?: boolean; airtableProducts?: unknown; installation?: unknown; authentication?: unknown; unknownPolicyField?: boolean } = {}) {
+  const commit='5fd93af4cd0c623e020d0cc7e9ce178b4ac1f70f';
+  const compat={apps:'./.app.json',author:{name:'Airtable'},description:'Airtable plugin description',interface:{category:'Productivity',displayName:'Airtable'},name:options.identityConflict?'other':'airtable',version:'6.0.1',...(options.components?{hooks:{SessionStart:[]},mcpServers:{airtable:{url:'https://mcp.airtable.com/mcp'}},agents:'./agents/',commands:'./commands/'}:{})};
+  const airtablePolicy:Record<string,unknown>={installation:options.installation??'AVAILABLE',authentication:options.authentication??'ON_INSTALL'};
+  if('airtableProducts' in options)airtablePolicy.products=options.airtableProducts;
+  if(options.unknownPolicyField)airtablePolicy.audience='CODEX';
+  const files=new Map<string,Buffer>([
+    ['.agents/plugins/marketplace.json',Buffer.from(JSON.stringify({name:'openai-curated',interface:{displayName:'Codex official'},plugins:[{name:'airtable',source:{source:'local',path:options.path??'./plugins/airtable'},policy:airtablePolicy,category:'Productivity'},{name:'game-studio',source:{source:'local',path:'./plugins/game-studio'},policy:{installation:'AVAILABLE',authentication:'ON_USE',products:['CODEX']},category:'Test fixture: observed CODEX and ON_USE values'}]}))],
+    ['plugins/airtable/.codex-plugin/plugin.json',Buffer.from(JSON.stringify(compat))],
+    ['plugins/airtable/.app.json',Buffer.from(JSON.stringify({apps:{airtable:{id:'registered-app'}}}))],
+    ['plugins/airtable/.mcp.json',Buffer.from(JSON.stringify({mcpServers:{airtable:{url:'https://mcp.airtable.com/mcp'}}}))],
+    ['plugins/airtable/skills/airtable-cli/SKILL.md',Buffer.from('---\nname: airtable-cli\ndescription: Lists and manages Airtable records.\n---\nInstructions only.')],
+    ['plugins/airtable/skills/airtable-filters/SKILL.md',Buffer.from('---\nname: airtable-filters\ndescription: Filters Airtable records.\n---\nInstructions only.')],
+    ['plugins/airtable/skills/airtable-overview/SKILL.md',Buffer.from('---\nname: airtable-overview\ndescription: Explains Airtable structure.\n---\nInstructions only.')],
+  ]);
+  if(options.dual) files.set('plugins/airtable/plugin.json',Buffer.from(JSON.stringify({$schema:'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json',name:'airtable',version:'0.2.0',description:'Portable canonical identity',extensions:{'com.openai':{interface:{displayName:'Inline OpenAI overlay'}}}})));
+  const state={denied:false,truncated:false,symlink:false,commitMismatch:false,failWrite:0,writes:0};
+  let records:Setting[]=[];
+  const store=new WorkbenchStore(null as unknown as Sql);
+  vi.spyOn(store,'list').mockImplementation(async()=>structuredClone(records));
+  vi.spyOn(store,'put').mockImplementation(async(_kind,data)=>{if(++state.writes===state.failWrite)throw new Error('Injected write failure');records.push(structuredClone(data) as Setting);});
+  vi.spyOn(store,'transaction').mockImplementation(async(_scope,fn)=>{const before=structuredClone(records);try{return await fn(null as unknown as Sql);}catch(error){records=before;throw error;}});
+  const requests:string[]=[];
+  const app=Fastify();
+  await registerSourceRoutes(app,store,{
+    authorize:async()=>{if(state.denied)throw Object.assign(new Error('Denied'),{statusCode:403});},
+    fetcher:async input=>{
+      const url=new URL(String(input));requests.push(url.href);
+      if(url.pathname.includes('/commits/'))return Response.json({sha:state.commitMismatch?'c'.repeat(40):commit});
+      if(url.pathname.includes('/git/trees/'))return Response.json({truncated:state.truncated,tree:[...files].map(([path,bytes])=>({path,type:'blob',mode:'100644',sha:gitBlobHash(bytes),size:bytes.length}))});
+      if(url.pathname.includes('/git/blobs/')){const bytes=[...files.values()].find(bytes=>gitBlobHash(bytes)===url.pathname.split('/').at(-1));if(bytes)return Response.json({encoding:'base64',content:bytes.toString('base64'),size:bytes.length});}
+      return new Response(null,{status:404});
+    },
+  });
+  const catalogUrl=`https://github.com/openai/plugins/blob/${commit}/.agents/plugins/marketplace.json`;
+  const payload={scope:'project' as const,projectId:'p',catalogUrl,pluginName:'airtable',previewCommit:commit,previewCatalogCommit:commit,selectedPaths:['plugins/airtable/skills/airtable-cli/SKILL.md','plugins/airtable/skills/airtable-filters/SKILL.md','plugins/airtable/skills/airtable-overview/SKILL.md']};
+  return {app,state,files,payload,requests,records:()=>records};
+}
+
+it('resolves the official same-repository local catalog entry at its immutable catalog commit and imports only complete skills',async()=>{
+  const f=await codexLocalFixture();try{
+    const preview=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json().catalog.commit).toBe('5fd93af4cd0c623e020d0cc7e9ce178b4ac1f70f');
+    expect(preview.json().plugin).toMatchObject({name:'airtable',commit:f.payload.previewCommit,version:'6.0.1'});
+    expect(preview.json().skills.map((skill:{path:string})=>skill.path)).toEqual(f.payload.selectedPaths);
+    expect(preview.json().unsupported).toEqual(expect.arrayContaining(['.codex-plugin/plugin.json:apps','plugins/airtable/.app.json','plugins/airtable/.mcp.json']));
+    expect(f.requests.every(url=>new URL(url).pathname.startsWith('/repos/openai/plugins/'))).toBe(true);
+    expect(f.requests.some(url=>url.includes('/commits/5fd93af4cd0c623e020d0cc7e9ce178b4ac1f70f'))).toBe(true);
+    expect(f.requests.filter(url=>url.includes('/git/trees/')).every(url=>url.includes(`/git/trees/${f.payload.previewCatalogCommit}?recursive=1`))).toBe(true);
+    const result=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:f.payload});
+    expect(result.statusCode).toBe(200);expect(result.json().installed).toHaveLength(3);expect(f.records()).toHaveLength(3);
+    for(const skill of result.json().installed){
+      verifyBundle(skill.data.bundle);
+      expect(skill.data.resolvedSha).toBe(f.payload.previewCommit);
+      expect(skill.data.catalogResolvedSha).toBe(f.payload.previewCatalogCommit);
+      expect(skill.data.sourcePath).toMatch(/^plugins\/airtable\/skills\/[^/]+\/SKILL\.md$/u);
+      expect(skill.data.provenance).toContain(`openai/plugins@${f.payload.previewCommit}:`);
+      expect(skill.data.unsupportedPluginComponents).toEqual(expect.arrayContaining(['plugins/airtable/.app.json','plugins/airtable/.mcp.json']));
+      expect(skill.data.provider).toBeUndefined();
+    }
+    expect(f.requests.every(url=>new URL(url).pathname.startsWith('/repos/openai/plugins/'))).toBe(true);
+  }finally{await f.app.close();}
+});
+
+it('parses ON_USE and verified CODEX metadata elsewhere in the full catalog while Airtable omits products',async()=>{
+  const f=await codexLocalFixture();try{
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(200);expect(response.json().plugin.name).toBe('airtable');expect(f.records()).toEqual([]);
+  }finally{await f.app.close();}
+});
+
+it('continues accepting legacy ON_FIRST_USE authentication policy',async()=>{
+  const f=await codexLocalFixture({authentication:'ON_FIRST_USE'});try{
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(200);expect(response.json().plugin.name).toBe('airtable');expect(f.records()).toEqual([]);
+  }finally{await f.app.close();}
+});
+
+it('returns contextual 400s for malformed products and legacy policy fields before import persistence',async()=>{
+  const invalidPolicies=[
+    {options:{airtableProducts:['CHATGPT']},field:'policy.products'},
+    {options:{airtableProducts:'CODEX'},field:'policy.products'},
+    {options:{airtableProducts:[42]},field:'policy.products'},
+    {options:{airtableProducts:['CODEX'],unknownPolicyField:true},field:'policy.audience'},
+    {options:{installation:'SOMETIMES'},field:'policy.installation'},
+    {options:{installation:42},field:'policy.installation'},
+    {options:{authentication:'ON_SUBMIT'},field:'policy.authentication'},
+    {options:{authentication:42},field:'policy.authentication'},
+  ];
+  for(const {options,field} of invalidPolicies){
+    const f=await codexLocalFixture(options);try{
+      const request={scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'};
+      const preview=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:request});
+      expect(preview.statusCode).toBe(400);expect(preview.json().message).toContain('airtable');expect(preview.json().message).toContain(field);expect(f.records()).toEqual([]);
+      const imported=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:{...request,selectedPaths:f.payload.selectedPaths,previewCommit:f.payload.previewCommit,previewCatalogCommit:f.payload.previewCatalogCommit}});
+      expect(imported.statusCode).toBe(400);expect(imported.json().message).toContain('airtable');expect(imported.json().message).toContain(field);expect(f.records()).toEqual([]);
+    }finally{await f.app.close();}
+  }
+});
+
+it('uses the inline OpenAI overlay without merging a Codex fallback and keeps portable identity canonical',async()=>{
+  const f=await codexLocalFixture({dual:true});try{
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(200);
+    expect(response.json().plugin.version).toBe('0.2.0');
+    expect(response.json().unsupported).toContain('.codex-plugin/plugin.json ignored: replaced by plugin.json extensions.com.openai');
+    expect(response.json().unsupported).not.toContain('.codex-plugin/plugin.json:apps');
+    expect(response.json().unsupported).not.toContain('.codex-plugin/plugin.json:hooks');
+  }finally{await f.app.close();}
+});
+
+it('labels apps, MCP, hooks, agents and commands as uninstalled compatibility components',async()=>{
+  const f=await codexLocalFixture({components:true});try{
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(200);
+    expect(response.json().unsupported).toEqual(expect.arrayContaining(['.codex-plugin/plugin.json:apps','.codex-plugin/plugin.json:mcpServers','.codex-plugin/plugin.json:hooks','.codex-plugin/plugin.json:agents','.codex-plugin/plugin.json:commands']));
+  }finally{await f.app.close();}
+});
+
+it('rejects local path escape and conflicting dual-manifest identity before import',async()=>{
+  const traversal=await codexLocalFixture({path:'./plugins/../outside'});try{
+    const response=await traversal.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:traversal.payload.scope,projectId:'p',catalogUrl:traversal.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(400);expect(traversal.records()).toEqual([]);
+  }finally{await traversal.app.close();}
+  const conflict=await codexLocalFixture({dual:true,identityConflict:true});try{
+    const payload={scope:conflict.payload.scope,projectId:'p',catalogUrl:conflict.payload.catalogUrl,pluginName:'airtable'};
+    const preview=await conflict.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload});
+    expect(preview.statusCode).toBe(400);expect(preview.json().message).toMatch(/manifests have conflicting identities/u);expect(conflict.records()).toEqual([]);
+    const imported=await conflict.app.inject({method:'POST',url:'/api/workbench/skills/catalog/import',payload:{...payload,selectedPaths:conflict.payload.selectedPaths,previewCommit:conflict.payload.previewCommit,previewCatalogCommit:conflict.payload.previewCatalogCommit}});
+    expect(imported.statusCode).toBe(400);expect(imported.json().message).toMatch(/manifests have conflicting identities/u);expect(conflict.records()).toEqual([]);
+  }finally{await conflict.app.close();}
+  const catalogMismatch=await codexLocalFixture({identityConflict:true});try{
+    const response=await catalogMismatch.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:catalogMismatch.payload.scope,projectId:'p',catalogUrl:catalogMismatch.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(400);expect(response.json().message).toMatch(/manifest identity does not match the catalog/u);expect(catalogMismatch.records()).toEqual([]);
+  }finally{await catalogMismatch.app.close();}
+  const f=await codexLocalFixture();try{
+    f.state.commitMismatch=true;
+    const response=await f.app.inject({method:'POST',url:'/api/workbench/skills/catalog/preview',payload:{scope:f.payload.scope,projectId:'p',catalogUrl:f.payload.catalogUrl,pluginName:'airtable'}});
+    expect(response.statusCode).toBe(502);expect(response.json().message).toMatch(/immutable commit SHA/u);
+  }finally{await f.app.close();}
+});
