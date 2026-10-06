@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { copyFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from '../src/db/migrate.js';
@@ -9,6 +12,108 @@ import { createWorkbenchApp } from '../src/workbench/app.js';
 const databaseUrl = process.env.MENOTEAM_PROVIDER_TEST_DATABASE_URL;
 const serialAuthorized = process.env.MENOTEAM_PROVIDER_TEST_SERIAL_AUTHORIZED === '1';
 const enabled = Boolean(databaseUrl && serialAuthorized);
+
+const legacyMigrationFiles = [
+  '001_initial.sql',
+  '002_owner_provenance.sql',
+  '003_workbench.sql',
+  '004_workbench_constraints.sql',
+  '005_workbench_bridge_tokens.sql'
+];
+const providerIndexes = ['wb_provider_single_default', 'wb_provider_connector_identity'];
+
+async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<void> {
+  const location = new URL(databaseUrl);
+  if (!['localhost', '127.0.0.1', '::1'].includes(location.hostname) || !location.pathname.replace(/^\//u, '').endsWith('_test'))
+    throw new Error('Migration boundary tests require a loopback *_test database');
+
+  const sql = postgres(databaseUrl, { max: 1 });
+  const legacyDir = await mkdtemp(join(tmpdir(), 'menoteam-provider-legacy-migrations-'));
+  const fixtureIds = [`migration-provider-a-${randomUUID()}`, `migration-provider-b-${randomUUID()}`];
+  const insertedFixtureIds: string[] = [];
+  try {
+    const existingTables = await sql<{ tablename: string }[]>`SELECT tablename FROM pg_tables WHERE schemaname='public'`;
+    if (existingTables.length)
+      throw new Error('Migration boundary test requires a fresh empty *_test database; existing tables were left untouched');
+
+    for (const file of legacyMigrationFiles)
+      await copyFile(join(process.cwd(), 'migrations', file), join(legacyDir, file));
+
+    await migrate(databaseUrl, legacyDir);
+    const legacyLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
+    expect(legacyLedger.map(row => row.version)).toEqual(legacyMigrationFiles);
+
+    const duplicateConnectorId = `migration-connector-${randomUUID()}`;
+    for (const id of fixtureIds) {
+      const record = {
+        id,
+        kind: 'provider',
+        name: `Migration fixture ${id}`,
+        data: { provider: 'openai', method: 'codex-host', connectorId: duplicateConnectorId, enabled: true, default: false }
+      };
+      await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${id},'setting',NULL,${sql.json(record)})`;
+      insertedFixtureIds.push(id);
+    }
+
+    await expect(migrate(databaseUrl)).rejects.toMatchObject({ code: '23505' });
+    const failedLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
+    expect(failedLedger.map(row => row.version)).toEqual(legacyMigrationFiles);
+    const indexesAfterFailure = await sql<{ indexname: string }[]>`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname='public' AND indexname=ANY(${sql.array(providerIndexes, 'text')})
+      ORDER BY indexname`;
+    expect(indexesAfterFailure).toHaveLength(0);
+    const preservedAfterFailure = await sql<{ id: string; connector_id: string }[]>`
+      SELECT id,data->'data'->>'connectorId' AS connector_id FROM wb_records WHERE id=ANY(${sql.array(fixtureIds, 'text')}) ORDER BY id`;
+    expect(preservedAfterFailure).toHaveLength(2);
+    expect(preservedAfterFailure.map(row => row.connector_id)).toEqual([duplicateConnectorId, duplicateConnectorId]);
+
+    await sql`DELETE FROM wb_records WHERE id=${fixtureIds[1]}`;
+    const uniqueRecord = {
+      id: fixtureIds[1],
+      kind: 'provider',
+      name: `Migration fixture ${fixtureIds[1]}`,
+      data: { provider: 'openai', method: 'codex-host', connectorId: `migration-connector-${randomUUID()}`, enabled: true, default: true }
+    };
+    await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${fixtureIds[1]},'setting',NULL,${sql.json(uniqueRecord)})`;
+
+    await migrate(databaseUrl);
+    const upgradedLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
+    expect(upgradedLedger.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql']);
+    const indexesAfterSuccess = await sql<{ indexname: string }[]>`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname='public' AND indexname=ANY(${sql.array(providerIndexes, 'text')})
+      ORDER BY indexname`;
+    expect(indexesAfterSuccess.map(row => row.indexname)).toEqual([...providerIndexes].sort());
+    await expect(migrate(databaseUrl, legacyDir)).rejects.toThrow('Database schema 006_workbench_provider_connections.sql is newer than this application');
+
+    const preservedAfterOldMigrator = await sql<{ id: string }[]>`
+      SELECT id FROM wb_records WHERE id=ANY(${sql.array(fixtureIds, 'text')}) ORDER BY id`;
+    expect(preservedAfterOldMigrator.map(row => row.id)).toEqual([...fixtureIds].sort());
+    const ledgerAfterOldMigrator = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
+    expect(ledgerAfterOldMigrator.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql']);
+    const indexesAfterOldMigrator = await sql<{ indexname: string }[]>`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname='public' AND indexname=ANY(${sql.array(providerIndexes, 'text')})
+      ORDER BY indexname`;
+    expect(indexesAfterOldMigrator.map(row => row.indexname)).toEqual([...providerIndexes].sort());
+  } finally {
+    try {
+      const hasRecordsTable = await sql<{ present: boolean }[]>`SELECT to_regclass('public.wb_records') IS NOT NULL AS present`;
+      if (hasRecordsTable[0]?.present && insertedFixtureIds.length)
+        await sql`DELETE FROM wb_records WHERE id=ANY(${sql.array(insertedFixtureIds, 'text')})`;
+    } finally {
+      await sql.end();
+      await rm(legacyDir, { recursive: true, force: true });
+    }
+  }
+}
+
+describe.skipIf(!enabled)('Provider migration 006 PostgreSQL boundary', () => {
+  it('rolls back a failed unique index upgrade and keeps newer schemas intact when an older migrator runs', async () => {
+    await verifyProviderMigrationBoundary(databaseUrl as string);
+  }, 30_000);
+});
 
 describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () => {
   let sql: ReturnType<typeof postgres>;
@@ -64,8 +169,8 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     const location = new URL(databaseUrl);
     if (!['localhost', '127.0.0.1', '::1'].includes(location.hostname) || !location.pathname.replace(/^\//u, '').endsWith('_test'))
       throw new Error('Provider test database must be a loopback *_test database');
-    await migrate(databaseUrl);
     sql = postgres(databaseUrl);
+    await migrate(databaseUrl);
     const existing = await sql`SELECT (SELECT count(*) FROM wb_users)::int AS users,(SELECT count(*) FROM wb_records)::int AS records,(SELECT count(*) FROM wb_connectors)::int AS connectors,(SELECT count(*) FROM wb_requests)::int AS requests,(SELECT count(*) FROM wb_bridge_tokens)::int AS bridge_tokens,(SELECT count(*) FROM wb_sessions)::int AS sessions,(SELECT count(*) FROM wb_memberships)::int AS memberships,(SELECT count(*) FROM wb_invites)::int AS invites`;
     if (Number(existing[0]?.users) || Number(existing[0]?.records) || Number(existing[0]?.connectors) || Number(existing[0]?.requests) || Number(existing[0]?.bridge_tokens) || Number(existing[0]?.sessions) || Number(existing[0]?.memberships) || Number(existing[0]?.invites))
       throw new Error('Provider contract suite requires a dedicated empty *_test database; existing workbench data was left untouched');
