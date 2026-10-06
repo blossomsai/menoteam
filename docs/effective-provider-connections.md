@@ -102,3 +102,26 @@ node node_modules/vitest/vitest.mjs run tests/workbench-postgres.test.ts
 Normal Connector completion owns the Git checkpoint and resulting diff revision.
 A working-tree fingerprint or test pass does not prove that checkpoint, independent
 review, merge, deployment, live pairing, or real model execution succeeded.
+
+## Integrated QA policy
+
+The integrated Menoteam adapter uses `menoteam-full/v3`: full tests, all three
+PostgreSQL suites, three typechecks and isolated builds. It requires two distinct,
+explicitly authorized loopback `_test` databases. The ordinary Workbench/V1
+suites share `resource`; the Provider suite uses `providerResource`. The host
+operator maps both resource IDs to private URLs in the Connector's existing
+`qaResources` configuration. No URL is inferred from ambient environment.
+The fixed QA child receives the second URL and its serial grant only after both
+resources are bound; Vitest file parallelism is disabled. CI provisions the
+Provider database separately and requires nonempty passing results from all
+three PostgreSQL suites, with zero skipped/todo tests.
+
+Both resource locks are canonicalized and acquired in one sorted order across
+Connector processes. A known contention rolls back previously acquired locks;
+an unknown owner write, executor or child stop retains durable intents. Recovery
+uses the same original-parent/child stop proofs before releasing either lock.
+This does not change generic `project/v1` single-resource policy behavior.
+Legacy `menoteam-full/v2` remains readable history but is unusable for new QA or
+delivery effects. An administrator must explicitly save a v3 policy and authorize
+the second host resource; its new version makes old evidence stale. Integration
+does not grant this authorization or modify any live policy automatically.

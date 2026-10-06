@@ -74,15 +74,16 @@ export class QaProcessFixture {
     // Group absence and the registered descendant identities must both precede any lock release.
     for(const identity of this.observed)try{budget();process.kill(identity.pid,0);throw Error('Fixture descendant still exists; evidence retained');}catch(error){if((error as NodeJS.ErrnoException).code!=='ESRCH')failures.push(error);}
     if(!failures.length)for(const state of stoppedStates)try{
-      budget();if(state.resourceLock){
-        const guard=state.resourceLock.directory+'.guard';
+      budget();for(const lock of state.resourceLocks??(state.resourceLock?[state.resourceLock]:[])){
+        const single={...state,resourceLocks:undefined,resourceLock:lock};
+        const guard=lock.directory+'.guard';
         const guardOwner=await readJson<{nonce:string;resourceOwner:string;executor:CodexProcessIdentity}>(path.join(guard,'owner.json'));
         // Only a fully recorded guard from a registered, now-stopped fixture parent may be removed.
         // An incomplete/foreign guard remains blocked by the production release protocol.
         if(guardOwner&&typeof guardOwner.nonce==='string'&&guardOwner.resourceOwner===state.nonce&&this.parents.some(p=>stoppedParents.has(p.stateFile)&&same(p.identity,guardOwner.executor)))await rm(guard,{recursive:true});
-        const owner=await readJson<{owner:string}>(path.join(state.resourceLock.directory,'owner.json'));budget();
+        const owner=await readJson<{owner:string}>(path.join(lock.directory,'owner.json'));budget();
         // A contender never acquired this resource; only our exact nonce may be released.
-        if(owner?.owner===state.nonce||!owner)await releaseQaResource(state); // Incomplete ownership fails closed.
+        if(owner?.owner===state.nonce||!owner)await releaseQaResource(single); // Incomplete ownership fails closed.
       }
     }catch(error){failures.push(error);}
     if(failures.length)throw new AggregateError(failures,`Fixture stop proof unknown; preserved ${this.directory}`);

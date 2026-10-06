@@ -1345,7 +1345,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const input=z.object({settingId:text,expectedUpdatedAt:z.string().min(1),name:text.optional(),data:z.record(z.string(),z.unknown()).optional()}).strict().parse(b.input);
                 const {settingId,...change}=input;
                 const setting=await store.get<Setting>('setting',settingId,tx);
-                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','allowMergePr','mergeMethod','requiredChecks','baseBranch','configuredBy','coverage','requirements','resource'];
+                const protectedConnectionKeys=['provider','url','purpose','enabled','allowDraftPr','allowMergePr','mergeMethod','requiredChecks','baseBranch','configuredBy','coverage','requirements','resource','providerResource'];
                 if(setting?.kind==='provider')fail(403,'Master cannot change workspace provider connections');
                 if(setting?.kind==='connection'&&change.data&&protectedConnectionKeys.some(key=>Object.hasOwn(change.data!,key)))fail(403,'Master cannot change connection or delivery authorization policy');
                 result=await patchSetting(actors[0] as unknown as Member,settingId,change,tx,r.projectId);

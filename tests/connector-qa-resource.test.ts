@@ -3,8 +3,9 @@ import {mkdtemp,readFile,rm} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {withQaOwnership,assertQaOwnership,qaExecutorStopped,authorizedQaResource,stopQaExecution,releaseQaResource,acquireQaResource,claimQaResource,type QaExecution} from '../src/connector/qa-process.js';
+import {qaChildEnvironment,withQaOwnership,assertQaOwnership,qaExecutorStopped,authorizedQaResource,stopQaExecution,releaseQaResource,acquireQaResource,claimQaResource,type QaExecution} from '../src/connector/qa-process.js';
 import {writeSecureJson,stateKey} from '../src/connector/state.js';
+import * as stateFiles from '../src/connector/state.js';
 import {qaPolicyFixture} from './helpers/local-qa-fixture.js';
 import * as processes from '../src/connector/codex.js';
 import {ConnectorRunner} from '../src/connector/runner.js';
@@ -17,6 +18,48 @@ const executor={pid:process.pid,processGroupId:process.pid,startedAt:'fixture-ex
 describe('QA resource authorization and conservative startup recovery',()=>{
   beforeEach(()=>{vi.spyOn(processes,'readProcessIdentity').mockResolvedValue(executor);});
   afterEach(()=>vi.restoreAllMocks());
+  it('injects the second database and serial grant only from explicit authorization, never ambient values',()=>{
+    vi.stubEnv('MENOTEAM_PROVIDER_TEST_DATABASE_URL','ambient-private');vi.stubEnv('MENOTEAM_PROVIDER_TEST_SERIAL_AUTHORIZED','1');
+    try{
+      expect(qaChildEnvironment()).not.toHaveProperty('MENOTEAM_PROVIDER_TEST_DATABASE_URL');expect(qaChildEnvironment()).not.toHaveProperty('MENOTEAM_PROVIDER_TEST_SERIAL_AUTHORIZED');
+      expect(qaChildEnvironment('explicit-main','explicit-provider')).toMatchObject({WORK_MAP_TEST_DATABASE_URL:'explicit-main',MENOTEAM_PROVIDER_TEST_DATABASE_URL:'explicit-provider',MENOTEAM_PROVIDER_TEST_SERIAL_AUTHORIZED:'1'});
+    }finally{vi.unstubAllEnvs();}
+  });
+  it('retains all durable intents on an incomplete second owner write instead of treating I/O failure as contention',async()=>fixture(async directory=>{
+    const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
+    const execution=state(directory);await acquireQaResource(execution,policy);const locks=[...execution.resourceLocks!];
+    const original=stateFiles.writeSecureJson,write=vi.spyOn(stateFiles,'writeSecureJson').mockImplementation(async(file,value)=>{if(file===path.join(locks[1]!.directory,'owner.json'))throw Object.assign(Error('fixture I/O'),{code:'EIO'});await original(file,value);});
+    try{
+      await expect(claimQaResource(execution)).rejects.toThrow('fixture I/O');expect(execution.resourceLocks).toEqual(locks);
+      expect(JSON.parse(await readFile(path.join(locks[0]!.directory,'owner.json'),'utf8')).owner).toBe(execution.nonce);
+      await expect(releaseQaResource(execution)).rejects.toThrow('ownership cannot be proven');
+    }finally{
+      write.mockRestore(); // Repair only this test's incomplete private record, then use the production release proof.
+      await original(path.join(locks[1]!.directory,'owner.json'),{owner:execution.nonce,executionDirectory:execution.directory,executor:execution.executor});await releaseQaResource(execution);
+    }
+  }));
+  it('rolls back the first canonical lock when the second is contended, without touching the other owner',async()=>fixture(async directory=>{
+    const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
+    const execution=state(directory);await acquireQaResource(execution,policy);
+    const [first,second]=execution.resourceLocks!;
+    const occupied=state(directory);occupied.resourceLock={directory:second!.directory,owner:occupied.nonce};await claimQaResource(occupied);
+    try{
+      await expect(claimQaResource(execution)).rejects.toThrow('owned by another');expect(execution.resourceLocks).toBeUndefined();
+      await expect(readFile(path.join(first!.directory,'owner.json'))).rejects.toMatchObject({code:'ENOENT'});
+      expect(JSON.parse(await readFile(path.join(second!.directory,'owner.json'),'utf8')).owner).toBe(occupied.nonce);
+    }finally{await releaseQaResource(occupied);}
+  }));
+  it('checks both owners before GO and retains both reservations when original executor stop is unknown',async()=>fixture(async directory=>{
+    const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
+    const execution=state(directory);await acquireQaResource(execution,policy);await claimQaResource(execution);
+    const locks=[...execution.resourceLocks!],file=path.join(locks[1]!.directory,'owner.json'),owner=JSON.parse(await readFile(file,'utf8'));
+    try{
+      await writeSecureJson(file,{...owner,owner:'foreign'});await expect(withQaOwnership(execution,async()=>{throw Error('must not GO');})).rejects.toThrow('no GO');
+      await writeSecureJson(file,owner);execution.executor={...executor,pid:424242};vi.spyOn(process,'kill').mockImplementation(()=>{throw Object.assign(Error('denied'),{code:'EPERM'});});
+      await expect(releaseQaResource(execution)).rejects.toThrow('executor stop proof');
+      for(const lock of locks)expect(JSON.parse(await readFile(path.join(lock.directory,'owner.json'),'utf8')).owner).toBe(execution.nonce);
+    }finally{execution.executor=executor;await releaseQaResource(execution);}
+  }));
   it('requires exact explicit disposable host authorization, not suffix/ambient configuration',()=>{
     const policy=resource(),r=policy.resource!;
     const valid=`postgres://fixture-only@${r.hostname}:${r.port}/${r.database}`;

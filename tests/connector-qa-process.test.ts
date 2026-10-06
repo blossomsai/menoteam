@@ -19,6 +19,28 @@ async function recovery(directory:string){let acknowledgements=0,runner:Connecto
   await runner.run();return acknowledgements;
 }
 describe('controlled REAL child process and cross-process resource proofs (operator process access required)',()=>{
+  it('a second-resource conflict in another process rolls back the first without releasing the conflicting owner',async()=>qaProcessFixture(async f=>{
+    const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`provider_${randomUUID().replaceAll('-','')}_test`};
+    const sorted=[policy.resource!,policy.providerResource].sort((a,b)=>stateKey(a.hostname,String(a.port),a.database).localeCompare(stateKey(b.hostname,String(b.port),b.database)));
+    const owner=await f.parent(f.state(),{...policy,resource:sorted[1],providerResource:undefined},'lock');await f.until(async()=>owner.output.includes('owned'));
+    const contender=await f.parent(f.state(),policy,'lock');expect(await contender.closed).toBe(1);
+    const free=await f.parent(f.state(),{...policy,resource:sorted[0],providerResource:undefined},'lock');await f.until(async()=>free.output.includes('owned'));
+    expect(owner.child.exitCode).toBeNull();free.child.stdin!.write('release');expect(await free.closed).toBe(0);
+    owner.child.stdin!.write('release');expect(await owner.closed).toBe(0);
+  },qaFixtureBudget(40_000)),40_000);
+  it('holds both canonical resources across processes and releases both only after parent crash reconciliation',async()=>qaProcessFixture(async f=>{
+    const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`provider_${randomUUID().replaceAll('-','')}_test`};
+    const old=await f.parent(f.state(),policy,'lock');await f.until(async()=>old.output.includes('owned'));
+    const saved=(await readJson<QaExecution>(old.stateFile))!;expect(saved.resourceLocks).toHaveLength(2);
+    expect(saved.resourceLocks!.map(lock=>lock.directory)).toEqual(saved.resourceLocks!.map(lock=>lock.directory).sort());
+    for(const r of [policy.resource!,policy.providerResource]){
+      const contender=await f.parent(f.state(),{...policy,resource:r,providerResource:undefined},'lock');expect(await contender.closed).toBe(1);
+    }
+    await f.stopParent(old.entry);
+    const blocked=await f.parent(f.state(),policy,'lock');expect(await blocked.closed).toBe(1);
+    await releaseQaResource(saved);
+    const next=await f.parent(f.state(),policy,'lock');await f.until(async()=>next.output.includes('owned'));next.child.stdin!.write('release');expect(await next.closed).toBe(0);
+  },qaFixtureBudget(40_000)),40_000);
   it('serializes independent Connector processes; parent crash does not free its resource',async()=>qaProcessFixture(async f=>{
     const policy=resource(),one=await f.parent(f.state(),policy,'lock');await f.until(async()=>one.output.includes('owned'));
     const two=await f.parent(f.state(),policy,'lock');expect(await two.closed).toBe(1);expect(two.output).not.toContain('owned');expect(two.errors).toContain('owned by another');
@@ -85,8 +107,9 @@ describe('controlled REAL child process and cross-process resource proofs (opera
       await expect(readFile(marker)).rejects.toMatchObject({code:'ENOENT'});expect(await stopQaExecution(execution)).toBe(true);
     }finally{await writeSecureJson(ownerFile,owner);} // Restore only this fixture's deliberate nonce corruption.
   },qaFixtureBudget(30_000)),30_000);
-  it.each(['readiness','assertion','timeout'])('finally stops every owned parent/group/descendant and frees only its lock after injected %s failure',async mode=>{
-    const budget=qaFixtureBudget(36_000,2),policy=resource();let parentPid=0,group=0,observed:number[]=[];
+  for(const mode of ['readiness','assertion','timeout'])it(`finally stops every owned parent/group/descendant and frees only its lock after injected ${mode} failure`,async()=>{
+    // Cleanup/next-owner proofs are not minimum-budget tests: reserve 4s for setup.
+    const budget=qaFixtureBudget(40_000,2),policy=resource();let parentPid=0,group=0,observed:number[]=[];
     const failed=qaProcessFixture(async f=>{
       const marker=path.join(f.directory,'started.json'),owner=await f.parent(f.state(),policy,undefined,['-e',descendantScript,marker]);parentPid=owner.child.pid!;
       await f.until(async()=>{try{await readFile(marker);return true;}catch{return false;}});
@@ -99,5 +122,5 @@ describe('controlled REAL child process and cross-process resource proofs (opera
     await expect(failed).rejects.toThrow(mode==='readiness'?'did not become ready':mode==='assertion'?'expected':'deadline');
     expect(await waitProcessGroup(group,100)).toBe(true);for(const pid of [parentPid,...observed])expect(()=>process.kill(pid,0)).toThrow();
     await qaProcessFixture(async f=>{const next=await f.parent(f.state(),policy,'lock');await f.until(async()=>next.output.includes('owned'));next.child.stdin!.write('release');expect(await next.closed).toBe(0);},budget);
-  },36_000);
+  },40_000);
 });

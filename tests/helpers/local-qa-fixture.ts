@@ -1,6 +1,6 @@
 import { LOCAL_QA_CONTRACT,MENOTEAM_QA_REQUIREMENTS,type QaPolicy } from '../../src/workbench/local-qa.js';
 export function qaPolicyFixture(projectId='fixture-project',repositoryUrl='https://github.com/example/fixture',id='fixture-qa-policy'):QaPolicy {
-  return {id,version:'2000-01-01T00:00:00.000Z',projectId,repositoryUrl,configuredBy:'fixture-owner',coverage:'menoteam-full/v2',requirements:JSON.parse(JSON.stringify(MENOTEAM_QA_REQUIREMENTS)),resource:{id:'disposable-fixture',kind:'postgres',hostname:'127.0.0.1',port:55439,database:'menoteam_workbench_test',disposable:true}};
+  return {id,version:'2000-01-01T00:00:00.000Z',projectId,repositoryUrl,configuredBy:'fixture-owner',coverage:'project/v1',requirements:JSON.parse(JSON.stringify(MENOTEAM_QA_REQUIREMENTS)),resource:{id:'disposable-fixture',kind:'postgres',hostname:'127.0.0.1',port:55439,database:'menoteam_workbench_test',disposable:true}};
 }
 export function requiredQaFixture(fingerprint:string,policy=qaPolicyFixture()) {
   const stamp=new Date().toISOString();

@@ -13,23 +13,26 @@ export const MENOTEAM_QA_REQUIREMENTS = [
   {id:'full-suite',category:'tests',commands:[{executable:'repo-bin',bin:'vitest',args:['run','--fileParallelism=false','--reporter=json','--outputFile={reportFile}'],timeoutMs:600_000}],report:'vitest-json'},
   {id:'three-typechecks',category:'typecheck',commands:['tsconfig.json','tsconfig.local-ui.json','tsconfig.workbench-ui.json'].map(config=>({executable:'repo-bin',bin:'tsc',args:['--noEmit','-p',config],timeoutMs:300_000})),report:'none'},
   {id:'isolated-builds',category:'build',commands:[{executable:'repo-bin',bin:'tsc',args:['-p','tsconfig.json','--outDir','{outputDir}/server'],timeoutMs:300_000},...['local','workbench'].map(ui=>({executable:'repo-bin',bin:'vite',args:['build','--config',`vite.${ui}.config.ts`,'--outDir',`{outputDir}/${ui}`],timeoutMs:300_000}))],report:'none'},
-  {id:'both-postgres-suites',category:'postgres',commands:[{executable:'repo-bin',bin:'vitest',args:['run','tests/workbench-postgres.test.ts','tests/postgres-repository.test.ts','--fileParallelism=false','--reporter=json','--outputFile={reportFile}'],timeoutMs:600_000}],report:'vitest-json'},
+  {id:'three-postgres-suites',category:'postgres',commands:[{executable:'repo-bin',bin:'vitest',args:['run','tests/workbench-postgres.test.ts','tests/postgres-repository.test.ts','tests/workbench-provider-postgres.test.ts','--fileParallelism=false','--reporter=json','--outputFile={reportFile}'],timeoutMs:600_000}],report:'vitest-json'},
 ] as const;
-export const qaPolicyData = z.object({provider:z.literal('qa'),purpose:z.literal('qa'),url:z.string().url().refine(value=>{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.search&&!u.hash;}),enabled:z.boolean().default(true),configuredBy:z.string().optional(),coverage:z.enum(['project/v1','menoteam-full/v2']),requirements:z.array(requirement).min(1).max(20),resource:qaResource.optional()}).strict().superRefine((p,ctx)=>{
+export const qaPolicyData = z.object({provider:z.literal('qa'),purpose:z.literal('qa'),url:z.string().url().refine(value=>{const u=new URL(value);return u.protocol==='https:'&&!u.username&&!u.password&&!u.search&&!u.hash;}),enabled:z.boolean().default(true),configuredBy:z.string().optional(),coverage:z.enum(['project/v1','menoteam-full/v2','menoteam-full/v3']),requirements:z.array(requirement).min(1).max(20),resource:qaResource.optional(),providerResource:qaResource.optional()}).strict().superRefine((p,ctx)=>{
+  if(p.coverage==='menoteam-full/v2')ctx.addIssue({code:'custom',message:'Legacy Menoteam QA policy must be explicitly upgraded; old evidence is stale'});
+  if(p.providerResource&&p.coverage!=='menoteam-full/v3')ctx.addIssue({code:'custom',message:'Provider test resource requires explicit Menoteam v3 policy'});
+  if(p.coverage==='menoteam-full/v3'&&[p.resource,p.providerResource].some(resource=>resource&&!resource.database.endsWith('_test')))ctx.addIssue({code:'custom',message:'Menoteam QA databases must be explicitly disposable _test resources'});
   if(new Set(p.requirements.map(r=>r.id)).size!==p.requirements.length)ctx.addIssue({code:'custom',message:'QA requirement IDs must be unique'});
   if(p.requirements.some(r=>r.category==='postgres')&&!p.resource)ctx.addIssue({code:'custom',message:'Explicit disposable PostgreSQL resource is required'});
-  if(/^https:\/\/github\.com\/blossomsai\/menoteam(?:\.git)?\/?$/iu.test(p.url)&&p.coverage!=='menoteam-full/v2')ctx.addIssue({code:'custom',message:'Menoteam QA coverage cannot be reduced'});
-  if(p.coverage==='menoteam-full/v2'&&(JSON.stringify(p.requirements)!==JSON.stringify(MENOTEAM_QA_REQUIREMENTS)||!p.resource))ctx.addIssue({code:'custom',message:'Menoteam requires the full suite, three typechecks, isolated builds and both PostgreSQL suites'});
+  if(/^https:\/\/github\.com\/blossomsai\/menoteam(?:\.git)?\/?$/iu.test(p.url)&&p.coverage!=='menoteam-full/v3')ctx.addIssue({code:'custom',message:'Menoteam QA coverage cannot be reduced'});
+  if(p.coverage==='menoteam-full/v3'&&(JSON.stringify(p.requirements)!==JSON.stringify(MENOTEAM_QA_REQUIREMENTS)||!p.resource||!p.providerResource||JSON.stringify([p.resource.hostname==='localhost'?'127.0.0.1':p.resource.hostname,p.resource.port,p.resource.database])===JSON.stringify([p.providerResource.hostname==='localhost'?'127.0.0.1':p.providerResource.hostname,p.providerResource.port,p.providerResource.database])))ctx.addIssue({code:'custom',message:'Menoteam requires the full suite, three typechecks, isolated builds and three PostgreSQL suites and two distinct authorized resources'});
 });
-export const qaPolicySnapshot = z.object({id:z.string().min(1),version:timestamp,projectId:z.string().min(1),repositoryUrl:z.string().url(),configuredBy:z.string().min(1),coverage:z.enum(['project/v1','menoteam-full/v2']),requirements:z.array(requirement).min(1).max(20),resource:qaResource.optional()}).strict();
+export const qaPolicySnapshot = z.object({id:z.string().min(1),version:timestamp,projectId:z.string().min(1),repositoryUrl:z.string().url(),configuredBy:z.string().min(1),coverage:z.enum(['project/v1','menoteam-full/v2','menoteam-full/v3']),requirements:z.array(requirement).min(1).max(20),resource:qaResource.optional(),providerResource:qaResource.optional()}).strict();
 export type QaPolicy = z.infer<typeof qaPolicySnapshot>;
 export function savedQaPolicy(settings:Setting[],projectId:string,repositoryUrl:string):QaPolicy|undefined {
   const matches=settings.filter(s=>s.kind==='connection'&&s.projectId===projectId&&s.data.provider==='qa'&&s.data.purpose==='qa'&&s.data.enabled===true&&s.data.url===repositoryUrl);
   if(matches.length!==1)return;
   const s=matches[0]!, parsed=qaPolicyData.safeParse(s.data);
   if(!parsed.success||!parsed.data.configuredBy)return;
-  const {coverage,requirements,resource,configuredBy}=parsed.data;
-  return qaPolicySnapshot.parse({id:s.id,version:s.updatedAt,projectId,repositoryUrl,configuredBy,coverage,requirements,...(resource?{resource}:{})});
+  const {coverage,requirements,resource,providerResource,configuredBy}=parsed.data;
+  return qaPolicySnapshot.parse({id:s.id,version:s.updatedAt,projectId,repositoryUrl,configuredBy,coverage,requirements,...(resource?{resource}:{}),...(providerResource?{providerResource}:{})});
 }
 export function sameQaPolicy(a:unknown,b:unknown):boolean {
   const left=qaPolicySnapshot.safeParse(a),right=qaPolicySnapshot.safeParse(b);
@@ -41,7 +44,7 @@ export type FixedQaCheck=z.infer<typeof fixedQaCheck>;
 export const fixedQaSnapshot=z.object({localQaContract:z.literal(LOCAL_QA_CONTRACT),policy:qaPolicySnapshot.optional(),candidateFingerprint:z.string().regex(/^[a-f0-9]{64}$/u),stale:z.boolean(),verification:z.enum(['current','unknown']),capturedAt:timestamp,checks:z.array(fixedQaCheck),revision:z.string().optional()}).strict();
 export function hasRequiredLocalQa(value:unknown,fingerprint:string,policy?:QaPolicy):boolean {
   const parsed=fixedQaSnapshot.safeParse(value);
-  if(!parsed.success||!policy||!sameQaPolicy(parsed.data.policy,policy))return false;
+  if(!parsed.success||!policy||policy.coverage==='menoteam-full/v2'||!sameQaPolicy(parsed.data.policy,policy))return false;
   const qa=parsed.data,captured=Date.parse(qa.capturedAt);
   return qa.candidateFingerprint===fingerprint&&qa.stale===false&&qa.verification==='current'&&captured<=Date.now()&&captured>=Date.parse(policy.version)&&qa.checks.length===policy.requirements.length&&policy.requirements.every(r=>{
     const matches=qa.checks.filter(c=>c.requirementId===r.id),check=matches[0];

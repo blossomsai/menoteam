@@ -52,5 +52,7 @@ describe('generic authorized fixed-parent QA (real subprocesses, no network)',()
     expect((await captureRequiredLocalQa(cwd,options)).verification).toBe('unknown');
     const saved=policy();saved.resource={id:'not-authorized',kind:'postgres',hostname:'127.0.0.1',port:55439,database:'fixture_test',disposable:true};
     expect((await captureRequiredLocalQa(cwd,{...options,policy:saved})).checks).toEqual([]);
+    saved.coverage='menoteam-full/v2';
+    expect((await captureRequiredLocalQa(cwd,{...options,policy:saved,resources:{[saved.resource.id]:{url:'postgres://fixture-only@127.0.0.1:55439/fixture_test'}}})).checks).toEqual([]);
   },20_000),20_000);
 });
