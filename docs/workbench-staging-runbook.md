@@ -185,3 +185,11 @@ dependencies or enable install scripts implicitly. Preparation does not permit
 writing shared `dist`, changing runtime processes or inheriting QA database
 credentials. A scratch typecheck success is not proof that an active native
 checkout was prepared or that its source compiles.
+
+
+For an interrupted local Work with a verified stopped proof, a later same-Work
+continuation remains blocked by the existing reservation rule even while its
+Connector heartbeats normally. Use the existing owner/admin UI reconciliation
+flow; if an unwanted queued continuation exists, cancel it first, then resume
+the original run. Current Master MCP has no cancel/reconciliation tool. Do not
+release the reservation by editing the database or restarting the Connector.
