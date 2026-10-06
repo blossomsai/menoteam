@@ -1,6 +1,8 @@
-import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { WorkbenchConnectorClient as HttpClient } from '../src/connector/client.js';
 import { describe,it,expect,vi } from 'vitest';
@@ -8,11 +10,96 @@ import { ConnectorRunner,buildRunPrompt } from '../src/connector/runner.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
 import { ConnectorHttpError, type WorkbenchConnectorClient } from '../src/connector/client.js';
 import { stateKey,writeSecureJson } from '../src/connector/state.js';
-import type { ClaimedRun,ConnectorConfig } from '../src/connector/types.js';
+import { diffRevision, ensureWorktree, fingerprint, git } from '../src/connector/git.js';
+import type { ClaimedRun,ConnectorConfig,DiffArtifactData } from '../src/connector/types.js';
+import { LOCAL_QA_CONTRACT } from '../src/workbench/local-qa.js';
 function claim():ClaimedRun {
   return {run:{id:'run-one',connectorId:'one',projectId:'project-one',requestedBy:'owner',kind:'master',prompt:'Plan work',model:'gpt-6.1-sol',reasoning:'medium',status:'running',generation:1,createdAt:'now',updatedAt:'now',threadId:'persistent-thread',execution:{provider:'openai',method:'codex-host',skills:[{id:'skill-one',name:'Evidence',content:'Verify first'}],tools:[]}},project:{id:'project-one',name:'Dogfood',instructions:'Stay scoped',repositoryUrl:'',deliveryAuthorization:'',createdAt:'now'},messages:[],settings:[]};
 }
+const execFile=promisify(execFileCallback);
 describe('Integrated connector lifecycle',()=>{
+  it('keeps implementation edits in assigned cwd and parent captures bytes after native Git commit failure',async()=>{
+    const bounded=<T>(promise:Promise<T>)=>{let timer:ReturnType<typeof setTimeout>;return Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Timed out waiting for bounded implementation capture')),5_000);})]).finally(()=>clearTimeout(timer));};
+    let root:string|undefined;let dataDir:string|undefined;let runner:ConnectorRunner|undefined;let execution:Promise<void>|undefined;let executionSettled=false;let restoreQaAdapter:(()=>void)|undefined;
+    try{
+      root=await mkdtemp(path.join(os.tmpdir(),'menoteam-assigned-cwd-'));
+      dataDir=await realpath(await mkdtemp(path.join(os.tmpdir(),'menoteam-assigned-state-')));
+      await git(root,'init','-q'); await git(root,'config','user.name','Fixture'); await git(root,'config','user.email','fixture@example.invalid');
+      await writeFile(path.join(root,'source.txt'),'base source\n'); await git(root,'add','-A'); await git(root,'commit','-qm','base');
+      const c=claim();c.run.kind='implementation';c.run.workId='work-native';c.run.threadId=undefined;c.run.execution={provider:'openai',method:'codex-host',skills:[],tools:[]};
+      const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'fixture-token',connectorId:'one',dataDir,projects:{[c.run.projectId]:root},pollIntervalMs:1};
+      const assigned=await ensureWorktree(cfg,c.run.projectId,c.run.workId);
+      const priorAssigned='preexisting assigned-cwd edit\n';const nativeSource=`${priorAssigned}native source edit\n`;const cloneOnlyFinal='clone-only final text that is not present in assigned source';
+      await writeFile(path.join(assigned.path,'source.txt'),priorAssigned);
+      // The sandbox may hide this process identity; stub only the existing QA executor identity adapter.
+      const qaProcess=await import('../src/connector/qa-process.js');
+      const qaAdapter=vi.spyOn(qaProcess,'bindQaExecutor').mockImplementation(async state=>{state.executor={pid:process.pid,processGroupId:process.pid,startedAt:'isolated-fixture-identity',command:'isolated fixture'};});
+      restoreQaAdapter=()=>qaAdapter.mockRestore();
+      let claimed=false;let completed=false;const artifacts:unknown[]=[];
+      const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{},run:async(_claim:unknown,cwd:string,prompt:string)=>{
+        expect(cwd).toBe(assigned.path);
+        for(const phrase of ['assigned cwd','Connector parent exclusively owns','Do not run git add, commit, or other Git writes','.git/index.lock denial','external clone','If a source write itself is denied, report the exact path and error','checks actually completed in the assigned cwd'])expect(prompt).toContain(phrase);
+        expect(await readFile(path.join(cwd,'source.txt'),'utf8')).toBe(priorAssigned);
+        // Model a failed native Git write; the Connector parent must still capture the source bytes.
+        await expect(execFile('git',['commit','-m','native candidate'],{cwd,timeout:2_000,env:{...process.env,GIT_INDEX_FILE:'/dev/null/menoteam-denied-index'}})).rejects.toBeTruthy();
+        await writeFile(path.join(cwd,'source.txt'),nativeSource);
+        return{threadId:'native-thread',text:cloneOnlyFinal,checks:[]};
+      }} as unknown as CodexAppServer;
+      const client={
+        claim:async()=>{if(claimed){if(completed)await runner!.stop();return undefined;}claimed=true;return c;},
+        readRun:async()=>({...c.run}),
+        addArtifact:async(_id:string,_generation:number,artifact:unknown)=>{artifacts.push(artifact);},
+        complete:async()=>{completed=true;},
+      } as unknown as WorkbenchConnectorClient;
+      runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+      execution=runner.run().finally(()=>{executionSettled=true;});
+      await bounded(execution);
+      const diagnosticFiles=await readdir(path.join(dataDir,'diagnostics')).catch((error:NodeJS.ErrnoException)=>error.code==='ENOENT'?[]:Promise.reject(error));
+      if(diagnosticFiles.length)throw new Error(`Implementation capture failed: ${(JSON.parse(await readFile(path.join(dataDir,'diagnostics',diagnosticFiles[0]!),'utf8')) as {cause:string}).cause}`);
+
+      const capturedArtifacts=artifacts as Array<{kind:string;revision:string;requestId:string;data:Record<string,unknown>}>;
+      const diffArtifact=capturedArtifacts.find(item=>item.kind==='diff');
+      const qaArtifacts=capturedArtifacts.filter(item=>item.kind==='qa');
+      expect(diffArtifact).toBeDefined();
+      expect(qaArtifacts.map(item=>item.requestId).sort()).toEqual([`qa:${c.run.id}:${c.run.generation}`,`required-qa:${c.run.id}:${c.run.generation}`].sort());
+      const requiredQa=qaArtifacts.find(item=>item.requestId.startsWith('required-qa:'))!;
+      const nativeQa=qaArtifacts.find(item=>item.requestId.startsWith('qa:'))!;
+      const diff=diffArtifact!.data as DiffArtifactData;
+      const revision=diffArtifact!.revision;
+      const candidate=(await git(assigned.path,'rev-parse','HEAD')).trim();
+      const candidateFingerprint=await fingerprint(assigned.path);
+      expect(diff.source).toBe('git');
+      expect(diff.baseRevision).toBe(assigned.baseRevision);
+      expect(diff.candidateRevision).toBe(candidate);
+      expect(diff.truncated).toBe(false);
+      expect(revision).toBe(diffRevision(diff));
+      expect(diffArtifact!.requestId).toBe(`diff:${c.run.id}:${c.run.generation}`);
+      expect(diff.files.find(file=>file.path==='source.txt')?.hunks.flatMap(hunk=>hunk.lines).map(line=>line.text).join('\n')).toContain(nativeSource.trimEnd());
+      expect(diff.patch).not.toContain(cloneOnlyFinal);
+      expect(await git(assigned.path,'show',`${assigned.baseRevision}:source.txt`)).toBe('base source\n');
+      expect(await git(assigned.path,'show','HEAD:source.txt')).toBe(nativeSource);
+      expect(requiredQa.requestId).toBe(`required-qa:${c.run.id}:${c.run.generation}`);
+      expect(requiredQa.data.localQaContract).toBe(LOCAL_QA_CONTRACT);
+      expect(requiredQa.data.candidateFingerprint).toBe(candidateFingerprint);
+      expect(requiredQa.data.revision).toBe(revision);
+      expect(requiredQa.data.checks).toEqual([]);
+      expect(requiredQa.data.verification).toBe('unknown');
+      expect(nativeQa.requestId).toBe(`qa:${c.run.id}:${c.run.generation}`);
+      expect(nativeQa.data.checks).toEqual([]);
+      expect(nativeQa.data.candidateFingerprint).toBe(candidateFingerprint);
+      expect(nativeQa.data.revision).toBe(revision);
+      expect(nativeQa.data.verification).toBe('unknown');
+      expect(artifacts).toHaveLength(3);
+    }finally{
+      try{
+        await runner?.stop();
+        if(execution)await bounded(execution).catch(()=>undefined);
+      }finally{restoreQaAdapter?.();}
+      expect(executionSettled).toBe(true);
+      if(root)await rm(root,{recursive:true,force:true});
+      if(dataDir)await rm(dataDir,{recursive:true,force:true});
+    }
+  });
   it('resumes native thread, streams idempotent events, keeps only scoped bridge token, stops before completion',async()=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-runner-'));
     const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'connector-wide-secret',connectorId:'one',dataDir,projects:{},pollIntervalMs:1};
