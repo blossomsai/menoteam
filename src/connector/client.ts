@@ -53,6 +53,7 @@ export class WorkbenchConnectorClient {
   }
 
   async claim(runKinds?: Run['kind'][]): Promise<ClaimedRun | undefined> {
+    const deploymentTargets=Object.keys(this.config.deploymentTargets??{});
     const capabilities = {
       codexAppServer: true,
       models: this.codexModels,
@@ -61,9 +62,9 @@ export class WorkbenchConnectorClient {
       ...(process.env.MENOTEAM_GITHUB_TOKEN ? {
         git: true,
         githubWrite: true,
-        deliveryActions: ['create_draft_pr','merge_pr', ...(Object.keys(this.config.deploymentTargets ?? {}).length ? ['deploy_staging','rollback_staging'] : [])],
-        ...(Object.keys(this.config.deploymentTargets ?? {}).length ? { deploymentTargets: Object.keys(this.config.deploymentTargets!) } : {}),
+        deliveryActions: ['create_draft_pr','merge_pr', ...(deploymentTargets.length ? ['deploy_staging','rollback_staging'] : [])],
       } : {}),
+      ...(deploymentTargets.length ? { deploymentTargets } : {}),
       ...(runKinds ? { runKinds: [...new Set(runKinds)] } : {}),
     };
     const result = await this.request<ClaimedRun | undefined>('/api/workbench/connector/claim', {

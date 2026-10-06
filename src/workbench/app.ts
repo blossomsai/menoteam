@@ -599,6 +599,20 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return String(connector.id);
     }
     function stagingReservationScope(projectId:string,targetId:string){return `staging-target:${projectId}:${targetId}`;}
+    async function resumeStagingIntent(saved:{run:Run;operationId:string},requestScope:string,requestId:string,workId:string,targetId:string,sourceMergeRunId:string,tx:Sql,previousDeploymentRunId?:string){
+        const run=await store.get<Run>('run',saved.run.id,tx);if(!run||run.workId!==workId||run.operation?.targetId!==targetId||run.operation.sourceMergeRunId!==sourceMergeRunId||previousDeploymentRunId&&run.operation.previousDeploymentRunId!==previousDeploymentRunId)fail(409,'Saved staging operation identity changed');
+        const op=run.operation!,hasIntent=Boolean(op.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(op.phase);
+        if(!hasIntent)return undefined;
+        const reservationScope=stagingReservationScope(run.projectId,targetId);const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
+        if(['completed'].includes(run.status))return {run,operationId:run.id};
+        if(!reservation[0]||(reservation[0].result as {runId?:string}).runId!==run.id)fail(409,'Saved staging intent no longer owns the target reservation');
+        if(['failed','interrupted','cancelled'].includes(run.status)){
+            if(['interrupted','cancelled'].includes(run.status)&&!run.stoppedAt)fail(409,'Connector process must be confirmed stopped before staging status reconciliation');
+            if(run.operation.stagingEffectStage==='transport_intent'&&!run.stoppedAt&&!run.operation.stagingReceipt)fail(409,'Staging transport stop must be confirmed before status reconciliation');
+            run.generation++;run.status='queued';run.stoppedAt=undefined;run.error=undefined;run.updatedAt=now();await store.put('run',run,tx);
+        }else if(run.status!=='queued'&&run.status!=='running'&&run.status!=='paused')fail(409,'Staging operation cannot be reconciled from its current state');
+        const result={run,operationId:run.id};await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${requestId},${tx.json(result as never)}) ON CONFLICT(scope,request_id) DO UPDATE SET result=EXCLUDED.result`;return result;
+    }
     async function latestStagingDeployment(projectId:string,targetId:string,tx:Sql) {
         const runs=await store.list<Run>('run',projectId,tx);
         return runs.filter(run=>run.kind==='delivery'&&run.operation?.targetId===targetId&&['deploy_staging','rollback_staging'].includes(run.operation.action)&&run.operation.stagingReceipt&&['health_passed','rolled_back'].includes(run.operation.phase))
@@ -608,6 +622,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const b=z.object({sourceMergeRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),imageDigest:z.string().regex(/^sha256:[a-f0-9]{64}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
         const work=await store.get<Work>('work',workId,tx);if(!work||projectBoundary&&work.projectId!==projectBoundary)fail(404,'Work missing');
         await grant(user,work!.projectId,true,tx);
+        const requestScope=`staging-request:${work!.projectId}:${user.id}:${b.targetId}`;const canonicalScope=`staging-operation:${work!.projectId}:${b.targetId}:${b.sourceMergeRunId}:${b.imageDigest}`;
+        const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        const savedRequest=prior[0]?(prior[0].result as {run:Run;operationId:string}):canonical[0]?(canonical[0].result as {run:Run;operationId:string}):undefined;
+        if(savedRequest){if(savedRequest.run.operation?.imageDigest!==b.imageDigest||savedRequest.run.operation?.sourceMergeRunId!==b.sourceMergeRunId)fail(409,'Staging request is already bound to another image or merged commit');const reconciled=await resumeStagingIntent(savedRequest,requestScope,b.requestId,workId,b.targetId,b.sourceMergeRunId,tx);if(reconciled)return reconciled;}
         const actor=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;if(!actor[0]||!['owner','admin'].includes(String(actor[0].role)))fail(403,'Staging deployment requires a project administrator');
         const source=await store.get<Run>('run',b.sourceMergeRunId,tx);const sourceOp=source?.operation;
         if(!source||source.projectId!==work!.projectId||source.workId!==workId||source.kind!=='delivery'||source.status!=='completed'||sourceOp?.action!=='merge_pr'||sourceOp.phase!=='merged'||!sourceOp.external?.mergeSha||source.connectorId!==source.targetConnectorId)fail(409,'Verified merged source receipt is unavailable');
@@ -617,11 +635,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const connectorId=await stagingConnector(work!.projectId,b.targetId,'deploy_staging',tx);
         const latest=await latestStagingDeployment(work!.projectId,b.targetId,tx);
         const expectedCurrentDeploymentId=latest?.operation?.stagingReceipt?.deploymentId??null;
-        const requestScope=`staging-request:${work!.projectId}:${user.id}:${b.targetId}`;
-        const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
         if(prior[0]){const saved=prior[0].result as {run?:Run};if(saved.run?.operation?.sourceMergeRunId!==source.id||saved.run.operation.imageDigest!==b.imageDigest)fail(409,'Request ID was already used for another staging image');return saved;}
-        const canonicalScope=`staging-operation:${work!.projectId}:${b.targetId}:${source.id}:${b.imageDigest}`;
-        const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
         if(canonical[0]){
             const saved=canonical[0].result as {run:Run;operationId:string};const current=await store.get<Run>('run',saved.run.id,tx);if(!current)fail(409,'Staging operation is unavailable');
             const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${stagingReservationScope(work!.projectId,b.targetId)} AND request_id='reservation'`;
@@ -636,7 +650,8 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const reservationScope=stagingReservationScope(work!.projectId,b.targetId);
         const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
         if(reservation[0])fail(409,'Staging target is reserved by an unresolved operation');
-        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Deploy this exact merged commit to the configured staging target. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:source.targetRunId,targetRevision:source.targetRevision,targetConnectorId:connectorId,operation:{...sourceOp!,action:'deploy_staging',actorId:user.id,commitSha,candidateRunId:sourceOp.candidateRunId,candidateRevision:sourceOp.candidateRevision,artifactRevision:sourceOp.artifactRevision,phase:'queued',sourceMergeRunId:source.id,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,imageDigest:b.imageDigest,expectedCurrentDeploymentId}};
+        const deploySource={...sourceOp!};delete deploySource.effectIntentGeneration;delete deploySource.stagingEffectStage;delete deploySource.stagingReceipt;delete deploySource.previousDeploymentRunId;delete deploySource.previousDeploymentId;delete deploySource.rollbackToImageDigest;
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Deploy this exact merged commit to the configured staging target. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:source.targetRunId,targetRevision:source.targetRevision,targetConnectorId:connectorId,operation:{...deploySource,action:'deploy_staging',actorId:user.id,commitSha,candidateRunId:sourceOp.candidateRunId,candidateRevision:sourceOp.candidateRevision,artifactRevision:sourceOp.artifactRevision,phase:'queued',sourceMergeRunId:source.id,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,imageDigest:b.imageDigest,expectedCurrentDeploymentId}};
         const saved={run,operationId:run.id};await store.put('run',run,tx);
         await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'deploy_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;
         return saved;
@@ -644,19 +659,24 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     async function requestStagingRollback(user:Member,workId:string,raw:unknown,tx=sql,projectBoundary?:string){
         const b=z.object({deploymentRunId:text,targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
         const work=await store.get<Work>('work',workId,tx);if(!work||projectBoundary&&work.projectId!==projectBoundary)fail(404,'Work missing');
-        await grant(user,work!.projectId,true,tx);const actor=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;if(!actor[0]||!['owner','admin'].includes(String(actor[0].role)))fail(403,'Staging rollback requires a project administrator');
+        await grant(user,work!.projectId,true,tx);
         const current=await store.get<Run>('run',b.deploymentRunId,tx);const receipt=current?.operation?.stagingReceipt;
         if(!current||current.workId!==workId||current.projectId!==work!.projectId||current.operation?.targetId!==b.targetId||!receipt||!['health_passed','rolled_back'].includes(receipt.phase)||!receipt.deploymentId)fail(409,'Current verified staging deployment is unavailable');
-        const {policy}=await stagingTargetPolicy(work!.projectId,b.targetId,tx);const connectorId=await stagingConnector(work!.projectId,b.targetId,'rollback_staging',tx);
         if(!receipt.previousDeploymentId||!receipt.previousImageDigest)fail(409,'No previous health-verified deployment receipt is available');
         const runs=await store.list<Run>('run',work!.projectId,tx);const previous=runs.find(run=>run.workId===workId&&run.operation?.targetId===b.targetId&&run.operation.stagingReceipt?.deploymentId===receipt.previousDeploymentId&&run.operation.stagingReceipt?.phase==='health_passed');
         if(!previous?.operation?.sourceMergeRunId||!previous.operation.commitSha)fail(409,'Previous deployment source receipt is unavailable');
         const source=await store.get<Run>('run',previous.operation.sourceMergeRunId,tx);if(!source||source.status!=='completed'||source.operation?.action!=='merge_pr'||source.operation.phase!=='merged'||source.operation.external?.mergeSha!==previous.operation.commitSha)fail(409,'Previous merged source receipt is unavailable');
-        const requestScope=`staging-rollback-request:${work!.projectId}:${user.id}:${b.targetId}`;const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;if(prior[0]){const saved=prior[0].result as {run:Run;operationId:string};if(saved.run.workId!==workId||saved.run.operation?.targetId!==b.targetId||saved.run.operation?.previousDeploymentRunId!==previous.id)fail(409,'Rollback request id is already bound to a different deployment');return saved;}
-        const reservationScope=stagingReservationScope(work!.projectId,b.targetId);if((await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`)[0])fail(409,'Staging target is reserved by an unresolved operation');
-        const canonicalScope=`staging-rollback:${work!.projectId}:${b.targetId}:${current.id}:${previous.id}`;const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
-        if(canonical[0]){const saved=canonical[0].result as {run:Run;operationId:string};await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(saved as never)}) ON CONFLICT(scope,request_id) DO UPDATE SET result=EXCLUDED.result`;return saved;}
-        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Roll staging back to the previous verified deployment receipt. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:current.targetRunId,targetRevision:current.targetRevision,targetConnectorId:connectorId,operation:{...current.operation!,action:'rollback_staging',actorId:user.id,sourceMergeRunId:previous.operation.sourceMergeRunId,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,commitSha:previous.operation.commitSha,imageDigest:receipt.previousImageDigest,previousDeploymentRunId:previous.id,previousDeploymentId:receipt.previousDeploymentId,rollbackToImageDigest:receipt.previousImageDigest,expectedCurrentDeploymentId:receipt.deploymentId,phase:'queued',stagingReceipt:undefined,stagingEffectStage:undefined}};
+        const requestScope=`staging-rollback-request:${work!.projectId}:${user.id}:${b.targetId}`;const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
+        const reservationScope=stagingReservationScope(work!.projectId,b.targetId);const canonicalScope=`staging-rollback:${work!.projectId}:${b.targetId}:${current.id}:${previous.id}`;
+        const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        const savedRun=prior[0]?(prior[0].result as {run:Run;operationId:string}):canonical[0]?(canonical[0].result as {run:Run;operationId:string}):undefined;
+        if(prior[0]&&(savedRun!.run.workId!==workId||savedRun!.run.operation?.targetId!==b.targetId||savedRun!.run.operation?.previousDeploymentRunId!==previous.id))fail(409,'Rollback request id is already bound to a different deployment');
+        if(savedRun){const reconciled=await resumeStagingIntent(savedRun,requestScope,b.requestId,workId,b.targetId,previous.operation.sourceMergeRunId,tx,previous.id);if(reconciled)return reconciled;}
+        const actor=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;if(!actor[0]||!['owner','admin'].includes(String(actor[0].role)))fail(403,'Staging rollback requires a project administrator');
+        const {policy}=await stagingTargetPolicy(work!.projectId,b.targetId,tx);const connectorId=await stagingConnector(work!.projectId,b.targetId,'rollback_staging',tx);
+        const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;if(reservation[0])fail(409,'Staging target is reserved by an unresolved operation');
+        const rollbackSource={...current.operation!};delete rollbackSource.effectIntentGeneration;delete rollbackSource.stagingEffectStage;delete rollbackSource.stagingReceipt;delete rollbackSource.previousDeploymentRunId;delete rollbackSource.previousDeploymentId;delete rollbackSource.rollbackToImageDigest;
+        const run:Run={id:id('run'),projectId:work!.projectId,workId,prompt:'Roll staging back to the previous verified deployment receipt. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:current.targetRunId,targetRevision:current.targetRevision,targetConnectorId:connectorId,operation:{...rollbackSource,action:'rollback_staging',actorId:user.id,sourceMergeRunId:previous.operation.sourceMergeRunId,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,commitSha:previous.operation.commitSha,imageDigest:receipt.previousImageDigest,previousDeploymentRunId:previous.id,previousDeploymentId:receipt.previousDeploymentId,rollbackToImageDigest:receipt.previousImageDigest,expectedCurrentDeploymentId:receipt.deploymentId,phase:'queued'}};
         const saved={run,operationId:run.id};await store.put('run',run,tx);await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'rollback_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;return saved;
     }
     async function draftPrPolicy(projectId:string,repositoryUrl:string,baseBranch:string,tx:Sql):Promise<void>{
@@ -1202,9 +1222,15 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await sql `UPDATE wb_connectors SET last_seen=now(),capabilities=${sql.json((body.capabilities ?? {}) as never)} WHERE id=${c.id}`;
         const claimed = await store.transaction("workbench:claim", async (tx) => {
             const runs = await store.list<Run>("run", undefined, tx);
+            const isStagingStatusOnly=(run:Run)=>!!run.operation&&['deploy_staging','rollback_staging'].includes(run.operation.action)&&Boolean(run.operation.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(run.operation.phase);
+            const canClaimDelivery=(run:Run)=>{
+                const op=run.operation;if(!op)return false;
+                if(isStagingStatusOnly(run))return Array.isArray(body.capabilities?.deploymentTargets)&&!!op.targetId&&body.capabilities.deploymentTargets.includes(op.targetId);
+                return body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&body.capabilities.deliveryActions.includes(op.action);
+            };
             for (const r of runs) {
                 if(!c.projectIds.includes(r.projectId))continue;
-                if(r.status==='queued'&&!(r.kind==='delivery'&&r.operation?.action==='merge_pr'&&r.operation.phase==='merge_intent')&&!await actorAuthorized(r,tx)){r.status='cancelled';r.stoppedAt=now();r.error='Run authorization revoked';await store.put('run',r,tx);}
+                if(r.status==='queued'&&!(r.kind==='delivery'&&r.operation?.action==='merge_pr'&&r.operation.phase==='merge_intent')&&!(r.kind==='delivery'&&isStagingStatusOnly(r))&&!await actorAuthorized(r,tx)){r.status='cancelled';r.stoppedAt=now();r.error='Run authorization revoked';await store.put('run',r,tx);}
                 if (r.status === "running" && Date.parse(r.leaseUntil ?? "") < Date.now()) {
                     r.status = "interrupted";
                     r.error = "Connector lease expired; reconciliation required";
@@ -1216,7 +1242,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const selected=queued.execution?.connectorId??queued.targetConnectorId??queued.connectorId;
                 if(selected)try{await validateRunSelection(queued,tx);}catch(error){queued.status='failed';queued.error=error instanceof Error?error.message:'Selected connection unavailable';queued.updatedAt=now();await store.put('run',queued,tx);}
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? body.capabilities?.git===true&&body.capabilities?.githubWrite===true&&Array.isArray(body.capabilities?.deliveryActions)&&!!r.operation&&body.capabilities.deliveryActions.includes(r.operation.action) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (r.kind==='delivery'?(!r.targetConnectorId||r.targetConnectorId===c.id):(r.execution?.connectorId??r.targetConnectorId??r.connectorId)===c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(Date.parse(active.createdAt)===Date.parse(r.createdAt)&&active.id<r.id))))));
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? canClaimDelivery(r) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (r.kind==='delivery'?(!r.targetConnectorId||r.targetConnectorId===c.id):(r.execution?.connectorId??r.targetConnectorId??r.connectorId)===c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(Date.parse(active.createdAt)===Date.parse(r.createdAt)&&active.id<r.id))))));
             if (!r)
                 return undefined;
             if(r.kind!=='delivery'){
@@ -1255,7 +1281,13 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.post("/api/workbench/connector/runs/:id/renew", async (req) => store.transaction(`run:${(req.params as {
         id: string;
     }).id}`, async (tx) => {
-        const r = await leased(req, tx);
+        const current=await store.get<Run>('run',(req.params as {id:string}).id,tx);
+        const stageStatusOnly=Boolean(current?.operation?.effectIntentGeneration)&&current?.kind==='delivery'&&['deploy_staging','rollback_staging'].includes(current.operation?.action??'')&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(current.operation?.phase??'');
+        // Once an external staging intent exists, renewal keeps the same bounded status
+        // reconciliation alive even if the initiating actor's mutation permission was revoked.
+        // This does not authorize another deploy/rollback effect.
+        if(stageStatusOnly&&current?.status!=='running')fail(409,'Only a running staging reconciliation can renew its lease');
+        const r = await leased(req, tx, false, stageStatusOnly);
         r.leaseUntil = new Date(Date.now() + 90000).toISOString();
         await tx`UPDATE wb_connectors SET last_seen=now() WHERE id=${r.connectorId!}`;
         await store.put("run", r, tx);

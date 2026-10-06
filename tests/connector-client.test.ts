@@ -45,6 +45,20 @@ it('can constrain a claim to run kinds without changing the default capability r
   expect(body.capabilities.modelReasoningEfforts).toEqual({ 'gpt-6-luna': ['advertised-effort'] });
 });
 
+it('continues to advertise only the configured target for read-only staging reconciliation without the GitHub token',async()=>{
+  vi.stubEnv('MENOTEAM_GITHUB_TOKEN','');
+  const fetcher=vi.fn(async(_url:URL|RequestInfo,_init?:RequestInit)=>new Response(null,{status:204}));
+  try{
+    const client=new WorkbenchConnectorClient({...auth,deploymentTargets:{staging:{sshHost:'stage.example',sshUser:'deploy',identityFile:'/fixture/key',knownHostsFile:'/fixture/known_hosts',hostKeyFingerprint:`SHA256:${'c'.repeat(43)}`,imageRepository:'ghcr.io/blossomsai/menoteam-work-map'} as never}},fetcher as typeof fetch);
+    await client.claim(['delivery']);
+    const body=JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body));
+    expect(body.capabilities.deploymentTargets).toEqual(['staging']);
+    expect(body.capabilities.git).toBeUndefined();
+    expect(body.capabilities.githubWrite).toBeUndefined();
+    expect(body.capabilities.deliveryActions).toBeUndefined();
+  }finally{vi.unstubAllEnvs();}
+});
+
 it('surfaces only safe validation paths and codes from API errors', async () => {
   const fetcher = vi.fn(async (_url: URL | RequestInfo, _init?: RequestInit) => new Response(JSON.stringify({
     message: 'Invalid request',
