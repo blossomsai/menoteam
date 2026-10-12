@@ -85,3 +85,6 @@ jobs:
 
       - name: Build production image
         run: docker build -t menoteam-work-map:ci .
+
+      - name: Build Workbench staging image
+        run: docker build --platform linux/amd64 -f deploy/staging/Dockerfile.workbench -t menoteam-workbench:ci .
