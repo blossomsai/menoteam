@@ -57,3 +57,38 @@ describe('generic authorized fixed-parent QA (real subprocesses, no network)',()
     expect((await captureRequiredLocalQa(cwd,{...options,policy:saved,resources:{[saved.resource.id]:{url:'postgres://fixture-only@127.0.0.1:55439/fixture_test'}}})).checks).toEqual([]);
   },20_000),20_000);
 });
+
+
+describe('fixed-parent Vitest report diagnostics (real child, no database connection)',()=>{
+  it.each(['failed','passed','unknown'] as const)('retains bounded, redacted %s report evidence without changing QA semantics',async mode=>fixture(async(cwd,f)=>{
+    const saved=policy(),database=`diagnostics_${Date.now()}_test`,password='private%20fixture-secret';
+    const url=`postgres://fixture:${password}@127.0.0.1:65432/${database}`;
+    saved.resource={id:'diagnostic-fixture-db',kind:'postgres',hostname:'127.0.0.1',port:65432,database,disposable:true};
+    saved.requirements=[{id:'json-tests',category:'tests',commands:[{executable:'node',args:['report.cjs','{reportFile}'],timeoutMs:10_000}],report:'vitest-json'}];
+    await writeFile(path.join(cwd,'report.cjs'),`
+      const fs=require('node:fs'),path=require('node:path');
+      const mode=${JSON.stringify(mode)},url=process.env.WORK_MAP_TEST_DATABASE_URL;
+      const data=mode==='unknown'?{success:false,testResults:[null,{status:'failed',name:42,assertionResults:[null,{status:'failed',fullName:{unknown:true},failureMessages:[42,null]}]}]}:
+        {numTotalTests:1,numPassedTests:mode==='passed'?1:0,numFailedTests:mode==='failed'?1:0,numPendingTests:0,success:mode==='passed',
+          testResults:[{name:path.join(process.cwd(),'tests/example.test.ts'),status:mode,assertionResults:[{status:mode,fullName:'required QA preserves actor binding',failureMessages:mode==='failed'?['Expected member authorization. '+url+' '+decodeURIComponent(new URL(url).password)+' '+new URL(url).password+' at '+path.join(process.cwd(),'tests/example.test.ts')+':17:4 /private/outside/evidence.ts:9:1 file:///private/outside/reference.ts:8 '+ 'x'.repeat(40_000)]:[]}]}]};
+      fs.writeFileSync(process.argv[2],JSON.stringify(data));console.log('JSON report written');console.log('child output '+ 'z'.repeat(35_000));process.exitCode=mode==='passed'?0:1;
+    `);
+    const qa=await f.track(captureRequiredLocalQa(cwd,{policy:saved,resources:{[saved.resource.id]:{url}},dataDirectory:path.join(cwd,'parent-state'),state:execution(f),signal:f.abort.signal,save:async state=>writeSecureJson(path.join(cwd,'parent-state','spool.json'),state)}));
+    const check=qa.checks[0]!;
+    expect(check.output.length).toBeLessThanOrEqual(30_000);
+    expect(check.output).not.toContain(url);expect(check.output).not.toContain(password);expect(check.output).not.toContain(decodeURIComponent(password));
+    expect(check.output).not.toContain(cwd);expect(check.output).not.toContain('/private/outside/');
+    expect(check.exitCode).toBe(mode==='passed'?0:1);
+    if(mode==='failed'){
+      expect(check.metrics).toEqual({total:1,passed:0,failed:1,skipped:0});
+      expect(check.output).toContain('Failed suite: tests/example.test.ts');
+      expect(check.output).toContain('Failed test: required QA preserves actor binding');
+      expect(check.output).toContain('Expected member authorization.');expect(check.output).toContain('tests/example.test.ts:17:4');
+      expect(check.output).toContain('[QA resource secret]');expect(check.output).toContain('[external path]');
+      expect(qa.verification).toBe('unknown');
+    }else if(mode==='passed'){
+      expect(check.metrics).toEqual({total:1,passed:1,failed:0,skipped:0});expect(check.output).not.toContain('Vitest failure details');
+      expect(hasRequiredLocalQa(qa,qa.candidateFingerprint,saved)).toBe(true);
+    }else{expect(check.metrics).toBeUndefined();expect(qa.verification).toBe('unknown');}
+  },45_000),45_000);
+});
