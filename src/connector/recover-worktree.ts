@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { cp, lstat, mkdir, readFile, readdir, realpath, rename, rmdir } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
-import { waitProcessGroup, type CodexProcessIdentity } from './codex.js';
+import { waitProcessGroup } from './codex.js';
 import { createDiff, diffRevision, fingerprint, gitWithEnv, persistWorktreeMap, type GitOptions, type Worktree } from './git.js';
 import { writeSecureJson } from './state.js';
 import type { ConnectorConfig } from './types.js';
@@ -10,20 +10,22 @@ import type { ConnectorConfig } from './types.js';
 const id = z.string().regex(/^[A-Za-z0-9_-]+$/u);
 const sha = z.string().regex(/^[a-f0-9]{40,64}$/u);
 const hash = z.string().regex(/^[a-f0-9]{64}$/u);
-const identity = z.object({pid:z.number().int().min(2),processGroupId:z.number().int().min(2),startedAt:z.string().min(1),command:z.string().min(1)}).strict();
+const processReference = z.object({pid:z.number().int().min(2),processGroupId:z.number().int().min(2)}).strict();
 export const worktreeRecoveryReceipt = z.object({
   projectId:id,workId:id,candidateSha:sha,baseSha:sha,artifactRevision:hash,candidateFingerprint:hash,
   // Operator observations, not signed authorization or a replacement for server stop acknowledgement.
   idleProof:z.object({
-    connectorId:id,observedAt:z.string().datetime(),activeRunCount:z.literal(0),
+    connectorId:id,observedAt:z.string().datetime(),globalActiveRunCount:z.literal(0),futureLeaseCount:z.literal(0),
     runId:id,generation:z.number().int().min(1),status:z.enum(['completed','failed','paused','cancelled','interrupted']),stoppedAt:z.string().datetime().optional(),
-    connector:identity,children:z.array(identity)
+    // Known references are not a complete historical child inventory. Failed scans cannot be recorded as zero.
+    knownProcesses:z.array(processReference).min(1),
+    osScan:z.object({observedAt:z.string().datetime(),success:z.literal(true),acceptanceCwd:z.string().startsWith('/'),threadId:id,cwdMatches:z.literal(0),threadMatches:z.literal(0)}).strict()
   }).strict()
 }).strict();
 export type WorktreeRecoveryReceipt = z.infer<typeof worktreeRecoveryReceipt>;
 
 async function metadata(file:string){try{return await lstat(file);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw error;}}
-async function assertGone(processes:CodexProcessIdentity[]){
+async function assertGone(processes:Array<z.infer<typeof processReference>>){
   for(const saved of processes){
     // No signals beyond existence checks. Live/recycled/permission-unknown PID or surviving group blocks restoration.
     try{process.kill(saved.pid,0);throw new Error('Recorded process is still present');}
@@ -49,18 +51,21 @@ async function registrationHash(directory:string):Promise<string>{
 export async function recoverWorktree(config:ConnectorConfig,input:WorktreeRecoveryReceipt,options:GitOptions={}):Promise<Worktree>{
   const receipt=worktreeRecoveryReceipt.parse(input),proof=receipt.idleProof;
   if(proof.connectorId!==config.connectorId)throw new Error('Recovery Connector identity mismatch');
-  const age=Date.now()-Date.parse(proof.observedAt);
-  if(age<0||age>300_000)throw new Error('Recovery idle observation is not fresh');
+  for(const observedAt of [proof.observedAt,proof.osScan.observedAt]){
+    const age=Date.now()-Date.parse(observedAt);
+    if(age<0||age>300_000)throw new Error('Recovery idle or OS scan observation is not fresh');
+  }
   if(proof.status!=='completed'&&!proof.stoppedAt)throw new Error('Server stop acknowledgement is required');
-  await assertGone([proof.connector,...proof.children]);
+  await assertGone(proof.knownProcesses);
   const configured=config.projects[receipt.projectId];if(!configured)throw new Error('Recovery project is not configured');
   const root=await realpath(configured),dataDir=await realpath(config.dataDir);
   if(root!==path.resolve(configured)||dataDir!==path.resolve(config.dataDir)||dataDir===root||dataDir.startsWith(`${root}${path.sep}`))throw new Error('Recovery paths must be canonical and separate');
+  const target=path.join(dataDir,'worktrees',receipt.projectId,receipt.workId);
+  if(proof.osScan.acceptanceCwd!==target||path.resolve(proof.osScan.acceptanceCwd)!==target)throw new Error('Recovery OS scan does not match the exact Work target');
   const run=(cwd:string,args:string[])=>gitWithEnv(cwd,{},args,undefined,undefined,options.timeoutMs??30_000,options.signal);
   if((await run(root,['rev-parse','--show-toplevel'])).trim()!==root)throw new Error('Configured repository is not its root');
   for(const ref of [receipt.baseSha,receipt.candidateSha])if((await run(root,['rev-parse','--verify',`${ref}^{commit}`])).trim()!==ref)throw new Error('Recovery requires exact commit IDs');
   await run(root,['merge-base','--is-ancestor',receipt.baseSha,receipt.candidateSha]);
-  const target=path.join(dataDir,'worktrees',receipt.projectId,receipt.workId);
   const expected:Worktree={path:target,revision:receipt.candidateSha,baseRevision:receipt.baseSha,artifactRevision:receipt.artifactRevision};
   for(const ancestor of [path.join(dataDir,'worktrees'),path.dirname(target),target]){
     const info=await metadata(ancestor);if(info&&(info.isSymbolicLink()||!info.isDirectory()||await realpath(ancestor)!==ancestor))throw new Error('Recovery target path is not canonical');
@@ -98,7 +103,8 @@ export async function recoverWorktree(config:ConnectorConfig,input:WorktreeRecov
     const backlink=path.join(admin,'gitdir'),backlinkInfo=await lstat(backlink);
     if(!backlinkInfo.isFile()||backlinkInfo.isSymbolicLink()||path.dirname(admin)!==path.join(common,'worktrees')||(await readFile(backlink,'utf8')).trim()!==path.join(target,'.git'))throw new Error('Recovery checkout references another registration');
     await verify();
-    if(!prior){await assertGone([proof.connector,...proof.children]);await persistWorktreeMap(dataDir,receipt.workId,expected);}
+    await assertGone(proof.knownProcesses);
+    if(!prior)await persistWorktreeMap(dataDir,receipt.workId,expected);
     return expected;
   }
   if(prior)throw new Error('Existing valid map points to missing checkout');
@@ -135,7 +141,7 @@ export async function recoverWorktree(config:ConnectorConfig,input:WorktreeRecov
     await mkdir(path.dirname(target),{recursive:true,mode:0o700});
     await run(root,['worktree','add','--detach',target,receipt.candidateSha]);
     await verify();
-    await assertGone([proof.connector,...proof.children]);
+    await assertGone(proof.knownProcesses);
     options.signal?.throwIfAborted();
     await persistWorktreeMap(dataDir,receipt.workId,expected);
     return expected;

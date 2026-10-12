@@ -18,7 +18,7 @@ vi.mock('node:fs/promises',async original=>{
 });
 
 let temp='';
-afterEach(async()=>{failure.renamePath='';if(temp)await rm(temp,{recursive:true,force:true});temp='';});
+afterEach(async()=>{vi.restoreAllMocks();failure.renamePath='';if(temp)await rm(temp,{recursive:true,force:true});temp='';});
 async function setup(){
   temp=await realpath(await mkdtemp(path.join(os.tmpdir(),'menoteam-offline-work-recovery-')));
   const root=path.join(temp,'repo'),dataDir=path.join(temp,'data');await mkdir(root);await mkdir(dataDir);
@@ -33,7 +33,7 @@ async function setup(){
   // Owned detached fixture exits naturally: its exact PID/group is absent, not inferred from a missing spool.
   const child=spawn(process.execPath,['-e','process.exit(0)'],{detached:true,stdio:'ignore'});await once(child,'exit');
   const receipt:WorktreeRecoveryReceipt={projectId:'project',workId:'work',candidateSha,baseSha,artifactRevision:diffRevision(diff),candidateFingerprint,
-    idleProof:{connectorId:config.connectorId,observedAt:new Date().toISOString(),activeRunCount:0,runId:'run-fixture',generation:1,status:'completed',connector:{pid:child.pid!,processGroupId:child.pid!,startedAt:'owned-fixture',command:'node owned-fixture'},children:[]}};
+    idleProof:{connectorId:config.connectorId,observedAt:new Date().toISOString(),globalActiveRunCount:0,futureLeaseCount:0,runId:'run-fixture',generation:1,status:'completed',knownProcesses:[{pid:child.pid!,processGroupId:child.pid!}],osScan:{observedAt:new Date().toISOString(),success:true,acceptanceCwd:tree.path,threadId:'fixture-thread',cwdMatches:0,threadMatches:0}}};
   const map=path.join(dataDir,'worktree-map','work.json');await rm(map);
   return {config,receipt,tree,root,map};
 }
@@ -76,7 +76,7 @@ it('rejects a live owned group, missing stop acknowledgement, stale observation 
   const {config,receipt,tree,map}=await setup();await eraseCheckout(tree.path);
   const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});await once(child,'spawn');
   try{
-    await expect(recoverWorktree(config,{...receipt,idleProof:{...receipt.idleProof,connector:{...receipt.idleProof.connector,pid:child.pid!,processGroupId:child.pid!}}})).rejects.toThrow('still present');
+    await expect(recoverWorktree(config,{...receipt,idleProof:{...receipt.idleProof,knownProcesses:[{pid:child.pid!,processGroupId:child.pid!}]}})).rejects.toThrow('still present');
   }finally{process.kill(-child.pid!,'SIGKILL');await once(child,'exit');}
   await expect(recoverWorktree(config,{...receipt,idleProof:{...receipt.idleProof,status:'interrupted'}})).rejects.toThrow('stop acknowledgement');
   await expect(recoverWorktree(config,{...receipt,idleProof:{...receipt.idleProof,observedAt:'2020-01-01T00:00:00.000Z'}})).rejects.toThrow('not fresh');
@@ -145,4 +145,37 @@ it('accepts only equivalent complete maps independent of JSON property ordering'
   await writeFile(map,JSON.stringify({...result,unexpected:'no'}));
   await expect(recoverWorktree(config,receipt)).rejects.toThrow('mapping conflicts');
   expect((await git(tree.path,'status','--porcelain')).trim()).toBe('');
+});
+
+
+it('rejects non-idle DB or unsuccessful, nonzero, missing and stale OS observations without mutation',async()=>{
+  const {config,receipt,tree,map}=await setup();await eraseCheckout(tree.path);
+  const proof=receipt.idleProof;
+  await expect(recoverWorktree(config,{...receipt,idleProof:{...proof,osScan:{...proof.osScan,acceptanceCwd:config.dataDir}}})).rejects.toThrow('exact Work target');
+  for(const changes of [{globalActiveRunCount:1},{futureLeaseCount:1},{knownProcesses:[]},
+    {osScan:{...proof.osScan,success:false}}, {osScan:{...proof.osScan,cwdMatches:1}},
+    {osScan:{...proof.osScan,threadMatches:1}}, {osScan:undefined}]){
+    await expect(recoverWorktree(config,{...receipt,idleProof:{...proof,...changes}} as WorktreeRecoveryReceipt)).rejects.toThrow();
+  }
+  for(const observedAt of ['2020-01-01T00:00:00.000Z',new Date(Date.now()+60_000).toISOString()])
+    await expect(recoverWorktree(config,{...receipt,idleProof:{...proof,osScan:{...proof.osScan,observedAt}}})).rejects.toThrow('not fresh');
+  await expect(readFile(map)).rejects.toMatchObject({code:'ENOENT'});expect(await readdir(tree.path)).toEqual([]);
+});
+
+it('rejects permission-unknown known PIDs and rechecks references before writing a valid map',async()=>{
+  const {config,receipt,map}=await setup(),saved=receipt.idleProof.knownProcesses[0]!;
+  const actual=process.kill.bind(process);
+  const check=vi.spyOn(process,'kill').mockImplementation((pid,signal)=>{
+    if(pid===saved.pid&&signal===0)throw Object.assign(new Error('Unknown permission'),{code:'EPERM'});
+    return actual(pid,signal);
+  });
+  await expect(recoverWorktree(config,receipt)).rejects.toMatchObject({code:'EPERM'});
+  await expect(readFile(map)).rejects.toMatchObject({code:'ENOENT'});
+  let calls=0;
+  check.mockImplementation((pid,signal)=>{
+    if(pid===saved.pid&&signal===0){if(++calls===2)throw Object.assign(new Error('Unknown second observation'),{code:'EPERM'});throw Object.assign(new Error('Absent'),{code:'ESRCH'});}
+    return actual(pid,signal);
+  });
+  await expect(recoverWorktree(config,receipt)).rejects.toMatchObject({code:'EPERM'});
+  expect(calls).toBe(2);await expect(readFile(map)).rejects.toMatchObject({code:'ENOENT'});
 });
