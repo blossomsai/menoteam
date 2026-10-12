@@ -36,6 +36,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     const store = new WorkbenchStore(options.sql);
     const sql = options.sql;
     const app = Fastify({
+        // Generated typed-review artifact IDs reach 263 characters (including a bounded 200-char request ID).
+        // Fastify exposes this limit per router, not per route; retain a finite bound for every parameter.
+        routerOptions: { maxParamLength: 320 },
         bodyLimit: 1048576
     });
     await app.register(helmet);
