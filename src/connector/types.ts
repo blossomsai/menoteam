@@ -59,6 +59,7 @@ export interface DiffFile {
   oldPath?: string;
   status: 'added' | 'modified' | 'deleted' | 'renamed';
   binary: boolean;
+  encodingUnsupported?: boolean;
   additions: number | null;
   deletions: number | null;
   textBytes?: number;

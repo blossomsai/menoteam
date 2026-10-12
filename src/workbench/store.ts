@@ -32,7 +32,7 @@ export class WorkbenchStore {
         return rows.map(r => r.data as T);
     }
     async artifactMetadata(projectIds:string[],tx=this.sql,workId?:string):Promise<import('./types.js').Artifact[]>{
-        const rows=await tx`SELECT CASE WHEN data->>'kind'='diff' THEN jsonb_set(data,'{data}',data->'data'-'patch') ELSE data-'data' END AS data FROM wb_records WHERE kind='artifact' AND project_id=ANY(${projectIds}) AND data->>'kind'<>'diff_file_chunk' AND (${workId??null}::text IS NULL OR data->>'workId'=${workId??null}) ORDER BY updated_at DESC,id DESC LIMIT 200`;
+        const rows=await tx`SELECT CASE WHEN data->>'kind'='diff' THEN jsonb_set(data,'{data}',(data->'data')-'patch') ELSE data-'data' END AS data FROM wb_records WHERE kind='artifact' AND project_id=ANY(${projectIds}) AND data->>'kind'<>'diff_file_chunk' AND (${workId??null}::text IS NULL OR data->>'workId'=${workId??null}) ORDER BY updated_at DESC,id DESC LIMIT 200`;
         return rows.map(r=>r.data as import('./types.js').Artifact);
     }
     async runArtifacts(projectId:string,runId:string,tx=this.sql):Promise<import('./types.js').Artifact[]>{

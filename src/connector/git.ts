@@ -223,15 +223,15 @@ export async function createDiff(cwd: string, baseRevision: string, options: Git
   return previewData();
 }
 
-export interface DiffFileChunkIndex { path:string; oldPath?:string; sha256:string; byteLength:number; chunks:number; }
+export interface DiffFileChunkIndex { path:string; oldPath?:string; sha256:string; byteLength:number; chunks:number; encodingUnsupported?:boolean; }
 export async function spoolDiffFile(cwd:string,baseRevision:string,candidateRevision:string,file:DiffFile,directory:string,options:GitOptions={}):Promise<DiffFileChunkIndex>{
   const { createHash }=await import('node:crypto');
   const safeName=createHash('sha256').update(file.path).digest('hex');const dir=path.join(directory,safeName);await mkdir(dir,{recursive:true,mode:0o700});
   const args=['diff','--find-renames','--no-ext-diff','-U0',`${baseRevision}..${candidateRevision}`,'--',...(file.oldPath?[file.oldPath,file.path]:[file.path])];
-  let pending:Buffer=Buffer.alloc(0),index=0,byteLength=0;const hash=createHash('sha256');
+  let pending:Buffer=Buffer.alloc(0),index=0,byteLength=0,encodingUnsupported=false;const hash=createHash('sha256'),decoder=new TextDecoder('utf-8',{fatal:true});
   const writeChunk=async(chunk:Buffer)=>{await writeFile(path.join(dir,String(index++)),chunk,{mode:0o600});};
   const consume=async(chunk:Buffer)=>{
-    byteLength+=chunk.length;hash.update(chunk);pending=pending.length?Buffer.concat([pending,chunk]):chunk;
+    byteLength+=chunk.length;hash.update(chunk);try{decoder.decode(chunk,{stream:true});}catch{encodingUnsupported=true;}pending=pending.length?Buffer.concat([pending,chunk]):chunk;
     while(pending.length>DIFF_FILE_CHUNK_BYTES){
       let end=DIFF_FILE_CHUNK_BYTES;let start=end;
       while(start>0&&(pending[start]!&0xc0)===0x80)start--;
@@ -242,8 +242,9 @@ export async function spoolDiffFile(cwd:string,baseRevision:string,candidateRevi
     }
   };
   await executeGit(cwd,{},args,options,undefined,undefined,false,consume);
+  try{decoder.decode();}catch{encodingUnsupported=true;}
   if(pending.length||index===0)await writeChunk(pending);
-  return {path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),sha256:hash.digest('hex'),byteLength,chunks:index};
+  return {path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),sha256:hash.digest('hex'),byteLength,chunks:index,...(encodingUnsupported?{encodingUnsupported:true}:{})};
 }
 
 export async function persistWorktreeMap(dataDir: string, workId: string, worktree: Worktree): Promise<void> {

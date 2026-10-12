@@ -87,3 +87,7 @@ it('keeps a complete 217-file manifest beyond the aggregate preview and spools a
     expect(Buffer.byteLength(serialized)).toBeLessThan(1_000_000);
   }
 });
+
+it('marks invalid UTF-8 text diffs unsupported while retaining exact raw spool bytes',async()=>{
+  temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-invalid-utf8-'));await git(temp,'init','-q');await git(temp,'config','user.name','Test');await git(temp,'config','user.email','test@example.invalid');await writeFile(path.join(temp,'encoding.bin'),Buffer.from([0x61,0x0a]));await git(temp,'add','-A');await git(temp,'commit','-qm','base');const base=(await git(temp,'rev-parse','HEAD')).trim();await writeFile(path.join(temp,'encoding.bin'),Buffer.from([0xff,0x0a,0x62,0x0a]));await git(temp,'add','-A');await git(temp,'commit','-qm','invalid utf8 candidate');const diff=await createDiff(temp,base),file=diff.files.find(item=>item.path==='encoding.bin')!;expect(file.binary).toBe(false);const directory=path.join(temp,'spool');await mkdir(directory);const index=await spoolDiffFile(temp,base,diff.candidateRevision,file,directory);expect(index.encodingUnsupported).toBe(true);const reconstructed=Buffer.concat(await Promise.all(Array.from({length:index.chunks},(_,part)=>readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part))))));expect(createHash('sha256').update(reconstructed).digest('hex')).toBe(index.sha256);expect(reconstructed.includes(Buffer.from([0xff]))).toBe(true);
+});

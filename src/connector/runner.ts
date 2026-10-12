@@ -193,7 +193,7 @@ export class ConnectorRunner {
       if(!file){spool.diffFileUpload=undefined;await this.save(spool);await rm(upload.directory,{recursive:true,force:true});break;}
       const chunk=await readFile(path.join(upload.directory,createHash('sha256').update(file.path).digest('hex'),String(upload.chunkIndex)));
       const requestId=`diff-file:${upload.candidateRevision}:${createHash('sha256').update(file.path).digest('hex')}:${upload.chunkIndex}`;
-      const data={parentArtifactId:upload.parentArtifactId,projectId:upload.projectId,workId:upload.workId,runId:spool.runId,candidateRevision:upload.candidateRevision,baseRevision:upload.baseRevision,diffRevision:upload.revision,path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),chunkIndex:upload.chunkIndex,chunkCount:file.chunks,fileSha256:file.sha256,fileByteLength:file.byteLength,chunkSha256:createHash('sha256').update(chunk).digest('hex'),contentBase64:chunk.toString('base64')};
+      const data={parentArtifactId:upload.parentArtifactId,projectId:upload.projectId,workId:upload.workId,runId:spool.runId,candidateRevision:upload.candidateRevision,baseRevision:upload.baseRevision,diffRevision:upload.revision,path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),chunkIndex:upload.chunkIndex,chunkCount:file.chunks,fileSha256:file.sha256,fileByteLength:file.byteLength,chunkSha256:createHash('sha256').update(chunk).digest('hex'),contentBase64:chunk.toString('base64'),...(file.encodingUnsupported?{encodingUnsupported:true}:{})};
       await client.addArtifact(spool.runId,spool.generation,{kind:'diff_file_chunk',revision:upload.revision,requestId,data});
       if(++upload.chunkIndex>=file.chunks){upload.fileIndex++;upload.chunkIndex=0;}await this.save(spool);
     }
@@ -447,7 +447,7 @@ export class ConnectorRunner {
         const directory=path.join(this.config.dataDir,'diff-file-spool',stateKey(claim.run.id,String(claim.run.generation)));
         await mkdir(directory,{recursive:true,mode:0o700});
         const fileChunks:DiffFileChunkIndex[]=[];
-        for(const file of diff.files)if(!file.binary){const index=await spoolDiffFile(cwd,baseRevision,diff.candidateRevision,file,directory,gitOptions);file.textBytes=index.byteLength;file.chunkCount=index.chunks;file.fileSha256=index.sha256;fileChunks.push(index);}
+        for(const file of diff.files)if(!file.binary){const index=await spoolDiffFile(cwd,baseRevision,diff.candidateRevision,file,directory,gitOptions);file.textBytes=index.byteLength;file.chunkCount=index.chunks;file.fileSha256=index.sha256;file.encodingUnsupported=index.encodingUnsupported===true;fileChunks.push(index);}
         const saved = await readWorktreeMap(this.config.dataDir,claim.run.workId!);
         await persistWorktreeMap(this.config.dataDir,claim.run.workId!,{...saved!,artifactRevision:revision});
         spool.artifacts.push({kind:'diff',revision,data:diff,requestId:`diff:${claim.run.id}:${claim.run.generation}`});

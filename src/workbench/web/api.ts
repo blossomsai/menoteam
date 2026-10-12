@@ -54,7 +54,7 @@ export const workbenchApi = {
   logout: () => request<void>('/logout', { method: 'POST' }),
   snapshot: () => request<Snapshot>('/snapshot'),
   artifact: (id: string) => request<Artifact>(`/artifacts/${encodeURIComponent(id)}`),
-  diffFile: (id:string,path:string,revision:string,cursor?:string,signal?:AbortSignal) => { const query=new URLSearchParams({path,revision});if(cursor)query.set('cursor',cursor);return request<{path:string;binary:boolean;complete:boolean;incomplete?:boolean;chunkIndex:number;chunkCount:number;fileSha256?:string;contentBase64:string;nextCursor:string|null;reason?:string}>(`/artifacts/${encodeURIComponent(id)}/diff-file?${query}`,{signal}); },
+  diffFile: (id:string,path:string,revision:string,cursor?:string,signal?:AbortSignal) => { const query=new URLSearchParams({path,revision});if(cursor)query.set('cursor',cursor);return request<{path:string;binary:boolean;encodingUnsupported?:boolean;complete:boolean;verified?:boolean;incomplete?:boolean;integrity?:'pending'|'verified'|'incomplete';chunkIndex:number;chunkCount:number;fileSha256?:string;contentBase64:string;nextCursor:string|null;reason?:string}>(`/artifacts/${encodeURIComponent(id)}/diff-file?${query}`,{signal}); },
   projectMessages: (projectId: string, query: { workId?: string; before?: string; after?: string } = {}) => {
     const params = new URLSearchParams();
     if (query.workId) params.set('workId', query.workId);
