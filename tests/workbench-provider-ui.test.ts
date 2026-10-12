@@ -729,3 +729,19 @@ it.each(['matching','fingerprint mismatch','binding fingerprint mismatch','revis
   if(kind.endsWith('mismatch')){expect(reviewSection.textContent).toContain('Stale');expect(reviewSection.textContent).not.toContain('approved');}
   else {expect(reviewSection.textContent).toContain('Current evidence');expect(reviewSection.textContent).toContain('approved');}
 });
+
+
+it('puts execution history after the actual diff and keeps it collapsed without dropping errors',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+  const work={id:'work-1',projectId:project.id,title:'History',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+  const artifact={id:'diff-history',projectId:project.id,workId:work.id,runId:'run-history',kind:'diff' as const,revision:'revision',createdAt:'2026-10-12',data:{files:[{path:'src/example.ts',status:'modified',binary:false,additions:1,deletions:0,hunks:[]}],totalFiles:1,truncated:false}};
+  const run={id:'run-history',projectId:project.id,workId:work.id,kind:'implementation',status:'failed',error:'Actual execution failed',model:'gpt-6-luna',reasoning:'medium',generation:1,createdAt:'2026-10-12',updatedAt:'2026-10-12'} as Snapshot['runs'][number];
+  vi.spyOn(workbenchApi,'artifact').mockResolvedValue(artifact);
+  await mount({...snapshot(),works:[work],runs:[run],artifacts:[artifact]} as Snapshot);await flush();
+  const history=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent==='Execution history · 1 runs')!;
+  expect(history.open).toBe(false);
+  const file=[...host.querySelectorAll('summary')].find(item=>item.textContent?.includes('src/example.ts'))!;
+  expect(file.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  await flush(()=>{history.open=true;});
+  expect(history.textContent).toContain('Implementation run');expect(history.textContent).toContain('Actual execution failed');expect(history.textContent).toContain('failed');
+});
