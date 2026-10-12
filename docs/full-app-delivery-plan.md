@@ -87,3 +87,10 @@ The independent server-bound typed review remains **insufficient_evidence**, wit
 
 
 A subsequent local Luna UI delta after `bdab98e` adjusts desktop Work split scrolling and removes unavailable-Marketplace explanatory copy; a short-viewport clipping finding was corrected and bounded Sol source review found no remaining actionable issue. Reported mounted/UI checks and UI typecheck/build are supporting evidence only: browser behavior, a new full gate and runtime upgrade remain unproven; the 633/633 gate above applies only to committed `bdab98e`.
+
+
+### Current local execution checkpoint — 2026-10-12
+
+Local app **55253** and acceptance Connector **55741** / PTY **14382** now run exact `6cfa77311adde38436a3aa4a78ff71e7df75588e` from the verified Application Support layout, with same-schema rollback retained and data/session/config/grants preserved. Dogfood **85202** stays live at `8b96295`. UI HTML/assets and normal long-artifact GET return 200; Root's original authenticated browser displays All projects, but QA projection and New Work/Changes fixes are still awaiting app-only deployment. Current source/runtime evidence supersedes historical GET414/browser-denial checkpoints without changing their recorded facts.
+
+The native Beta candidate `32c9` has current fixed required QA and exact-assignment typed approval; separate exact-main operator checks passed 652/652 + PG54/54, three types/builds exit 0. A08 additionally has bounded real revoke/stopped-ACK-loss/same-ID restart evidence after one retained miss, with full read403/minimal recovery200 and no repeated effect. Historical native PID/PG proof remains unknown. See the acceptance ledger and ignored safe receipts for exact bindings. A03/A08/A16 and full-app remain Partial; this checkpoint authorizes no remote/production delivery.

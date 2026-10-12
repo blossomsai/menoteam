@@ -309,42 +309,24 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('Provider connection'); expect(host.textContent).toContain('Team Codex'); expect(host.textContent).toContain(runtime.connectorId); expect(host.textContent).toContain('This model is not reported by the Work’s bound provider connection.');
   });
 
-  it('creates Project B Work with explicit connection B while workspace default stays on A', async () => {
-    const projectB = { ...project, id: 'project-b', name: 'Project B' };
-    const connectionA = { ...providerSetting, id: 'provider-a', name: 'A Codex', data: { ...providerSetting.data, connectorId: 'connector-a', default: true } };
-    const connectionB = { ...providerSetting, id: 'provider-b', name: 'B Codex', data: { ...providerSetting.data, connectorId: 'connector-b', default: false } };
-    const current = snapshot(owner, [connectionA, connectionB], [
-      { ...runtime, connectorId: 'connector-a', projectIds: [project.id], models: ['gpt-6-luna'] },
-      { ...runtime, connectorId: 'connector-b', projectIds: [projectB.id], models: ['gpt-6-luna'] },
-    ]);
-    current.projects = [project, projectB];
-    current.providerConnections = [
-      { id: 'provider-a', name: 'A Codex', connectorId: 'connector-a', enabled: true, default: true, status: 'available', models: ['gpt-6-luna'], projectIds: [project.id], localWorktrees: true },
-      { id: 'provider-b', name: 'B Codex', connectorId: 'connector-b', enabled: true, default: false, status: 'available', models: ['gpt-6-luna'], projectIds: [projectB.id], localWorktrees: true },
-    ];
-    window.history.replaceState(null, '', `/workbench/?view=master&project=${projectB.id}&draft=Help%20me%20plan%20a%20new%20work%3A`);
+  it.each(['empty stored draft','existing draft'])('New work opens Master preset without automatic creation or sending: %s',async scenario=>{
+    const projectB={...project,id:'project-b',name:'Project B'};
+    const current=snapshot(owner,[]);current.projects=[project,projectB];
+    const preset='Help me plan a new work:';
+    sessionStorage.setItem(`menoteam-workbench:draft:${owner.id}:${projectB.id}:master`,scenario==='existing draft'?'My unsent draft':'');
+    window.history.replaceState(null,'',`/workbench/?view=master&project=${projectB.id}&draft=${encodeURIComponent(preset)}`);
+    const send=vi.spyOn(workbenchApi,'sendMessage');const create=vi.spyOn(workbenchApi,'createWork');
     await mount(current);
-    vi.spyOn(workbenchApi, 'sendMessage').mockResolvedValue({ message: {} as never, run: {} as never });
-    const create = vi.spyOn(workbenchApi, 'createWork').mockResolvedValue({ id: 'new-work', projectId: projectB.id, title: 'Explicit B', overview: 'B work', status: 'queued', revision: 1, profileId: '', connectionId: 'provider-b', sources: [], createdAt: '', updatedAt: '' });
-    vi.mocked(workbenchApi.snapshot).mockResolvedValue(current);
-    await type('#new-work-title', 'Explicit B'); await type('#new-work-overview', 'B work'); await choose('#new-work-provider', 'provider-b');
-    await flush(() => button('Create Work').click());
-    expect(create).toHaveBeenCalledWith(projectB.id, { title: 'Explicit B', overview: 'B work', connectionId: 'provider-b' });
-    expect(connectionA.data.default).toBe(true); expect(connectionB.data.default).toBe(false);
-    expect(workbenchApi.sendMessage).not.toHaveBeenCalled();
-    expect(host.textContent).toContain('Work created with its selected provider connection.'); expect(host.textContent).toContain('Open Explicit B');
-  });
-
-  it('does not expose cross-project or unavailable connections and keeps creation disabled without an eligible grant', async () => {
-    const projectB = { ...project, id: 'project-b', name: 'Project B' };
-    const aOnly = { id: 'provider-a', name: 'A Codex', connectorId: 'connector-a', enabled: true, default: true, status: 'available', models: ['gpt-6-luna'], projectIds: [project.id], localWorktrees: true };
-    const offline = { id: 'provider-b', name: 'B Offline', connectorId: 'connector-b', enabled: true, default: false, status: 'offline', models: ['gpt-6-luna'], projectIds: [projectB.id], localWorktrees: true };
-    const current = snapshot(member, []); current.projects = [project, projectB]; current.providerConnections = [aOnly, offline];
-    window.history.replaceState(null, '', `/workbench/?view=master&project=${projectB.id}&draft=Help%20me%20plan%20a%20new%20work%3A`);
-    await mount(current);
-    expect([...host.querySelectorAll<HTMLSelectElement>('#new-work-provider option')].map(option => option.value)).toEqual(['']);
-    expect(button('Create Work').disabled).toBe(true);
-    expect(host.textContent).toContain('No available connection is authorized for this project');
+    const expected=scenario==='existing draft'?'My unsent draft':preset;
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe(expected);
+    expect(host.querySelector('[aria-label="Create new Work"]')).toBeNull();
+    expect(new URL(window.location.href).searchParams.has('draft')).toBe(false);
+    expect(send).not.toHaveBeenCalled();expect(create).not.toHaveBeenCalled();
+    vi.mocked(workbenchApi.snapshot).mockResolvedValue(current);await flush();
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe(expected);
+    await flush(()=>root.unmount());root=createRoot(host);await mount(current);
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe(expected);
+    expect(send).not.toHaveBeenCalled();expect(create).not.toHaveBeenCalled();
   });
 
   it.each(['marked diagnostic', 'legacy diagnostic', 'genuine failed Master', 'queued Master', 'claimed Master with diagnostic wording', 'native Master with diagnostic wording'])('preserves bootstrap semantics after a %s', async scenario => {
@@ -521,19 +503,20 @@ describe('mounted provider connection settings', () => {
   });
 
 
-  it('surfaces an explicit project grant denial from the create API without substituting default or sending the draft', async () => {
-    const projectB = { ...project, id: 'project-b', name: 'Project B' };
-    const current = snapshot(owner, []); current.projects = [project, projectB]; current.providerConnections = [{ id: 'provider-b', name: 'B Codex', connectorId: 'connector-b', enabled: true, default: false, status: 'available', models: ['gpt-6-luna'], projectIds: [projectB.id], localWorktrees: true }];
-    window.history.replaceState(null, '', `/workbench/?view=master&project=${projectB.id}&draft=Help%20me%20plan%20a%20new%20work%3A`);
-    await mount(current);
-    const create = vi.spyOn(workbenchApi, 'createWork').mockRejectedValue(new Error('Project connection grant was revoked'));
-    vi.spyOn(workbenchApi, 'sendMessage').mockResolvedValue({ message: {} as never, run: {} as never });
-    await type('#new-work-title', 'Denied B'); await choose('#new-work-provider', 'provider-b'); await flush(() => button('Create Work').click());
-    expect(create).toHaveBeenCalledWith(projectB.id, { title: 'Denied B', overview: '', connectionId: 'provider-b' });
-    expect(host.textContent).toContain('Project connection grant was revoked'); expect(host.textContent).not.toContain('Work created with its selected provider connection.');
-    expect(workbenchApi.sendMessage).not.toHaveBeenCalled();
+  it('keeps the New work Master draft after an explicit project connection denial without substituting a default',async()=>{
+    const projectB={...project,id:'project-b',name:'Project B'};
+    const current=snapshot(owner,[]);current.projects=[project,projectB];current.providerConnections=[{id:'provider-b',name:'B Codex',connectorId:'connector-b',enabled:true,default:false,status:'available',models:['gpt-6.1-sol'],projectIds:[projectB.id],localWorktrees:true}];
+    window.history.replaceState(null,'',`/workbench/?view=master&project=${projectB.id}&draft=Help%20me%20plan%20a%20new%20work%3A`);
+    const send=vi.spyOn(workbenchApi,'sendMessage').mockRejectedValue(new Error('Project connection grant was revoked'));
+    const create=vi.spyOn(workbenchApi,'createWork');await mount(current);
+    const select=host.querySelector<HTMLSelectElement>('select[aria-label="Master provider connection"]');
+    expect(select).not.toBeNull();await flush(()=>{select!.value='provider-b';select!.dispatchEvent(new Event('change',{bubbles:true}));});
+    await flush(()=>button('Send message').click());
+    expect(send).toHaveBeenCalledWith(projectB.id,expect.objectContaining({connectionId:'provider-b',text:'Help me plan a new work:'}));
+    expect(host.textContent).toContain('Project connection grant was revoked');
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe('Help me plan a new work:');
+    expect(create).not.toHaveBeenCalled();
   });
-
 
   it('shows a recorded legacy Connector ID as unavailable when no scoped runtime is present', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=legacy-work');

@@ -263,7 +263,6 @@ function ProjectCard({ project, snapshot, setError, refresh }: { project: Projec
 }
 
 function ConversationPage({ title, messages, project, snapshot, work, refresh, setError, initialDraft = '' }: { title: string; messages: Message[]; project: Project; snapshot: Snapshot; work?: Work; refresh: () => Promise<void>; setError: (value: string) => void; initialDraft?: string }) {
-  const [showNewWorkPanel] = useState(() => !work && initialDraft.startsWith('Help me plan a new work:'));
   const workRuns = snapshot.runs.filter(run => run.projectId === project.id && run.workId === work?.id && ['queued', 'running', 'paused', 'failed', 'interrupted'].includes(run.status));
   const handoffHistory = snapshot.runs.filter(run => run.projectId === project.id && run.workId === work?.id && run.kind === 'implementation' && (run.threadId || run.execution?.connectorId || run.connectorId || run.targetConnectorId)).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
   const latestImplementation = handoffHistory.at(-1);
@@ -278,37 +277,8 @@ function ConversationPage({ title, messages, project, snapshot, work, refresh, s
     {title && <div className="mb-5 flex items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{work ? 'Conversation with the responsible Agent, Master, and subagents.' : `Project conversation · ${project.name}`}</p></div>{work && <Badge variant="outline">{work.status.replace('_', ' ')}</Badge>}</div>}
     {workRuns.map(run => <RunNotice key={run.id} run={run} canManageProject={canManageProject} refresh={refresh} setError={setError} />)}
     <div className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4" aria-live="polite">{history.hasOlder && <Button variant="ghost" size="sm" disabled={history.loadingOlder} onClick={() => void history.loadOlder()}>{history.loadingOlder ? 'Loading…' : 'Load earlier messages'}</Button>}{displayedMessages.length ? [...displayedMessages].sort(messageOrder).map(message => <MessageRow key={message.id} message={message} multiParticipant={!!work} userName={snapshot.member.name} />) : <p className="py-16 text-center text-sm text-muted-foreground">No messages yet. Send a message to begin.</p>}</div>
-    {showNewWorkPanel && <NewWorkPanel project={project} snapshot={snapshot} refresh={refresh} setError={setError} />}
     <MessageComposer key={`composer-${project.id}-${work?.id ?? 'master'}`} memberId={snapshot.member.id} project={project} work={work} handoffSource={handoffSource} handoffConnection={handoffSource ? handoffConnection : undefined} refresh={refresh} setError={setError} initialDraft={initialDraft} bootstrapConnections={!work && canBootstrapMaster(snapshot, project.id, displayedMessages) ? masterBootstrapConnections(snapshot, project.id) : []} />
   </div>;
-}
-
-function NewWorkPanel({ project, snapshot, refresh, setError }: { project: Project; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {
-  const [title, setTitle] = useState(''); const [overview, setOverview] = useState(''); const [connectionId, setConnectionId] = useState(''); const [profileId, setProfileId] = useState(''); const [createdWork, setCreatedWork] = useState<Work | null>(null); const [busy, setBusy] = useState(false);
-  const eligibleConnections = (snapshot.providerConnections ?? []).filter(connection => connection.enabled && connection.status === 'available' && connection.projectIds.includes(project.id) && connection.connectorId && connection.models.length > 0);
-  const selectedConnection = eligibleConnections.find(connection => connection.id === connectionId);
-  const profiles = snapshot.settings.filter(setting => setting.kind === 'profile' && (!setting.projectId || setting.projectId === project.id) && selectedConnection?.models.includes(String(setting.data.model ?? '')));
-  if (createdWork) return <section className="mb-4 rounded-lg border bg-muted/20 p-4" aria-label="Created Work"><p className="text-sm">Work created with its selected provider connection.</p><a className="mt-2 inline-block text-sm font-medium underline" href={href('work-detail', project.id, createdWork.id)}>Open {createdWork.title}</a></section>;
-  return <form aria-label="Create new Work" className="mb-4 grid gap-3 rounded-xl border bg-background p-4" onSubmit={async event => {
-    event.preventDefault(); const connection = eligibleConnections.find(item => item.id === connectionId); if (!title.trim() || !connection || (profileId && !profiles.some(profile => profile.id === profileId)) || (!profileId && !connection.models.includes('gpt-6-luna')) || busy) return;
-    setBusy(true); setError('');
-    try { const work = await workbenchApi.createWork(project.id, { title: title.trim(), overview: overview.trim(), connectionId: connection.id, ...(profileId ? { profileId } : {}) }); setCreatedWork(work); await refresh(); }
-    catch (cause) { setError(errorMessage(cause)); }
-    finally { setBusy(false); }
-  }}>
-    <div><h2 className="font-semibold">Create a new Work</h2><p className="mt-1 text-sm text-muted-foreground">Choose a connection authorized for {project.name}. This creates a Work; it does not send your Master draft.</p></div>
-    <div className="grid gap-3 sm:grid-cols-2">
-      <div className="grid gap-2"><Label htmlFor="new-work-title">Title</Label><Input id="new-work-title" required maxLength={200} value={title} onChange={event => setTitle(event.target.value)} /></div>
-      <div className="grid gap-2"><Label htmlFor="new-work-provider">Provider connection</Label><select id="new-work-provider" required className="h-9 rounded-md border bg-background px-3 text-sm" value={connectionId} onChange={event => setConnectionId(event.target.value)}><option value="">Choose an available project connection</option>{eligibleConnections.map(connection => <option key={connection.id} value={connection.id}>{connection.name} · {connection.models.join(', ')}</option>)}</select></div>
-      <div className="grid gap-2 sm:col-span-2"><Label htmlFor="new-work-overview">Overview (optional)</Label><Textarea id="new-work-overview" value={overview} onChange={event => setOverview(event.target.value)} rows={2} /></div>
-      <div className="grid gap-2"><Label htmlFor="new-work-profile">Execution profile</Label><select id="new-work-profile" className="h-9 rounded-md border bg-background px-3 text-sm" value={profileId} disabled={!selectedConnection} onChange={event => setProfileId(event.target.value)}><option value="">No profile · gpt-6-luna</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {String(profile.data.model)}</option>)}</select></div>
-    </div>
-    {!eligibleConnections.length && <p role="status" className="text-sm text-muted-foreground">No available connection is authorized for this project and required capabilities.</p>}
-    {selectedConnection && !profileId && !selectedConnection.models.includes('gpt-6-luna') && <p role="alert" className="text-sm text-destructive">Choose a compatible profile; this connection does not report the Connector default model gpt-6-luna.</p>}
-    {profileId && !profiles.some(profile => profile.id === profileId) && <p role="alert" className="text-sm text-destructive">The selected profile is no longer available for this connection. Choose a compatible profile explicitly.</p>}
-    {connectionId && !selectedConnection && <p role="alert" className="text-sm text-destructive">The selected connection is no longer available to this project. Choose another explicitly; no default will be substituted.</p>}
-    <div><Button disabled={busy || !title.trim() || !selectedConnection || (profileId && !profiles.some(profile => profile.id === profileId)) || (!profileId && !selectedConnection.models.includes('gpt-6-luna'))}>{busy ? 'Creating…' : 'Create Work'}</Button></div>
-  </form>;
 }
 
 function useMessageHistory(projectId: string, workId?: string) {
@@ -361,14 +331,14 @@ function MessageRow({ message, multiParticipant = false, userName = 'You' }: { m
 function MessageComposer({ memberId, project, work, handoffSource, handoffConnection, refresh, setError, initialDraft = '', bootstrapConnections = [] }: { memberId: string; project: Project; work?: Work; handoffSource?: Run; handoffConnection?: NonNullable<Snapshot['providerConnections']>[number]; refresh: () => Promise<void>; setError: (value: string) => void; initialDraft?: string; bootstrapConnections?: NonNullable<Snapshot['providerConnections']> }) {
   const draftKey = `menoteam-workbench:draft:${memberId}:${project.id}:${work?.id ?? 'master'}`;
   const connectionKey = work ? '' : `menoteam-workbench:bootstrap-connection:${memberId}:${project.id}`;
-  const [text, setText] = useState(() => { try { return sessionStorage.getItem(draftKey) ?? initialDraft; } catch { return initialDraft; } }); const [busy, setBusy] = useState(false); const [connectionId, setConnectionId] = useState(() => { try { return connectionKey ? sessionStorage.getItem(connectionKey) ?? '' : ''; } catch { return ''; } }); const [handoffMode, setHandoffMode] = useState(false); const [handoffModel, setHandoffModel] = useState(''); const [handoffReasoning, setHandoffReasoning] = useState('');
+  const [text, setText] = useState(() => { try { return sessionStorage.getItem(draftKey) || initialDraft; } catch { return initialDraft; } }); const [busy, setBusy] = useState(false); const [connectionId, setConnectionId] = useState(() => { try { return connectionKey ? sessionStorage.getItem(connectionKey) ?? '' : ''; } catch { return ''; } }); const [handoffMode, setHandoffMode] = useState(false); const [handoffModel, setHandoffModel] = useState(''); const [handoffReasoning, setHandoffReasoning] = useState('');
   const handoffModels = (handoffConnection?.models ?? []).filter(model => (handoffConnection?.modelReasoningEfforts?.[model]?.length ?? 0) > 0);
   const advertisedEfforts = handoffConnection?.modelReasoningEfforts?.[handoffModel] ?? [];
   const handoffReady = Boolean(handoffMode && handoffSource && handoffModel && handoffModels.includes(handoffModel) && handoffReasoning && advertisedEfforts.includes(handoffReasoning));
   useEffect(() => { setHandoffMode(false); setHandoffModel(''); setHandoffReasoning(''); }, [handoffSource?.id]);
   useEffect(() => { try { sessionStorage.setItem(draftKey, text); } catch { /* Keep the draft in memory when storage is unavailable. */ } }, [draftKey, text]);
   useEffect(() => { if (!connectionKey) return; try { if (connectionId) sessionStorage.setItem(connectionKey, connectionId); else sessionStorage.removeItem(connectionKey); } catch { /* Keep the selection in memory when storage is unavailable. */ } }, [connectionKey, connectionId]);
-  useEffect(() => { if (!initialDraft) return; const url = new URL(window.location.href); url.searchParams.delete('draft'); window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`); }, []);
+  useEffect(() => { if (!initialDraft) return; setText(current => current || initialDraft); const url = new URL(window.location.href); url.searchParams.delete('draft'); window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`); }, [initialDraft]);
   return <form className={`mt-4 flex gap-2 border bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring/40 ${handoffMode ? 'flex-col items-stretch rounded-xl' : 'items-center rounded-full'}`} onSubmit={async event => {
     event.preventDefault(); const value = text.trim(); if (!value || busy || (connectionId && !bootstrapConnections.some(item => item.id === connectionId)) || (handoffMode && !handoffReady)) return;
     setBusy(true); setError('');
