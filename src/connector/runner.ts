@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { ZodError } from 'zod';
 import { materializeRunSkills, selectedSkillPrompt, cleanupRunSkills, type RunSkillFiles } from './skill-files.js';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, unlink, rename } from 'node:fs/promises';
@@ -356,15 +357,23 @@ export class ConnectorRunner {
     let bridgeFile:string|undefined;
     let skillFiles:RunSkillFiles|undefined;
     let stage='prepare-workspace';
+    let monitorFailure:{stage:'read-run'|'renew';category:string;status?:number}|undefined;
     const monitor = async () => {
       if (monitoring || runAbort.signal.aborted) return;
       monitoring = true;
+      let monitorStage:'read-run'|'renew'='read-run';
       try {
         const remote = await client.readRun(claim.run.id);
         if (remote.generation !== claim.run.generation || remote.status !== 'running' || this.closing) {
           cancelled = true; runAbort.abort(); await stopRunProcesses();
-        } else if(!runAbort.signal.aborted&&!this.closing)await client.renew(claim.run.id,claim.run.generation);
-      } catch { cancelled = true; runAbort.abort(); await stopRunProcesses(); }
+        } else if(!runAbort.signal.aborted&&!this.closing){monitorStage='renew';await client.renew(claim.run.id,claim.run.generation);}
+      } catch(error) {
+        const category=error instanceof ConnectorHttpError?'http-failure':error instanceof ZodError?'response-validation':error instanceof Error&&error.name==='TimeoutError'?'timeout':error instanceof TypeError?'transport-failure':'local-failure';
+        const status=error instanceof ConnectorHttpError&&Number.isInteger(error.status)&&error.status>=100&&error.status<=599?error.status:undefined;
+        monitorFailure={stage:monitorStage,category,...(status===undefined?{}:{status})};
+        try{console.error(`Connector monitor failure stage=${monitorStage} category=${category}${status===undefined?'':` status=${status}`}`);}catch{/* Diagnostics must not prevent the existing fail-closed stop. */}
+        cancelled = true; runAbort.abort(); await stopRunProcesses();
+      }
       finally { monitoring = false; }
     };
     try {
@@ -466,7 +475,7 @@ export class ConnectorRunner {
         if(gitDiagnostic)console.error(`Git execution failure stage=${failureStage} command=${gitDiagnostic.command} code=${gitDiagnostic.code} elapsedMs=${gitDiagnostic.elapsedMs} timeoutMs=${gitDiagnostic.timeoutMs} stdoutBytes=${gitDiagnostic.stdoutBytes} stderrBytes=${gitDiagnostic.stderrBytes}`);
         else console.error(`Native execution failure stage=${failureStage} category=${category}${code===undefined?'':` code=${code}`}`);
         // Raw native cause stays local/private: never include it in logs, API completion or prompts.
-        try { await writeSecureJson(path.join(this.config.dataDir,'diagnostics',`${stateKey(claim.run.id,String(claim.run.generation))}.json`),{runId:claim.run.id,generation:claim.run.generation,stage:failureStage,category,code,...(gitDiagnostic?{git:gitDiagnostic}:{}),cause:typeof cause?.message==='string'?cause.message:'Unknown local error'}); } catch { /* Preserve primary failure even if private evidence cannot be written. */ }
+        try { await writeSecureJson(path.join(this.config.dataDir,'diagnostics',`${stateKey(claim.run.id,String(claim.run.generation))}.json`),{runId:claim.run.id,generation:claim.run.generation,stage:failureStage,category,code,...(monitorFailure?{monitorFailure}:{}),...(gitDiagnostic?{git:gitDiagnostic}:{}),cause:typeof cause?.message==='string'?cause.message:'Unknown local error'}); } catch { /* Preserve primary failure even if private evidence cannot be written. */ }
       }
       await native.stop(); await eventWrites;
       if(skillFiles) { await skillFiles.cleanup(); spool.skillDirectory=undefined; await this.save(spool); }
