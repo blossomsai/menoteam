@@ -1339,6 +1339,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 try{await validateRunSelection(r,tx);}catch(error){r.status='failed';r.error=error instanceof Error?error.message:'Selected connection unavailable';r.updatedAt=now();await store.put('run',r,tx);return undefined;}
             }
             r.status = "running";
+            r.error = undefined;
             r.connectorId = c.id;
             r.generation++;
             r.leaseUntil = new Date(Date.now() + 90000).toISOString();
@@ -1822,6 +1823,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             r!.status = "queued";
             r!.updatedAt = now();
             r!.stoppedAt = undefined;
+            r!.error = undefined;
             await store.put("run", r!, tx);
             return r;
         });
@@ -1973,6 +1975,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             r!.status = "queued";
             r!.updatedAt = now();
             r!.stoppedAt = undefined;
+            r!.error = undefined;
             await store.put("run", r!, tx);
             return r;
         });
