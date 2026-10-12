@@ -28,19 +28,29 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
   if (!['localhost', '127.0.0.1', '::1'].includes(location.hostname) || !location.pathname.replace(/^\//u, '').endsWith('_test'))
     throw new Error('Migration boundary tests require a loopback *_test database');
 
-  const sql = postgres(databaseUrl, { max: 1 });
+  const schema = `provider_boundary_${randomUUID().replaceAll('-', '')}`;
+  const scopedLocation = new URL(databaseUrl);
+  // postgres.js forwards URL search_path as a PostgreSQL startup parameter, including migrate() connections.
+  // No public fallback: an existing public migration ledger must never satisfy this fresh boundary fixture.
+  scopedLocation.searchParams.set('search_path', schema);
+  const scopedUrl = scopedLocation.toString();
+  const admin = postgres(databaseUrl, { max: 1 });
+  const sql = postgres(scopedUrl, { max: 1 });
+  let ownsSchema = false;
   const legacyDir = await mkdtemp(join(tmpdir(), 'menoteam-provider-legacy-migrations-'));
   const fixtureIds = [`migration-provider-a-${randomUUID()}`, `migration-provider-b-${randomUUID()}`];
-  const insertedFixtureIds: string[] = [];
   try {
-    const existingTables = await sql<{ tablename: string }[]>`SELECT tablename FROM pg_tables WHERE schemaname='public'`;
+    await admin`CREATE SCHEMA ${admin(schema)}`;
+    ownsSchema = true;
+    expect((await sql`SELECT current_schema() AS name`)[0]?.name).toBe(schema);
+    const existingTables = await sql<{ tablename: string }[]>`SELECT tablename FROM pg_tables WHERE schemaname=${schema}`;
     if (existingTables.length)
-      throw new Error('Migration boundary test requires a fresh empty *_test database; existing tables were left untouched');
+      throw new Error('Migration boundary test requires a fresh empty owned schema in the authorized *_test database');
 
     for (const file of legacyMigrationFiles)
       await copyFile(join(process.cwd(), 'migrations', file), join(legacyDir, file));
 
-    await migrate(databaseUrl, legacyDir);
+    await migrate(scopedUrl, legacyDir);
     const legacyLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
     expect(legacyLedger.map(row => row.version)).toEqual(legacyMigrationFiles);
 
@@ -53,15 +63,14 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
         data: { provider: 'openai', method: 'codex-host', connectorId: duplicateConnectorId, enabled: true, default: false }
       };
       await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${id},'setting',NULL,${sql.json(record)})`;
-      insertedFixtureIds.push(id);
     }
 
-    await expect(migrate(databaseUrl)).rejects.toMatchObject({ code: '23505' });
+    await expect(migrate(scopedUrl)).rejects.toMatchObject({ code: '23505' });
     const failedLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
     expect(failedLedger.map(row => row.version)).toEqual(legacyMigrationFiles);
     const indexesAfterFailure = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
-      WHERE schemaname='public' AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
+      WHERE schemaname=${schema} AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
       ORDER BY indexname`;
     expect(indexesAfterFailure).toHaveLength(0);
     const preservedAfterFailure = await sql<{ id: string; connector_id: string }[]>`
@@ -79,15 +88,15 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
     };
     await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${fixtureIds[1]},'setting',NULL,${sql.json(uniqueRecord)})`;
 
-    await migrate(databaseUrl);
+    await migrate(scopedUrl);
     const upgradedLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
     expect(upgradedLedger.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql']);
     const indexesAfterSuccess = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
-      WHERE schemaname='public' AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
+      WHERE schemaname=${schema} AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
       ORDER BY indexname`;
     expect(indexesAfterSuccess.map(row => row.indexname)).toEqual([...providerIndexes].sort());
-    await expect(migrate(databaseUrl, legacyDir)).rejects.toThrow('Database schema 006_workbench_provider_connections.sql is newer than this application');
+    await expect(migrate(scopedUrl, legacyDir)).rejects.toThrow('Database schema 006_workbench_provider_connections.sql is newer than this application');
 
     const preservedAfterOldMigrator = await sql<{ id: string }[]>`
       SELECT id FROM wb_records WHERE id=${fixtureIds[0]} OR id=${fixtureIds[1]} ORDER BY id`;
@@ -96,17 +105,17 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
     expect(ledgerAfterOldMigrator.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql']);
     const indexesAfterOldMigrator = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
-      WHERE schemaname='public' AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
+      WHERE schemaname=${schema} AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
       ORDER BY indexname`;
     expect(indexesAfterOldMigrator.map(row => row.indexname)).toEqual([...providerIndexes].sort());
   } finally {
     try {
-      const hasRecordsTable = await sql<{ present: boolean }[]>`SELECT to_regclass('public.wb_records') IS NOT NULL AS present`;
-      if (hasRecordsTable[0]?.present) {
-        for (const id of insertedFixtureIds) await sql`DELETE FROM wb_records WHERE id=${id}`;
-      }
-    } finally {
       await sql.end();
+      // Only a schema created by this invocation is removed. Existing public tables/extensions stay untouched.
+      // If pg_trgm did not exist, 001 installs it in this owned schema and CASCADE removes only that instance.
+      if (ownsSchema) await admin`DROP SCHEMA ${admin(schema)} CASCADE`;
+    } finally {
+      await admin.end();
       await rm(legacyDir, { recursive: true, force: true });
     }
   }
