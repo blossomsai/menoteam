@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fingerprint, type GitOptions } from './git.js';
-import { hasRequiredLocalQa, qaMetrics, LOCAL_QA_CONTRACT, type FixedQaCheck, type QaPolicy } from '../workbench/local-qa.js';
+import { hasRequiredLocalQa, qaMetrics, qaPolicySnapshot, LOCAL_QA_CONTRACT, type FixedQaCheck, type QaPolicy } from '../workbench/local-qa.js';
 import { assertQaResourcePolicy,bindQaExecutor, acquireQaResource, authorizedQaResource, claimQaResource, QaResourceContention, qaChildEnvironment, releaseQaResource, runQaCommand, stopQaExecution, type QaExecution, type QaResourceConfig } from './qa-process.js';
 
 // Vitest can write failures only to JSON; retain a small diagnostic excerpt before the temporary report is removed.
@@ -30,7 +30,9 @@ function vitestFailures(value:unknown,cwd:string,redact:(text:string)=>string):s
 }
 
 export async function captureRequiredLocalQa(cwd:string,options:{policy?:QaPolicy;resources:Record<string,QaResourceConfig>;dataDirectory:string;save:(state:QaExecution)=>Promise<void>;authorize?:()=>Promise<void>;state?:QaExecution;signal?:AbortSignal;gitOptions?:GitOptions}) {
-  const {policy,signal}=options;
+  const {signal}=options;
+  // Reuse the server schema: JSONB object-key order must not change serialized fixed-command evidence.
+  const policy=options.policy?qaPolicySnapshot.parse(options.policy):undefined;
   const candidateFingerprint=await fingerprint(cwd,{...options.gitOptions,signal});
   const unavailable=()=>({localQaContract:LOCAL_QA_CONTRACT,...(policy?{policy}:{}),checks:[] as FixedQaCheck[],capturedAt:new Date().toISOString(),candidateFingerprint,stale:false,verification:'unknown'});
   if(!policy||policy.coverage==='menoteam-full/v2'||process.platform==='win32')return unavailable();

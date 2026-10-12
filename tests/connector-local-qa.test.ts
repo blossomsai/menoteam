@@ -8,7 +8,7 @@ import os from 'node:os';
 import { qaFixtureBudget } from './helpers/qa-fixture-budget.js';
 import { qaProcessFixture,type QaProcessFixture } from './helpers/qa-process-fixture.js';
 import { captureRequiredLocalQa } from '../src/connector/local-qa.js';
-import { hasRequiredLocalQa,type QaPolicy } from '../src/workbench/local-qa.js';
+import { hasRequiredLocalQa,savedQaPolicy,type QaPolicy } from '../src/workbench/local-qa.js';
 import { ConnectorRunner } from '../src/connector/runner.js';
 import { stateKey, writeSecureJson } from '../src/connector/state.js';
 import type { WorkbenchConnectorClient } from '../src/connector/client.js';
@@ -92,3 +92,23 @@ describe('fixed-parent Vitest report diagnostics (real child, no database connec
     }else{expect(check.metrics).toBeUndefined();expect(qa.verification).toBe('unknown');}
   },45_000),45_000);
 });
+
+
+it('normalizes a JSONB-ordered frozen policy before real capture and validates it against the current saved policy',async()=>fixture(async(cwd,f)=>{
+  const saved=policy(),database=`canonical_${Date.now()}_test`,url=`postgres://fixture-only@127.0.0.1:65432/${database}`;
+  saved.resource={id:'canonical-child-db',kind:'postgres',hostname:'127.0.0.1',port:65432,database,disposable:true};
+  // PostgreSQL JSONB orders object keys by length, then bytes; arrays must retain their order.
+  const frozen=JSON.parse(JSON.stringify(saved,(_key,value)=>value&&typeof value==='object'&&!Array.isArray(value)?Object.fromEntries(Object.entries(value).sort(([a],[b])=>a.length-b.length||(a<b?-1:a>b?1:0))):value)) as QaPolicy;
+  const current=savedQaPolicy([{id:saved.id,kind:'connection',projectId:saved.projectId,name:'Canonical policy fixture',updatedAt:saved.version,data:{provider:'qa',purpose:'qa',url:saved.repositoryUrl,enabled:true,configuredBy:saved.configuredBy,coverage:saved.coverage,requirements:saved.requirements,resource:saved.resource}}],saved.projectId,saved.repositoryUrl)!;
+  expect(JSON.stringify(frozen.requirements[0]!.commands)).not.toBe(JSON.stringify(current.requirements[0]!.commands));
+  await writeFile(path.join(cwd,'verify.cjs'),`require('node:assert/strict').equal(process.env.WORK_MAP_TEST_DATABASE_URL,${JSON.stringify(url)});`);
+  const options={resources:{[saved.resource.id]:{url}},dataDirectory:path.join(cwd,'parent-state'),state:execution(f),signal:f.abort.signal,save:async(state:ReturnType<typeof execution>)=>writeSecureJson(path.join(cwd,'parent-state','spool.json'),state)};
+  const qa=await f.track(captureRequiredLocalQa(cwd,{...options,policy:frozen}));
+  expect(qa.policy).toEqual(frozen);expect(qa.policy?.resource).toEqual(saved.resource);
+  expect(qa.checks.map(check=>check.command)).toEqual(current.requirements.map(requirement=>JSON.stringify(requirement.commands)));
+  expect(hasRequiredLocalQa(qa,qa.candidateFingerprint,current)).toBe(true);
+  expect(qa.checks.every(check=>check.exitCode===0)).toBe(true);
+  let saves=0;
+  await expect(captureRequiredLocalQa(cwd,{...options,policy:{...frozen,unexpected:true} as QaPolicy,save:async()=>{saves++;}})).rejects.toThrow();
+  expect(saves).toBe(0);
+},45_000),45_000);
