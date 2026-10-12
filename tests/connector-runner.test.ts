@@ -306,3 +306,17 @@ describe('Integrated connector lifecycle',()=>{
     expect(prompt).not.toContain('token');
   });
 });
+
+it('uses server-owned Workbench rules only for the Project Master role',()=>{
+  const c=claim();c.project.instructions='Current project convention';
+  const prompt=buildRunPrompt(c,{'skill-one':'/isolated/run/skill-one'});
+  expect(prompt).toContain('Workbench Project Master, not the legacy Company Master / Work Map V1 role');
+  expect(prompt).toContain("this run's server-owned project instructions and fresh scoped read_context");
+  expect(prompt).toContain('Current project convention');
+  expect(prompt).toContain('read_team_rules requirement do not apply');
+  expect(prompt).toContain('do not call their legacy MCP tools or claim Team Rules were read');
+  expect(prompt).toContain('An actual scoped-tool authorization or context-read failure still requires stopping');
+  for(const kind of ['implementation','review','delivery'] as const){
+    c.run.kind=kind;expect(buildRunPrompt(c,{'skill-one':'/isolated/run/skill-one'})).not.toContain('Workbench Project Master');
+  }
+});
