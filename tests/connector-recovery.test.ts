@@ -26,24 +26,26 @@ it('revocation stops the actual owned group; lost stopped ACK is replayed after 
   let child:ChildProcess|undefined,pid=0,revoked=false,claimed=false,runner:ConnectorRunner|undefined;
   let rejectTurn:(error:Error)=>void=()=>{};
   let signalAck:()=>void=()=>{};const ackAttempt=new Promise<void>(resolve=>{signalAck=resolve;});
+  let signalPreRevokeRenew:()=>void=()=>{};const preRevokeRenew=new Promise<void>(resolve=>{signalPreRevokeRenew=resolve;});
+  const renewalRevocationStates:boolean[]=[];
   let execution:Promise<void>|undefined;
   const native={start:async()=>{if(claimed&&!child){child=spawn(process.execPath,['-e','setInterval(()=>{},1000)','codex','app-server'],{detached:true,stdio:'ignore'});pid=child.pid!;}return ['gpt-6.1-sol'];},
     // The fixture native adapter records its spawned PID; stop proof below is the actual OS group absence.
     processIdentity:async()=>({pid,processGroupId:pid,startedAt:'fixture-owned-spawn',command:child!.spawnargs.join(' ')}),
-    run:async()=>{revoked=true;return new Promise((_resolve,reject)=>{rejectTurn=reject;});},
+    run:async()=>{await preRevokeRenew;revoked=true;return new Promise((_resolve,reject)=>{rejectTurn=reject;});},
     stop:async()=>{if(child){expect(await terminateProcessGroup(pid,100)).toBe(true);rejectTurn(Error('Actual group stopped'));}}
   } as unknown as CodexAppServer;
   const readRun=vi.fn(async()=>{if(revoked)throw new ConnectorHttpError(403,'Run authorization revoked');return claim().run;});
   const first={readRun,createBridgeToken:async()=>({token:'fixture'.padEnd(32,'x'),expiresAt:'later'}),
     claim:async()=>{if(!claimed){claimed=true;return claim();}await ackAttempt;await runner!.stop();return undefined;},
     stopped:async()=>{expect(await waitProcessGroup(pid,1)).toBe(true);signalAck();throw new ConnectorHttpError(503,'Stopped request lost');},
-    complete:vi.fn(),renew:vi.fn()
+    complete:vi.fn(),renew:vi.fn(async()=>{renewalRevocationStates.push(revoked);signalPreRevokeRenew();})
   } as unknown as WorkbenchConnectorClient;
   const spoolPath=path.join(dataDir,'spool',`${stateKey('revoked-run','1')}.json`);
   try{
     runner=new ConnectorRunner(config,{native:()=>native,client:()=>first});execution=runner.run();await bounded(execution);
     const saved=JSON.parse(await readFile(spoolPath,'utf8'));expect(saved.stopped).toBe(true);expect(saved.processIdentity.pid).toBe(pid);expect(saved.generation).toBe(1);
-    expect(first.complete).not.toHaveBeenCalled();expect(first.renew).not.toHaveBeenCalled();
+    expect(first.complete).not.toHaveBeenCalled();expect(first.renew).toHaveBeenCalled();expect(renewalRevocationStates).not.toContain(true);
     let acknowledgements=0;
     const fetcher=vi.fn(async(url:URL|RequestInfo,init?:RequestInit)=>{
       const route=String(url);const body=JSON.parse(String(init?.body||'{}'));
@@ -54,7 +56,7 @@ it('revocation stops the actual owned group; lost stopped ACK is replayed after 
     });
     runner=new ConnectorRunner(config,{native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer),client:()=>new WorkbenchConnectorClient(config,fetcher as typeof fetch)});
     execution=runner.run();await bounded(execution);expect(acknowledgements).toBe(1);expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);
-  }finally{signalAck();await runner?.stop();await bounded(execution??Promise.resolve()).catch(()=>{});if(pid)await terminateProcessGroup(pid,100);await rm(dataDir,{recursive:true,force:true});}
+  }finally{signalAck();signalPreRevokeRenew();await runner?.stop();await bounded(execution??Promise.resolve()).catch(()=>{});if(pid)await terminateProcessGroup(pid,100);await rm(dataDir,{recursive:true,force:true});}
 },12000);
 
 it.each(['read-failure','old-generation','unknown-native'])('retains %s spool and permits an independent authorized run',async fault=>{
