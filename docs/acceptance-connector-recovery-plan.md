@@ -1,8 +1,18 @@
-# Acceptance Connector recovery plan — recovery completed, required QA failed
+# Acceptance Connector recovery plan — QA checks pass, current-policy validation true, review pending
 
 Historical preparation checkpoint, 2026-10-11. This document records a proposed recovery of the existing local acceptance Connector before the already-approved Beta required-QA configuration. At that preparation checkpoint, **no token rotation, database creation, configuration change, restart, checkout restoration or native dispatch had been executed**. It is not a new identity, sample replacement, delivery approval or runtime upgrade.
 
-## Current recovery / QA status — 2026-10-12
+## Current recovery / required-QA status — 2026-10-12
+
+Same-ID recovery/config/grants and Beta policy/resources are complete. Original Work/thread continue; clean candidate is `32c9d41e0f7afe577fd701ec3a981f2a953b6901`, fingerprint `92c4c4874c299f4f505bb2c74825bff86e60b5fd47e7225a90cfe49cfca1c163`, revision `c9d2859d8aa2cc63eaef4359529e70880893064f14369e63be80cbc01bcc15c9`.
+
+The candidate's first all-pass parent capture (`run_b9f5b1c3-98a3-44e9-938b-5a70a0646e4f`, 633/633 + 54/54, typechecks/builds 0) was **not accepted by the current-policy gate** because JSONB command key order differed. Canonical capture fix `d84a1f9` reuses strict `qaPolicySnapshot.parse` at capture entry, preserves resources/argv and leaves the gate unchanged; its bounded checks passed 30/30 plus typecheck. Historical failed/unaccepted artifacts remain intact.
+
+Acceptance alone now runs unchanged `8b96295` plus the reviewed single-file `d84a1f9` local-QA overlay, foreground PTY **45835**, PID/group **99165**. Same-lock independent dependencies have zero external/broken links and compile exit 0; prior foreground stop was confirmed after idle. App 85141 and dogfood 85202 remain exact `8b96295`. Same-thread QA-only run `run_cff79eee-a231-4b5a-a7e4-2473c65bae99` produced new server-bound required QA with **all four checks exit 0**, 633/633 full suite, 54/54 PG, zero failures/skips, typechecks/builds passed, verification current, stale false and **current saved-policy gate true**. Required-QA checks pass for this exact candidate; operator evaluation using the existing helper, normal current-policy API and actual artifact is true. **Independent review remains pending**; this is not server delivery/deployment approval.
+
+Safe receipts: `.local/acceptance/provider-schema-final-candidate-safe.json`, `canonical-final-candidate-safe.json`, `canonical-build-safe.json`. Normal artifact GET still returns 414; readback uses read-only DB metadata and normal current-policy API. Main `6cfa773` has no combined full gate, `45ce313` is not live, and browser access remains blocked. No whole-runtime upgrade, remote action or full-app completion is claimed.
+
+## Historical recovery and failed-QA checkpoint — earlier 2026-10-12
 
 Normal owner API login and same-ID rotation are now completed after explicit authorization and the permission-context change; the earlier authentication rejection is preserved below as history. Identity `acceptance-a08-a09-a11-20261006` and all three grants remain unchanged. Ignored persistent configuration and its protected restoration copy are 0600 in a 0700 directory. No credential/session values are included here.
 
@@ -57,7 +67,7 @@ The database retains the thread reference, but normal same-thread continuation i
 7. Verify the deployed runtime build remains exact `8b96295` and its local dependencies are usable; temporary dependency files may also be missing. Restore only from verified local same-lock sources if needed, independently copied with no external/broken links or network/install scripts. Do not upgrade to current main as an incidental recovery.
 8. Start only the acceptance Connector in the already-proven Codex exec foreground context after idle and stop proof, save its actual PTY/PID and verify same identity/grants, heartbeat and normal capability reporting. No acceptance launchctl duplicate; leave app/dogfood untouched. A lost prior credential cannot be backed up as if it still existed.
 
-## Previously approved Beta QA plan — now configured; checks failed
+## Previously approved Beta QA plan — configured; candidate checks pass, current-policy validation true
 
 Once same-ID recovery and checkout/thread preconditions are verified:
 
