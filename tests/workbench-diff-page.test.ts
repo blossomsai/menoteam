@@ -39,3 +39,21 @@ it('keeps Unicode intact at fragment and historical-preview limits',()=>{
   const historical=historicalDiffRows([{lines:[{type:'add',newLine:1,text:line.slice(1)}]}]);
   expect(historical.truncated).toBe(true);expect(historical.rows[0]?.text).toBe(line.slice(0,4095));
 });
+
+it('reads every fragment beyond both display limits using lossless within-page portions',()=>{
+  const source='@@ -0,0 +1,1801 @@\n'+Array.from({length:1800},(_,i)=>`+line ${i} 雪\n`).join('')+'+'+'x'.repeat(4094)+'🙂'+'雪🙂'.repeat(22_000)+'\n';
+  expect(Buffer.byteLength(source)).toBeLessThan(256*1024);const before=initialDiffPageState();let offset=0,reconstructed='',views=0;
+  do{
+    const parsed=parseDiffPage(source,before,offset);expect(parsed.rows.length).toBeLessThanOrEqual(DIFF_VISIBLE_ROWS);expect(parsed.rows.reduce((n,row)=>n+row.text.length,0)).toBeLessThanOrEqual(DIFF_VISIBLE_CHARS);expect(parsed.rows.every(row=>row.text.length<=DIFF_FRAGMENT_CHARS)).toBe(true);
+    reconstructed+=parsed.rows.map(row=>row.text+(row.terminated?'\n':'')).join('');views++;expect(parsed.state.newLine).toBe(1802);expect(parsed.state.inHunk).toBe(false);
+    if(parsed.nextOffset===null)break;expect(parsed.nextOffset).toBeGreaterThan(offset);offset=parsed.nextOffset;expect(views).toBeLessThan(20);
+  }while(true);
+  expect(views).toBeGreaterThan(2);expect(reconstructed).toBe(source);
+});
+
+it('reads long-line portions and then preserves the same line identity at the next server-page boundary',()=>{
+  const before=parseDiffPage('@@ -0,0 +1,2 @@\n',initialDiffPageState()).state,source='+'+'🙂'.repeat(45_000);let offset=0,joined='';
+  do{const view=parseDiffPage(source,before,offset);expect(view.rows.every(row=>row.type==='add'&&row.newLine===1)).toBe(true);joined+=view.rows.map(row=>row.text).join('');if(view.nextOffset===null)break;expect(view.nextOffset).toBeGreaterThan(offset);offset=view.nextOffset;}while(true);
+  expect(joined).toBe(source);const endState=parseDiffPage(source,before).state,next=parseDiffPage('tail\n+after\n',endState);
+  expect(next.rows[0]).toMatchObject({text:'tail',type:'add',newLine:1,continuation:true});expect(next.rows[1]).toMatchObject({text:'+after',type:'add',newLine:2});
+});

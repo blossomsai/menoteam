@@ -807,4 +807,18 @@ describe('lazy diff review regressions',()=>{
     expect(read).not.toHaveBeenCalled();expect(host.textContent).toContain('Historical partial preview');expect(host.textContent).toContain('full-file integrity is unverified');expect(host.textContent).toContain('historical old');expect(host.textContent).toContain('historical new');expect(host.textContent).not.toContain('Whole-file SHA-256 verified');
     const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.find(row=>row.textContent?.includes('-historical old'))?.children[0]?.textContent).toBe('3');expect(rows.find(row=>row.textContent?.includes('+historical new'))?.children[1]?.textContent).toBe('5');
   });
+  it('reads all text beyond both limits inside the app without another server fetch',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const source='@@ -0,0 +1,1801 @@\n'+Array.from({length:1800},(_,i)=>`+line ${i} 雪\n`).join('')+'+'+'x'.repeat(4094)+'🙂'+'雪🙂'.repeat(22000)+'\n';
+    const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValue(page(Buffer.from(source).toString('base64'),0,null,{complete:true,chunkCount:1,integrity:'verified'}));await mount(current({chunkCount:1,textBytes:Buffer.byteLength(source)}));expect(read).not.toHaveBeenCalled();await expand();
+    let joined='',portions=0;do{const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.length).toBeLessThanOrEqual(1024);expect(rows.reduce((n,row)=>n+(row.children[2]?.textContent?.length??0),0)).toBeLessThanOrEqual(64*1024);joined+=rows.map(row=>(row.children[2]?.textContent??'')+(row.getAttribute('data-line-end')==='true'?'\n':'')).join('');portions++;if(button('More of this page').disabled)break;await flush(()=>button('More of this page').click());expect(read).toHaveBeenCalledTimes(1);expect(portions).toBeLessThan(20);}while(true);
+    expect(portions).toBeGreaterThan(2);expect(joined).toBe(source);expect(host.textContent).toContain('Whole-file SHA-256 verified');await flush(()=>button('Previous portion').click());expect(read).toHaveBeenCalledTimes(1);expect(button('More of this page').disabled).toBe(false);
+  });
+
+  it('reads every unsupported raw byte in bounded in-app base64 portions without another server fetch',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const bytes=Buffer.alloc(120_000,0xff),encoded=bytes.toString('base64');const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValue(page(encoded,0,null,{complete:true,chunkCount:1,encodingUnsupported:true,integrity:'verified'}));await mount(current({chunkCount:1,textBytes:bytes.length,encodingUnsupported:true}));await expand();let all='',portions=0;
+    do{const raw=host.querySelector('[aria-label="Unsupported encoding raw page"]')!.textContent!.slice('base64:'.length);expect(raw.length).toBeLessThanOrEqual(64*1024);all+=raw;portions++;if(button('More of this page').disabled)break;await flush(()=>button('More of this page').click());expect(read).toHaveBeenCalledTimes(1);}while(true);
+    expect(portions).toBeGreaterThan(1);expect(all).toBe(encoded);expect(Buffer.from(all,'base64').equals(bytes)).toBe(true);expect(host.textContent).toContain('Unsupported UTF-8 encoding');expect(host.textContent).toContain('Whole-file SHA-256 verified');
+  });
+
 });

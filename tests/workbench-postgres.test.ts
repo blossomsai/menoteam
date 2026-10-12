@@ -1868,6 +1868,45 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(snap.json().projects.map((p:any)=>p.id).sort()).toEqual(before.projects.map((p:any)=>p.id).sort());
         expect(snap.json().messages.length).toBeGreaterThan(1);
     });
+    it('isolated PostgreSQL persists >1 MiB diff chunks through real Connector HTTP and owner paged reads',async()=>{
+        const p=checkedJson(await user('POST','/projects',{name:'Large persisted diff fixture'}));
+        const enrolled=await enrollProvider(`large-diff-${randomUUID()}`,[p.id]);
+        const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Large file upload'}));
+        const queued=checkedJson(await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Capture this fixture',requestId:randomUUID()}));
+        const serverUrl=await app.listen({port:0,host:'127.0.0.1'});let dropAck=true;const postBytes:number[]=[];
+        const client=new WorkbenchConnectorClient({serverUrl,token:enrolled.token},async(input,init)=>{
+            const artifact=String(input).endsWith('/artifacts')?JSON.parse(String(init?.body)):undefined;
+            if(artifact){const length=Buffer.byteLength(String(init?.body));postBytes.push(length);expect(length).toBeLessThan(1048576);}
+            const response=await fetch(input,init);
+            if(dropAck&&artifact?.kind==='diff_file_chunk'&&artifact.data.chunkIndex===0&&response.ok){dropAck=false;throw new Error('Fixture ACK loss after PostgreSQL persisted the chunk');}
+            return response;
+        },['gpt-6-luna','gpt-6.1-sol']);
+        const claim=await client.claim(['implementation']);expect(claim?.run.id).toBe(queued.run.id);const run=claim!.run;
+        const baseRevision='a'.repeat(40),candidateRevision='b'.repeat(40),revision=createHash('sha256').update(baseRevision).update('\0').update(candidateRevision).digest('hex'),filePath='src/雪 space\tline\n.ts';
+        const unit='+quote " slash \\ tab\t 雪🙂\n',parts=Array.from({length:7},(_,index)=>Buffer.from((index===0?'@@ -0,0 +1,56000 @@\n':'')+unit.repeat(8000)));
+        const fileBytes=parts.reduce((total,part)=>total+part.length,0),manifestHash=createHash('sha256');for(const part of parts){expect(part.length).toBeLessThanOrEqual(256*1024);manifestHash.update(part);}const fileSha256=manifestHash.digest('hex');expect(fileBytes).toBeGreaterThan(1048576);
+        const parent=await client.addArtifact(run.id,run.generation,{kind:'diff',revision,requestId:`diff:${run.id}:${run.generation}`,data:{baseRevision,candidateRevision,diffFileChunksVersion:1,totalFiles:1,additions:56000,deletions:0,truncated:true,patch:'bounded preview',files:[{path:filePath,status:'added',binary:false,additions:56000,deletions:0,chunkCount:parts.length,textBytes:fileBytes,fileSha256}]}});
+        const payload=(index:number)=>({kind:'diff_file_chunk' as const,revision,requestId:`diff-file:${candidateRevision}:${createHash('sha256').update(filePath).digest('hex')}:${index}`,data:{parentArtifactId:parent.id,projectId:p.id,workId:work.id,runId:run.id,baseRevision,candidateRevision,diffRevision:revision,path:filePath,chunkIndex:index,chunkCount:parts.length,fileByteLength:fileBytes,fileSha256,chunkSha256:createHash('sha256').update(parts[index]!).digest('hex'),contentBase64:parts[index]!.toString('base64')}});
+        const count=async()=>Number((await sql`SELECT count(*)::int AS count FROM wb_records WHERE kind='artifact' AND project_id=${p.id} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id}`)[0]!.count);
+        await expect(client.addArtifact(run.id,run.generation,payload(0))).rejects.toThrow('Fixture ACK loss');expect(await count()).toBe(1);
+        const retry=await client.addArtifact(run.id,run.generation,payload(0));expect(retry.id).toBe(`artifact:${run.id}:${payload(0).requestId}`);expect(await count()).toBe(1);
+        expect((await client.addArtifact(run.id,run.generation,payload(0))).id).toBe(retry.id);expect(await count()).toBe(1);
+        const changed=Buffer.from('different bytes\n');await expect(client.addArtifact(run.id,run.generation,{...payload(0),data:{...payload(0).data,contentBase64:changed.toString('base64'),chunkSha256:createHash('sha256').update(changed).digest('hex')}})).rejects.toMatchObject({status:409});expect(await count()).toBe(1);
+        const query=new URLSearchParams({path:filePath,revision});const partial=await fetch(`${serverUrl}/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file?${query}`,{headers:{cookie}});expect(partial.status).toBe(200);expect(await partial.json()).toMatchObject({complete:false,incomplete:true});
+        for(let index=1;index<parts.length;index++)await client.addArtifact(run.id,run.generation,payload(index));expect(await count()).toBe(parts.length);
+        const saved=(await sql`SELECT data FROM wb_records WHERE id=${parent.id} AND kind='artifact'`)[0]!.data;expect(saved.data.files[0]).toMatchObject({path:filePath,textBytes:fileBytes,fileSha256,chunkCount:parts.length});
+        // Restart the reader with the same PostgreSQL store; no Connector is used for the offline reads.
+        await app.close();app=await createWorkbenchApp({sql,sourceFetcher:(...args)=>sourceFetch(...args)});const readerUrl=await app.listen({port:0,host:'127.0.0.1'});
+        const owner=await fetch(`${readerUrl}/api/workbench/me`,{headers:{cookie}});expect(owner.status).toBe(200);expect(await owner.json()).toMatchObject({role:'owner'});
+        let cursor:string|undefined,total=0;const seen=new Set<string>(),reconstructed=createHash('sha256');
+        for(let index=0;index<parts.length;index++){
+            const parameters=new URLSearchParams({path:filePath,revision,...(cursor?{cursor}:{})});const response=await fetch(`${readerUrl}/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file?${parameters}`,{headers:{cookie}});expect(response.status).toBe(200);const page=await response.json() as any;
+            const bytes=Buffer.from(page.contentBase64,'base64');expect(bytes.equals(parts[index]!)).toBe(true);reconstructed.update(bytes);total+=bytes.length;expect(page.fileSha256).toBe(fileSha256);expect(page.chunkIndex).toBe(index);expect(page.complete).toBe(index===parts.length-1);expect(page.integrity).toBe(index===parts.length-1?'verified':'pending');
+            if(index<parts.length-1){expect(typeof page.nextCursor).toBe('string');expect(seen.has(page.nextCursor)).toBe(false);seen.add(page.nextCursor);cursor=page.nextCursor;}else expect(page.nextCursor).toBeNull();
+        }
+        expect(total).toBe(fileBytes);expect(reconstructed.digest('hex')).toBe(fileSha256);expect(postBytes.every(length=>length<1048576)).toBe(true);
+    });
+
 });
 
 describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{

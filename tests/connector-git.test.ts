@@ -108,3 +108,27 @@ it('spools wildcard, pathspec-magic and renamed paths literally without selectin
     const paths=(await git(temp,'--literal-pathspecs','diff','--name-only','-z','--find-renames',`${base}..${diff.candidateRevision}`,'--',...selected)).split('\0').filter(Boolean);expect(paths).toEqual([file.path]);
   }
 });
+
+it.each([false,true])('isolates each file/directory conversion patch and hash, reverse=%s',async(reverse)=>{
+  temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-exact-conversion-'));await git(temp,'init','-q');await git(temp,'config','user.name','Test');await git(temp,'config','user.email','test@example.invalid');
+  const root=':(glob)雪 space\tline\n[?]*',child=`${root}/new.txt`,other=`${root}/other.txt`;
+  const putFile=async()=>{await rm(path.join(temp,root),{recursive:true,force:true});await writeFile(path.join(temp,root),'ONLY_ROOT_FILE\n');};
+  const putDirectory=async()=>{await rm(path.join(temp,root),{recursive:true,force:true});await mkdir(path.join(temp,root));await writeFile(path.join(temp,child),'ONLY_NEW_CHILD\n');await writeFile(path.join(temp,other),'ONLY_OTHER_CHILD\n');};
+  await (reverse?putDirectory():putFile());await git(temp,'add','-A');await git(temp,'commit','-qm','base');const base=(await git(temp,'rev-parse','HEAD')).trim();await (reverse?putFile():putDirectory());await git(temp,'add','-A');await git(temp,'commit','-qm','candidate');
+  const diff=await createDiff(temp,base),directory=path.join(temp,'spool');await mkdir(directory);expect(diff.files).toHaveLength(3);
+  const markers=new Map([[root,'ONLY_ROOT_FILE'],[child,'ONLY_NEW_CHILD'],[other,'ONLY_OTHER_CHILD']]);
+  expect((await git(temp,'--literal-pathspecs','diff',`${base}..${diff.candidateRevision}`,'--',root)).match(/^diff --git /gmu)).toHaveLength(3);
+  for(const file of diff.files){
+    const index=await spoolDiffFile(temp,base,diff.candidateRevision,file,directory),bytes=Buffer.concat(await Promise.all(Array.from({length:index.chunks},(_,part)=>readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part))))));
+    const patch=bytes.toString('utf8');expect(patch.match(/^diff --git /gmu)).toHaveLength(1);expect(patch).toContain(markers.get(file.path));for(const [name,marker] of markers)if(name!==file.path)expect(patch).not.toContain(marker);expect(createHash('sha256').update(bytes).digest('hex')).toBe(index.sha256);expect(bytes.length).toBe(index.byteLength);
+    expect(file.status).toBe(file.path===root?(reverse?'added':'deleted'):(reverse?'deleted':'added'));
+  }
+});
+
+it.each([false,true])('keeps an ancestor/descendant rename and unrelated children isolated, reverse=%s',async(reverse)=>{
+  temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-exact-rename-'));await git(temp,'init','-q');await git(temp,'config','user.name','Test');await git(temp,'config','user.email','test@example.invalid');
+  const root='雪',child='雪/new.txt';const putFile=async()=>{await rm(path.join(temp,root),{recursive:true,force:true});await writeFile(path.join(temp,root),'SAME_RENAME_CONTENT\n'.repeat(20));};const putDirectory=async()=>{await rm(path.join(temp,root),{recursive:true,force:true});await mkdir(path.join(temp,root));await writeFile(path.join(temp,child),'SAME_RENAME_CONTENT\n'.repeat(20));await writeFile(path.join(temp,root,'other.txt'),'UNRELATED_CHILD\n');};
+  await (reverse?putDirectory():putFile());await git(temp,'add','-A');await git(temp,'commit','-qm','base');const base=(await git(temp,'rev-parse','HEAD')).trim();await (reverse?putFile():putDirectory());await git(temp,'add','-A');await git(temp,'commit','-qm','candidate');const diff=await createDiff(temp,base),directory=path.join(temp,'spool');await mkdir(directory);
+  const file=diff.files.find(item=>item.status==='renamed')!;expect(file).toMatchObject({path:reverse?root:child,oldPath:reverse?child:root});const index=await spoolDiffFile(temp,base,diff.candidateRevision,file,directory),bytes=Buffer.concat(await Promise.all(Array.from({length:index.chunks},(_,part)=>readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part))))));
+  const patch=bytes.toString('utf8');expect(patch.match(/^diff --git /gmu)).toHaveLength(1);expect(patch).toContain('similarity index 100%');expect(patch).toContain('rename from');expect(patch).toContain('rename to');expect(patch).not.toContain('UNRELATED_CHILD');expect(createHash('sha256').update(bytes).digest('hex')).toBe(index.sha256);
+});

@@ -1,21 +1,22 @@
-export type DiffRow = { text:string; type:'context'|'add'|'remove'|'meta'; oldLine?:number; newLine?:number; continuation?:boolean };
+export type DiffRow = { text:string; type:'context'|'add'|'remove'|'meta'; oldLine?:number; newLine?:number; continuation?:boolean; terminated?:boolean };
 type OpenLine = Omit<DiffRow,'text'> & { header?:string };
 export type DiffPageState = { oldLine:number; newLine:number; oldRemaining:number; newRemaining:number; inHunk:boolean; line?:OpenLine };
 export const DIFF_FRAGMENT_CHARS=4096,DIFF_VISIBLE_CHARS=64*1024,DIFF_VISIBLE_ROWS=1024;
 export const initialDiffPageState=():DiffPageState=>({oldLine:0,newLine:0,oldRemaining:0,newRemaining:0,inHunk:false});
 
 // Keep only hunk/line identity across pages. Source text stays in its bounded byte page.
-export function parseDiffPage(text:string,before:DiffPageState){
+export function parseDiffPage(text:string,before:DiffPageState,viewOffset=0){
   const state:DiffPageState={...before,...(before.line?{line:{...before.line}}:{})};
-  const rows:DiffRow[]=[];let visibleChars=0,truncated=false;
-  const emit=(fragment:string,line:OpenLine,continued:boolean)=>{
-    let offset=0;
+  const rows:DiffRow[]=[];let visibleChars=0,truncated=false,nextOffset:number|null=null;
+  const emit=(fragment:string,line:OpenLine,continued:boolean,sourceStart:number,newline:boolean)=>{
+    if(truncated||viewOffset>sourceStart+fragment.length||viewOffset===sourceStart+fragment.length&&!newline)return;
+    let offset=Math.max(0,viewOffset-sourceStart);
     do {
-      if(rows.length>=DIFF_VISIBLE_ROWS||visibleChars>=DIFF_VISIBLE_CHARS){truncated=true;break;}
+      if(rows.length>=DIFF_VISIBLE_ROWS||visibleChars>=DIFF_VISIBLE_CHARS){truncated=true;nextOffset=sourceStart+offset;break;}
       let end=Math.min(fragment.length,offset+DIFF_FRAGMENT_CHARS,offset+DIFF_VISIBLE_CHARS-visibleChars);
       if(end<fragment.length&&end>offset&&/[\uD800-\uDBFF]/u.test(fragment[end-1]!))end--;
-      if(end===offset&&offset<fragment.length){truncated=true;break;}
-      rows.push({text:fragment.slice(offset,end),type:line.type,oldLine:line.oldLine,newLine:line.newLine,continuation:continued||offset>0});
+      if(end===offset&&offset<fragment.length){truncated=true;nextOffset=sourceStart+offset;break;}
+      rows.push({text:fragment.slice(offset,end),type:line.type,oldLine:line.oldLine,newLine:line.newLine,continuation:continued||offset>0,terminated:end===fragment.length&&newline});
       visibleChars+=end-offset;offset=end;
     }while(offset<fragment.length);
   };
@@ -28,7 +29,7 @@ export function parseDiffPage(text:string,before:DiffPageState){
     }
     const line=state.line;
     if(line.header!==undefined)line.header=(line.header+fragment).slice(0,512);
-    if(fragment.length||!continued)emit(fragment,line,continued);
+    emit(fragment,line,continued,start,newline>=0);
     if(newline<0)break;
     if(line.header!==undefined){
       const hunk=/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u.exec(line.header);
@@ -40,7 +41,7 @@ export function parseDiffPage(text:string,before:DiffPageState){
     }
     delete state.line;start=newline+1;
   }
-  return {rows,state,truncated,continues:!!state.line};
+  return {rows,state,truncated,nextOffset,continues:!!state.line};
 }
 
 export function historicalDiffRows(hunks:unknown){

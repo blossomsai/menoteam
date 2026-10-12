@@ -227,7 +227,11 @@ export interface DiffFileChunkIndex { path:string; oldPath?:string; sha256:strin
 export async function spoolDiffFile(cwd:string,baseRevision:string,candidateRevision:string,file:DiffFile,directory:string,options:GitOptions={}):Promise<DiffFileChunkIndex>{
   const { createHash }=await import('node:crypto');
   const safeName=createHash('sha256').update(file.path).digest('hex');const dir=path.join(directory,safeName);await mkdir(dir,{recursive:true,mode:0o700});
-  const args=['--literal-pathspecs','diff','--find-renames','--no-ext-diff','-U0',`${baseRevision}..${candidateRevision}`,'--',...(file.oldPath?[file.oldPath,file.path]:[file.path])];
+  const paths=file.oldPath?[file.oldPath,file.path]:[file.path];
+  // Literal pathspecs recurse into descendants. Escaped glob matching compares the whole path,
+  // including both exact rename endpoints, without selecting sibling/descendant patches.
+  const exactPaths=paths.map(name=>`:(top,glob)${Array.from(name,char=>`\\${char}`).join('')}`);
+  const args=['--no-literal-pathspecs','diff','--find-renames','--no-ext-diff','-U0',`${baseRevision}..${candidateRevision}`,'--',...exactPaths];
   let pending:Buffer=Buffer.alloc(0),index=0,byteLength=0,encodingUnsupported=false;const hash=createHash('sha256'),decoder=new TextDecoder('utf-8',{fatal:true});
   const writeChunk=async(chunk:Buffer)=>{await writeFile(path.join(dir,String(index++)),chunk,{mode:0o600});};
   const consume=async(chunk:Buffer)=>{
