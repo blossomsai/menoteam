@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { qaPolicyFixture, requiredQaFixture } from './helpers/local-qa-fixture';
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -702,4 +703,29 @@ describe('mounted provider connection settings', () => {
     expect(host.querySelector('[aria-label="Command checks"]')?.textContent).not.toContain('Passed');
   });
 
+});
+
+
+it.each(['matching','fingerprint mismatch','binding fingerprint mismatch','revision mismatch','invalid policy'] as const)('projects real-shaped JSONB required QA and typed result alongside newer supplemental QA: %s',async kind=>{
+  window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+  const work={id:'work-1',projectId:project.id,title:'Bound evidence',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+  const candidateId='run_cff79eee-a231-4b5a-a7e4-2473c65bae99',reviewId='run_9e5ebb54-762f-4ccc-ac0e-5d29eef1bbb8',fingerprint='9'.repeat(64),commit='3'.repeat(40),revision='c'.repeat(64);
+  const policy=qaPolicyFixture(project.id,'https://github.com/blossomsai/menoteam');policy.coverage='menoteam-full/v3';policy.providerResource={...policy.resource!,id:'provider-resource',database:'provider_fixture_test'};
+  const jsonb=(value:unknown)=>JSON.parse(JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.length-b.length||(a<b?-1:a>b?1:0))):item));
+  const diff={id:'diff-bound',projectId:project.id,workId:work.id,runId:candidateId,kind:'diff' as const,revision,createdAt:'2026-10-12T02:29:00.000Z',data:{candidateRevision:commit,files:[],totalFiles:0,truncated:false}};
+  const required={id:`artifact:${candidateId}:required-qa:${candidateId}:1`,projectId:project.id,workId:work.id,runId:candidateId,kind:'qa' as const,revision,createdAt:diff.createdAt,data:jsonb(requiredQaFixture(fingerprint,policy))};
+  const binding={candidateRunId:candidateId,commitSha:commit,candidateFingerprint:kind==='binding fingerprint mismatch'?'b'.repeat(64):fingerprint,diffArtifactId:diff.id,diffRevision:revision,qaArtifactIds:[required.id]};
+  const generic={id:'review-supplemental',projectId:project.id,workId:work.id,runId:reviewId,kind:'qa' as const,revision,createdAt:'2026-10-12T02:35:00.000Z',data:{verification:'unknown',checks:[]}};
+  const typed={id:'review-typed',projectId:project.id,workId:work.id,runId:reviewId,kind:'qa' as const,revision,createdAt:'2026-10-12T02:34:00.000Z',data:{typedReview:{...binding,reviewerRunId:reviewId,disposition:'approved',findings:[],evidenceArtifactIds:[required.id],...(kind==='fingerprint mismatch'?{candidateFingerprint:'b'.repeat(64)}:{}),...(kind==='revision mismatch'?{diffRevision:'old-revision'}:{})}}};
+  const candidate={id:candidateId,projectId:project.id,workId:work.id,kind:'implementation',status:'completed',model:'gpt-6.1-sol',reasoning:'medium',createdAt:diff.createdAt,updatedAt:diff.createdAt,generation:1,qaPolicySnapshot:jsonb({...policy,...(kind==='invalid policy'?{unexpected:true}:{})})} as Snapshot['runs'][number];
+  const review={id:reviewId,projectId:project.id,workId:work.id,kind:'review',status:'completed',model:'gpt-6.1-sol',reasoning:'medium',createdAt:typed.createdAt,updatedAt:generic.createdAt,generation:1,reviewBinding:jsonb(binding)} as Snapshot['runs'][number];
+  const records=[diff,required,generic,typed];
+  vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>records.find(item=>item.id===id)!);
+  await mount({...snapshot(),works:[work],runs:[candidate,review],artifacts:records.map(({data,...metadata})=>metadata)} as Snapshot);await flush();
+  const requiredSection=host.querySelector('[aria-label="Required checks"]')!;
+  if(kind==='invalid policy')expect(requiredSection.textContent).not.toContain('requirements met');
+  else expect.soft(requiredSection.textContent).toContain('4 required checks recorded · requirements met');
+  const reviewSection=[...host.querySelectorAll('h3')].find(item=>item.textContent==='Typed review')!.closest('section')!;
+  if(kind.endsWith('mismatch')){expect(reviewSection.textContent).toContain('Stale');expect(reviewSection.textContent).not.toContain('approved');}
+  else {expect(reviewSection.textContent).toContain('Current evidence');expect(reviewSection.textContent).toContain('approved');}
 });

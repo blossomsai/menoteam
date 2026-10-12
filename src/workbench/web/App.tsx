@@ -7,7 +7,7 @@ import { Textarea } from '../../local/web/src/components/ui/textarea';
 import { ProviderConnections } from './ProviderConnections';
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { isCausalMasterWake } from '../types';
-import { hasRequiredLocalQa } from '../local-qa';
+import { hasRequiredLocalQa, qaPolicySnapshot } from '../local-qa';
 import { ApiError, workbenchApi, type Snapshot } from './api';
 import { canManageProject, filterWorks, readRoute, selectProject, selectWork, type Route, type View } from './routes';
 import { cancelInstructionsDraft, completeInstructionsSave, editInstructionsDraft, hasRemoteInstructionsUpdate, keepInstructionsDraft, startInstructionsDraft, useLatestInstructions } from './instructions-draft';
@@ -638,6 +638,7 @@ function QaEvidencePanel({work,latestDiff,artifacts,runs}:{work:Work;latestDiff:
   const localChecks=Array.isArray(localData.checks)?localData.checks.filter(isRecord):[];
   const localFingerprint=typeof localData.candidateFingerprint==='string'?localData.candidateFingerprint:undefined;
   const policy=candidate?.qaPolicySnapshot;
+  const canonicalPolicy=qaPolicySnapshot.safeParse(policy);
   const localCurrent=Boolean(localQa&&latestDiff&&candidate&&localQa.runId===candidate.id&&localQa.revision===latestDiff.revision&&localData.localQaContract==='project-local-qa/v2'&&localData.verification==='current'&&localData.stale===false&&localFingerprint&&/^[a-f0-9]{64}$/u.test(localFingerprint)&&localChecks.length>0&&localChecks.every(check=>check.testedRevision===localFingerprint));
   const localFailed=localChecks.filter(check=>check.exitCode!==0).length;
   let requiredStatus:'Not configured'|'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
@@ -648,7 +649,7 @@ function QaEvidencePanel({work,latestDiff,artifacts,runs}:{work:Work;latestDiff:
   else if(localData.stale===true||localData.verification==='stale'||localQa.revision!==latestDiff?.revision)requiredStatus='Stale';
   else if(localCurrent)requiredStatus='Current';
   else requiredStatus='Unknown';
-  const localRequirementMet=Boolean(localCurrent&&policy&&localFingerprint&&hasRequiredLocalQa(localData,localFingerprint,policy));
+  const localRequirementMet=Boolean(localCurrent&&canonicalPolicy.success&&localFingerprint&&hasRequiredLocalQa(localData,localFingerprint,canonicalPolicy.data));
   const requiredDetail=!policy?'No required-check policy was recorded.':requiredStatus==='Pending'?'Required checks have not finished.':requiredStatus==='Unknown'?'Required checks could not be loaded or verified.':requiredStatus==='Missing'?'Required checks are missing for this candidate.':requiredStatus==='Stale'?'Recorded required checks do not match this candidate.':localRequirementMet?`${localChecks.length} required checks recorded · requirements met`:localFailed?`${localChecks.length} required checks recorded · ${localFailed} failed or unknown`:`${localChecks.length} required checks recorded · required checks are incomplete`;
 
   const commandQa=currentCandidateQa.find(item=>{const data=isRecord(item.data)?item.data:{};return Array.isArray(data.checks)&&data.localQaContract!=='project-local-qa/v2'&&!isRecord(data.typedReview);})
@@ -669,11 +670,11 @@ function QaEvidencePanel({work,latestDiff,artifacts,runs}:{work:Work;latestDiff:
   const commandFailed=commandChecks.filter(check=>check.exitCode!==0).length;
 
   const reviewRun=latestReview;
-  const reviewMetadata=reviewRun&&metadata.find(item=>item.runId===reviewRun.id);
-  const reviewArtifact=reviewMetadata?loaded[reviewMetadata.id]:undefined;
+  const reviewArtifact=metadata.filter(item=>item.runId===reviewRun?.id).sort((a,b)=>b.createdAt.localeCompare(a.createdAt))
+    .map(item=>loaded[item.id]).find(item=>isRecord(item?.data)&&isRecord(item.data.typedReview));
   const reviewData=isRecord(reviewArtifact?.data)&&isRecord(reviewArtifact.data.typedReview)?reviewArtifact.data.typedReview:{};
   const binding=reviewRun?.reviewBinding;
-  const reviewMatches=Boolean(candidate&&latestDiff&&commitSha&&reviewRun?.status==='completed'&&binding&&binding.candidateRunId===candidate.id&&binding.diffRevision===latestDiff.revision&&binding.commitSha===commitSha&&/^[a-f0-9]{64}$/u.test(binding.candidateFingerprint)&&reviewArtifact?.revision===latestDiff.revision&&reviewData.candidateRunId===candidate.id&&reviewData.diffRevision===latestDiff.revision&&reviewData.commitSha===commitSha&&reviewData.candidateFingerprint===binding.candidateFingerprint&&reviewData.reviewerRunId===reviewRun.id&&reviewData.disposition&&['approved','changes_requested','insufficient_evidence'].includes(String(reviewData.disposition)));
+  const reviewMatches=Boolean(candidate&&latestDiff&&commitSha&&reviewRun?.status==='completed'&&binding&&binding.candidateRunId===candidate.id&&binding.diffArtifactId===latestDiff.id&&binding.diffRevision===latestDiff.revision&&binding.commitSha===commitSha&&/^[a-f0-9]{64}$/u.test(binding.candidateFingerprint)&&(!localFingerprint||binding.candidateFingerprint===localFingerprint)&&reviewArtifact?.revision===latestDiff.revision&&reviewData.candidateRunId===candidate.id&&reviewData.diffArtifactId===binding.diffArtifactId&&reviewData.diffRevision===latestDiff.revision&&reviewData.commitSha===commitSha&&reviewData.candidateFingerprint===binding.candidateFingerprint&&reviewData.reviewerRunId===reviewRun.id&&reviewData.disposition&&['approved','changes_requested','insufficient_evidence'].includes(String(reviewData.disposition)));
   let reviewStatus:'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
   if(!reviewRun)reviewStatus='Missing';
   else if(['queued','running'].includes(reviewRun.status))reviewStatus='Pending';
