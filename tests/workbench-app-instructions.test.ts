@@ -506,6 +506,10 @@ it('sends the current run generation to the staging retirement endpoint', async 
   expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/workbench/runs/run%2Fwith%20slash/staging/retire');
   expect(JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body))).toEqual({ generation: 7 });
 });
+async function useNewInviteAccount() {
+  if ([...host.querySelectorAll('button')].some(item => item.textContent === 'Use a different account')) await click('Use a different account');
+}
+
 async function login() {
   await type(member.email, '#login-email');
   await type('password', '#login-password');
@@ -529,6 +533,70 @@ beforeEach(() => {
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
 });
 afterEach(async () => { await flush(() => root.unmount()); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+
+describe('mounted invitation acceptance', () => {
+  it('joins an invitation as the signed-in account without creating an account or signing in again', async () => {
+    window.history.replaceState(null, '', '/workbench/?invite=project-invite');
+    const join = vi.spyOn(workbenchApi, 'joinInvite').mockResolvedValue({ accepted: true });
+    const accept = vi.spyOn(workbenchApi, 'acceptInvite');
+    await mount();
+    expect(host.textContent).toContain(member.email); expect(host.querySelector('#invite-name')).toBeNull();
+    responses.push(Promise.resolve(snapshot('Joined project')));
+    await click('Accept invitation');
+    expect(join).toHaveBeenCalledExactlyOnceWith('project-invite');
+    expect(accept).not.toHaveBeenCalled(); expect(workbenchApi.login).not.toHaveBeenCalled();
+    expect(window.location.search).toBe(''); expect(host.textContent).toContain(member.name);
+    expect(snapshotSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('offers an explicit sign-in-and-join path for a logged-out existing user', async () => {
+    window.history.replaceState(null, '', '/workbench/?invite=project-invite');
+    vi.mocked(workbenchApi.me).mockRejectedValueOnce(new ApiError('Sign in required', 401));
+    const join = vi.spyOn(workbenchApi, 'joinInvite').mockResolvedValue({ accepted: true });
+    const accept = vi.spyOn(workbenchApi, 'acceptInvite');
+    await mount(); await click('Already have an account? Sign in');
+    await type(member.email, '#invite-email'); await type('existing-password', '#invite-password');
+    expect(host.querySelector<HTMLInputElement>('#invite-password')?.getAttribute('autocomplete')).toBe('current-password');
+    await click('Sign in and join');
+    expect(workbenchApi.login).toHaveBeenCalledExactlyOnceWith(member.email, 'existing-password');
+    expect(workbenchApi.me).toHaveBeenCalledTimes(2);
+    expect(join).toHaveBeenCalledExactlyOnceWith('project-invite'); expect(accept).not.toHaveBeenCalled();
+    expect(vi.mocked(workbenchApi.login).mock.invocationCallOrder[0]).toBeLessThan(join.mock.invocationCallOrder[0]!);
+    expect(window.location.search).toBe(''); expect(host.textContent).toContain(member.name);
+  });
+
+  it.each([400, 401])('preserves the invite on authenticated join rejection (%s) without falling back to account creation', async status => {
+    window.history.replaceState(null, '', '/workbench/?invite=wrong-account-invite');
+    const join = vi.spyOn(workbenchApi, 'joinInvite').mockRejectedValue(new ApiError(status === 400 ? 'Project invite unavailable' : 'Session expired', status));
+    const accept = vi.spyOn(workbenchApi, 'acceptInvite');
+    await mount(); await click('Accept invitation');
+    expect(join).toHaveBeenCalledOnce(); expect(accept).not.toHaveBeenCalled();
+    expect(window.location.search).toContain('wrong-account-invite');
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain(status === 400 ? 'Project invite unavailable' : 'Session expired');
+    if (status === 400) expect(button('Use a different account')).toBeDefined();
+    else expect(button('Already have an account? Sign in')).toBeDefined();
+  });
+
+  it('does not join or create an account after invalid existing-user credentials', async () => {
+    window.history.replaceState(null, '', '/workbench/?invite=project-invite');
+    vi.mocked(workbenchApi.me).mockRejectedValueOnce(new ApiError('Sign in required', 401));
+    vi.mocked(workbenchApi.login).mockRejectedValue(new ApiError('Invalid email or password', 401));
+    const join = vi.spyOn(workbenchApi, 'joinInvite'), accept = vi.spyOn(workbenchApi, 'acceptInvite');
+    await mount(); await click('Already have an account? Sign in');
+    await type(member.email, '#invite-email'); await type('wrong-password', '#invite-password'); await click('Sign in and join');
+    expect(join).not.toHaveBeenCalled(); expect(accept).not.toHaveBeenCalled();
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Invalid email or password');
+    expect(window.location.search).toContain('project-invite');
+  });
+
+  it('sends only the token to authenticated join, with same-origin credentials and server error propagation', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response(JSON.stringify({ message: 'Project invite unavailable' }), { status: 400, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(workbenchApi.joinInvite('token-only')).rejects.toMatchObject({ status: 400, message: 'Project invite unavailable' });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/workbench/invites/join');
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: 'POST', credentials: 'same-origin', body: JSON.stringify({ token: 'token-only' }) });
+  });
+});
 
 describe('mounted App Instructions and session races', () => {
   it.each(['Use latest version', 'Keep editing my draft', 'Cancel'])('preserves typing after save and ignores a late stale poll before %s', async resolution => {
@@ -652,7 +720,7 @@ describe('mounted App Instructions and session races', () => {
     await mount(); expect(host.textContent).toContain('Join Menoteam');
     const oldTick = timers.mock.calls.find(call => call[1] === 2_000)![0] as () => void;
     responses.push(oldPoll.promise); await poll(); expect(snapshotSpy).toHaveBeenCalledTimes(2);
-    await type(invited.name, '#invite-name'); await type('new-account-password', '#invite-password');
+    await useNewInviteAccount(); await type(invited.name, '#invite-name'); await type('new-account-password', '#invite-password');
     await click('Accept invitation');
     expect(accept).toHaveBeenCalledWith({ token: 'valid-invite', name: invited.name, password: 'new-account-password' });
     expect(workbenchApi.login).toHaveBeenCalledWith(invited.email, 'new-account-password');
@@ -695,7 +763,7 @@ describe('mounted App Instructions and session races', () => {
     vi.mocked(workbenchApi.login).mockReturnValue(entering.promise);
     await mount(); const oldTick = timers.mock.calls.find(call => call[1] === 2_000)![0] as () => void;
     responses.push(oldPoll.promise); await poll();
-    await type(accountB.name, '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
+    await useNewInviteAccount(); await type(accountB.name, '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
     responses.push(firstB.promise); await flush(() => entering.resolve({ authenticated: true }));
     expect(workbenchApi.login).toHaveBeenCalledWith(accountB.email, 'new-account-password');
     const expectPrivateAAbsent = () => {
@@ -726,7 +794,7 @@ describe('mounted App Instructions and session races', () => {
     window.history.replaceState(null, '', '/workbench/?invite=valid-invite');
     vi.spyOn(workbenchApi, 'acceptInvite').mockResolvedValue({ accepted: true, email: 'account-b@example.test' });
     const firstB = deferred<Snapshot>(); await mount();
-    await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password');
+    await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password');
     responses.push(firstB.promise); await click('Accept invitation');
     const accountB = { ...member, id: 'account-b', name: 'Account B' };
     window.history.replaceState(null, '', '/workbench/?view=instructions&project=project');
@@ -744,7 +812,7 @@ describe('mounted App Instructions and session races', () => {
     vi.mocked(workbenchApi.login).mockReturnValue(entering.promise);
     await mount(); const oldTick = timers.mock.calls.find(call => call[1] === 2_000)![0] as () => void;
     responses.push(oldPoll.promise); await poll();
-    await type('Invited owner', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
+    await useNewInviteAccount(); await type('Invited owner', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
     await flush(() => entering.reject(new Error('login network unavailable')));
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('login network unavailable');
     await flush(oldTick); await poll(); await flush(() => oldPoll.resolve(snapshot('Late A')));
@@ -766,7 +834,7 @@ describe('mounted App Instructions and session races', () => {
     const accepting = deferred<{ accepted: true; email: string }>(); const oldPoll = deferred<Snapshot>();
     vi.spyOn(workbenchApi, 'acceptInvite').mockReturnValue(accepting.promise);
     await mount(); responses.push(oldPoll.promise); await poll();
-    await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
+    await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
     // Navigate away from the invite overlay to inspect the actual underlying App state.
     window.history.replaceState(null, '', '/workbench/?view=instructions&project=project'); await mount();
     expect(host.textContent).toContain('Loading Menoteam'); expect(host.querySelector('aside')).toBeNull();
@@ -786,9 +854,9 @@ describe('mounted App Instructions and session races', () => {
     if (stage !== 'logout') window.history.replaceState(null, '', '/workbench/?invite=valid-invite');
     const accepting = deferred<{ accepted: true; email: string }>(); const entering = deferred<{ authenticated: true }>(); const exiting = deferred<void>();
     const accept = vi.spyOn(workbenchApi, 'acceptInvite').mockReturnValue(stage === 'accept' ? accepting.promise : Promise.resolve({ accepted: true, email: 'b@example.test' }));
-    vi.mocked(workbenchApi.login).mockReturnValue(entering.promise); vi.mocked(workbenchApi.logout).mockReturnValue(exiting.promise);
+    vi.mocked(workbenchApi.login).mockReturnValue(entering.promise); vi.mocked(workbenchApi.logout).mockReturnValue(stage === 'logout' ? exiting.promise : Promise.resolve());
     await mount();
-    if (stage === 'logout') await logout(); else { await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation'); }
+    if (stage === 'logout') await logout(); else { await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation'); }
     if (stage !== 'accept') expect(host.textContent).toContain('Loading Menoteam');
     expect(host.querySelector('aside')).toBeNull(); await poll(); expect(snapshotSpy).toHaveBeenCalledTimes(1);
     await flush(() => stage === 'accept' ? accepting.reject(failure) : stage === 'login' ? entering.reject(failure) : exiting.reject(failure));
@@ -807,7 +875,7 @@ describe('mounted App Instructions and session races', () => {
     const initialMe = deferred<typeof member>(); const initialSnapshot = deferred<Snapshot>(); const accepting = deferred<{ accepted: true; email: string }>();
     if (stage === 'me') { vi.mocked(workbenchApi.me).mockReturnValue(initialMe.promise); responses = []; } else responses = [initialSnapshot.promise];
     vi.spyOn(workbenchApi, 'acceptInvite').mockReturnValue(accepting.promise);
-    await mount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
+    await mount(); await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
     const newAccount = { ...snapshot('B instructions', 'B project'), member: { ...member, id: 'b', name: 'Account B' } };
     if (timing === 'ready') { responses.push(Promise.resolve(newAccount)); await flush(() => accepting.resolve({ accepted: true, email: 'b@example.test' })); }
     await flush(() => {
@@ -859,9 +927,9 @@ describe('mounted App Instructions and session races', () => {
     if (stage === 'logout') vi.mocked(workbenchApi.logout).mockReturnValueOnce(oldLogout.promise);
     if (stage !== 'logout') window.history.replaceState(null, '', '/workbench/?invite=old-invite');
     await mount();
-    if (stage === 'logout') await logout(); else { await type('Old invited account', '#invite-name'); await type('old-account-password', '#invite-password'); await click('Accept invitation'); }
+    if (stage === 'logout') await logout(); else { await useNewInviteAccount(); await type('Old invited account', '#invite-name'); await type('old-account-password', '#invite-password'); await click('Accept invitation'); }
     window.history.replaceState(null, '', '/workbench/?invite=new-invite'); await mount();
-    await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password');
+    await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password');
     responses.push(Promise.resolve({ ...snapshot('B instructions', 'B project'), member: { ...member, id: 'b', name: 'Account B' } }));
     await click('Accept invitation'); expect(host.textContent).toContain('Account B');
     const logins = vi.mocked(workbenchApi.login).mock.calls.length;
@@ -878,12 +946,12 @@ describe('mounted App Instructions and session races', () => {
     window.history.replaceState(null, '', '/workbench/?invite=valid-invite');
     const oldPoll = deferred<Snapshot>(); const entering = deferred<{ authenticated: true }>(); const exiting = deferred<void>();
     vi.spyOn(workbenchApi, 'acceptInvite').mockResolvedValue({ accepted: true, email: 'b@example.test' });
-    vi.mocked(workbenchApi.login).mockReturnValue(entering.promise); vi.mocked(workbenchApi.logout).mockReturnValue(exiting.promise);
+    vi.mocked(workbenchApi.login).mockReturnValue(entering.promise); vi.mocked(workbenchApi.logout).mockReturnValue(phase === 'logout pending' ? exiting.promise : Promise.resolve());
     await mount(); responses.push(oldPoll.promise); await poll();
     if (phase === 'logout pending') {
       window.history.replaceState(null, '', '/workbench/?view=instructions&project=project'); await mount(); await logout();
     } else {
-      await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
+      await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password'); await click('Accept invitation');
       if (phase === 'new session') { responses.push(Promise.resolve({ ...snapshot('B instructions'), member: { ...member, id: 'b', name: 'Account B' } })); await flush(() => entering.resolve({ authenticated: true })); }
     }
     await flush(() => outcome === 'success' ? oldPoll.resolve(snapshot('Private A', 'Private A project')) : oldPoll.reject(outcome === '401' ? new ApiError('Old session expired', 401) : new Error('Old session unavailable')));
@@ -897,7 +965,7 @@ describe('mounted App Instructions and session races', () => {
     const retry = deferred<Snapshot>(); responses.push(retry.promise); await click('Retry');
     window.history.replaceState(null, '', '/workbench/?invite=valid-invite'); await mount();
     vi.spyOn(workbenchApi, 'acceptInvite').mockResolvedValue({ accepted: true, email: 'b@example.test' });
-    await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password');
+    await useNewInviteAccount(); await type('Account B', '#invite-name'); await type('new-account-password', '#invite-password');
     responses.push(Promise.resolve({ ...snapshot('B instructions'), member: { ...member, id: 'b', name: 'Account B' } })); await click('Accept invitation');
     await flush(() => retry.reject(outcome === '401' ? new ApiError('Old retry expired', 401) : new Error('Old retry unavailable')));
     expect(host.textContent).toContain('Account B'); expect(host.querySelector('[role="alert"]')).toBeNull();

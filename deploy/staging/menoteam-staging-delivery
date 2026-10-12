@@ -201,10 +201,31 @@ def operate(config, request, state):
     deployments = state.setdefault('deployments', {})
     if request['action'] == 'status':
         image = f"{config['imageRepository']}@{request['imageDigest']}"
+        if prior:
+            saved_request = prior.get('request')
+            if saved_request:
+                expected = {key: value for key, value in saved_request.items() if key not in {'action', 'previousDeploymentId'}}
+                actual = {key: value for key, value in request.items() if key not in {'action', 'previousDeploymentId'}}
+                saved_hash = hashlib.sha256(json.dumps(saved_request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                matches = saved_hash == prior.get('requestHash') and actual == expected and (request.get('previousDeploymentId') is None or request['previousDeploymentId'] == saved_request.get('previousDeploymentId'))
+            else:
+                # Older completed records saved only the mutation hash and receipt.
+                # Reconstruct the original mutation, including its expected-current identity.
+                terminal = prior.get('receipt', {})
+                original = {key: value for key, value in request.items() if key != 'previousDeploymentId'}
+                candidates = [{**original, 'action': 'deploy'}]
+                if terminal.get('phase') == 'rolled_back' and terminal.get('deploymentId'):
+                    candidates.append({**original, 'action': 'rollback', 'previousDeploymentId': terminal['deploymentId']})
+                matches = any((request.get('previousDeploymentId') is None or request['previousDeploymentId'] == candidate.get('previousDeploymentId')) and hashlib.sha256(json.dumps(candidate, sort_keys=True, separators=(',', ':')).encode()).hexdigest() == prior.get('requestHash') for candidate in candidates)
+            if not matches:
+                fail('status query does not match the immutable operation identity')
+            if prior.get('receipt'):
+                terminal = prior['receipt']
+                if any(terminal.get(key) != request[key] for key in ('operationId', 'targetId', 'commitSha', 'imageDigest')):
+                    fail('saved receipt does not match the immutable operation identity')
+                return terminal
         if prior and prior.get('pending'):
             pending_request = prior.get('request', {})
-            if request['commitSha'] != pending_request.get('commitSha') or request['imageDigest'] != pending_request.get('imageDigest'):
-                fail('status query does not match the uncertain operation identity')
             if healthy(image, request['commitSha']):
                 if pending_request.get('action') == 'rollback':
                     deployment = deployments.get(pending_request.get('previousDeploymentId'))
@@ -219,15 +240,13 @@ def operate(config, request, state):
                 deployments[deployment['id']] = deployment
                 state['current'] = deployment
                 result = receipt(request, phase, deployment, previous)
-                state['operations'][request['operationId']] = {'requestHash': prior['requestHash'], 'receipt': result}
+                state['operations'][request['operationId']] = {'requestHash': prior['requestHash'], 'request': pending_request, 'receipt': result}
                 return result
             # A previous helper may have exited while Docker/Compose is still changing
             # container state. Neither the prior version being healthy nor no running
             # app container proves that the in-flight operation has ended.
             return receipt(request, 'unknown')
-        current = state.get('current')
-        matches = bool(current and current['commitSha'] == request['commitSha'] and current['imageDigest'] == request['imageDigest'])
-        return receipt(request, 'health_passed' if matches and healthy(image, request['commitSha']) else 'unknown', current if matches else None)
+        return receipt(request, 'unknown')
     if prior:
         if prior['requestHash'] != request_hash:
             fail('operation id was already used for a different mutation')
@@ -313,7 +332,7 @@ def main():
             result = operate(config, request, state)
             if request['action'] not in {'status', 'verify'}:
                 digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-                state.setdefault('operations', {})[request['operationId']] = {'requestHash': digest, 'receipt': result}
+                state.setdefault('operations', {})[request['operationId']] = {'requestHash': digest, 'request': request, 'receipt': result}
                 atomic_write(state)
             elif request['action'] == 'status':
                 atomic_write(state)

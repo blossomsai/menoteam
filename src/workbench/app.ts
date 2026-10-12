@@ -1275,15 +1275,31 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(!run.operation.effectIntentGeneration)fail(409,'A saved staging intent is required for receipt reconciliation');
         const op=run.operation,receipt=body.receipt;if(receipt.operationId!==run.id||receipt.targetId!==op.targetId||receipt.commitSha!==op.commitSha||receipt.imageDigest!==op.imageDigest)fail(409,'Staging receipt does not match the immutable operation');
         const validDeploy=op.action==='deploy_staging'&&receipt.phase==='health_passed'&&receipt.deploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
-        const validRollback=op.action==='rollback_staging'&&receipt.phase==='rolled_back'&&receipt.deploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
-        if(receipt.phase==='health_passed'&&!validDeploy||receipt.phase==='rolled_back'&&!validRollback)fail(409,'Staging health receipt does not prove the requested image is active');
+        const validRollback=op.action==='rollback_staging'&&receipt.phase==='rolled_back'&&receipt.deploymentId===op.previousDeploymentId&&Boolean(op.previousDeploymentId)&&receipt.previousDeploymentId===op.expectedCurrentDeploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
+        let validFallback=false;
+        if(op.action==='deploy_staging'&&receipt.phase==='rolled_back'&&op.expectedCurrentDeploymentId&&receipt.deploymentId===op.expectedCurrentDeploymentId&&receipt.previousDeploymentId===`deploy_${run.id.slice(4)}`&&receipt.previousImageDigest===op.imageDigest){
+            // Prove the restored active identity from a server-saved receipt that predates
+            // this operation, never from the failed candidate or an unbound helper claim.
+            const priorRuns=await store.list<Run>('run',run.projectId,tx);
+            validFallback=priorRuns.some(prior=>{
+                const previous=prior.operation,saved=previous?.stagingReceipt;
+                return prior.id!==run.id&&prior.projectId===run.projectId&&prior.kind==='delivery'&&previous&&saved
+                    &&['deploy_staging','rollback_staging'].includes(previous.action)&&previous.targetId===op.targetId
+                    &&['health_passed','rolled_back'].includes(previous.phase)&&saved.phase===previous.phase
+                    &&saved.operationId===prior.id&&saved.targetId===op.targetId&&saved.deploymentId===op.expectedCurrentDeploymentId
+                    &&saved.commitSha===previous.commitSha&&saved.imageDigest===previous.imageDigest
+                    &&Date.parse(prior.createdAt)<=Date.parse(run.createdAt)&&Boolean(receipt.activeCommitSha)&&Boolean(receipt.activeImageDigest)
+                    &&saved.activeCommitSha===receipt.activeCommitSha&&saved.activeImageDigest===receipt.activeImageDigest;
+            });
+        }
+        if(receipt.phase==='health_passed'&&!validDeploy||receipt.phase==='rolled_back'&&!validRollback&&!validFallback)fail(409,'Staging health receipt does not prove the requested or previously verified image is active');
         const phase=receipt.phase==='unknown'||receipt.phase==='deployed'?'deploy_unknown':receipt.phase;
         op.phase=phase;op.stagingReceipt=receipt;run.operation=op;run.updatedAt=now();await store.put('run',run,tx);
         const artifactId=`artifact:${run.id}:staging:${run.generation}:${phase}`;let artifact=await store.get<Artifact>('artifact',artifactId,tx);
         const data={operationId:run.id,action:op.action,phase,targetId:op.targetId,sourceMergeRunId:op.sourceMergeRunId,targetPolicyVersion:op.targetPolicyVersion,commitSha:op.commitSha,imageDigest:op.imageDigest,previousDeploymentRunId:op.previousDeploymentRunId,receipt};
         if(artifact){if(!isDeepStrictEqual(artifact.data,data))fail(409,'Staging receipt is immutable');}
         else{artifact={id:artifactId,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data,createdAt:now()};await store.put('artifact',artifact,tx);}
-        if((validDeploy||validRollback)&&op.targetId){const reservationScope=stagingReservationScope(run.projectId,op.targetId);await tx`DELETE FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' AND result->>'runId'=${run.id}`;}
+        if((validDeploy||validRollback||validFallback)&&op.targetId){const reservationScope=stagingReservationScope(run.projectId,op.targetId);await tx`DELETE FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' AND result->>'runId'=${run.id}`;}
         return {run,artifact};
     }));
     app.post("/api/workbench/connector/claim", async (req, reply) => {

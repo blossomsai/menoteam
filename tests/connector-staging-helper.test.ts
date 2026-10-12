@@ -13,6 +13,50 @@ async function simulate(source: string): Promise<Record<string, unknown>> {
 }
 
 describe('fixed staging remote helper policy', () => {
+  it.each(['rollback', 'deploy'])('replays completed %s after lost mutation and status responses without another mutation', async action => {
+    const result = await simulate(`
+import importlib.util,importlib.machinery,json,sys,tempfile,pathlib,io,contextlib,copy
+spec=importlib.util.spec_from_loader('stage',importlib.machinery.SourceFileLoader('stage',sys.argv[1]));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+directory=pathlib.Path(tempfile.mkdtemp());m.STATE=directory/'state.json';m.LOCK=directory/'state.lock'
+config={'targetId':'staging','imageRepository':'ghcr.io/blossomsai/menoteam-work-map'};m.load_config=lambda:config
+old={'id':'deploy_old','commitSha':'c'*40,'imageDigest':'sha256:'+'d'*64,'healthPassed':True,'schemaMax':'006_old.sql'}
+previous={'id':'deploy_previous','commitSha':'a'*40,'imageDigest':'sha256:'+'b'*64,'healthPassed':True,'schemaMax':'006_old.sql'}
+state={'current':old,'deployments':{'deploy_old':old,'deploy_previous':previous},'operations':{}};m.atomic_write(state)
+request={'action':'${action}','operationId':'run_11111111-2222-3333-4444-555555555555','targetId':'staging','commitSha':'a'*40,'imageDigest':'sha256:'+'b'*64,'expectedCurrentDeploymentId':'deploy_old'}
+if request['action']=='rollback':request['previousDeploymentId']='deploy_previous'
+calls=[];m.run_compose=lambda *args:calls.append(args);m.image_schema_max=lambda image:'006_old.sql';m.database_schema_latest=lambda:'006_old.sql'
+m.wait_health=lambda image,commitSha,seconds=60:request['action']=='rollback' or commitSha==old['commitSha']
+def invoke(value):
+ m.parse_request=lambda:value
+ output=io.StringIO()
+ with contextlib.redirect_stdout(output):m.main()
+ return json.loads(output.getvalue())
+terminal=invoke(request);mutations=len(calls)
+# The client loses both the mutation response and the first status response.
+status={key:value for key,value in request.items() if key!='previousDeploymentId'};status['action']='status'
+m.healthy=lambda *args:(_ for _ in ()).throw(Exception('terminal replay must not derive a fresh phase'))
+first=invoke(status);second=invoke(status)
+saved=json.loads(m.STATE.read_text());legacy=copy.deepcopy(saved);legacy['operations'][request['operationId']].pop('request');legacyResult=m.operate(config,status,legacy)
+errors=[]
+for key,value in [('commitSha','e'*40),('imageDigest','sha256:'+'f'*64),('expectedCurrentDeploymentId','deploy_wrong'),('targetId','other')]:
+ try:invoke({**status,key:value})
+ except ValueError as error:errors.append(str(error))
+unknown=invoke({**status,'operationId':'run_22222222-2222-3333-4444-555555555555'})
+corrupt=copy.deepcopy(saved);corrupt['operations'][request['operationId']]['request']['expectedCurrentDeploymentId']='deploy_wrong'
+try:m.operate(config,{**status,'expectedCurrentDeploymentId':'deploy_wrong'},corrupt)
+except ValueError as error:corruptError=str(error)
+print(json.dumps({'terminal':terminal,'first':first,'second':second,'legacy':legacyResult,'callsBefore':mutations,'callsAfter':len(calls),'errors':errors,'unknown':unknown,'corruptError':corruptError}))
+`);
+    expect(result.terminal).toMatchObject({ phase: 'rolled_back', deploymentId: action === 'rollback' ? 'deploy_previous' : 'deploy_old', previousDeploymentId: action === 'rollback' ? 'deploy_old' : 'deploy_11111111-2222-3333-4444-555555555555' });
+    expect(result.first).toEqual(result.terminal);
+    expect(result.second).toEqual(result.terminal);
+    expect(result.legacy).toEqual(result.terminal);
+    expect(result.callsAfter).toBe(result.callsBefore);
+    expect(result.errors).toHaveLength(4);
+    expect(result.unknown).toMatchObject({ phase: 'unknown' });
+    expect(result.corruptError).toContain('immutable operation identity');
+  });
+
   it('supplies immutable image inputs to every Compose call and uses Docker labels for status lookup', async () => {
     const result = await simulate(`
 import importlib.util,importlib.machinery,json,sys,types

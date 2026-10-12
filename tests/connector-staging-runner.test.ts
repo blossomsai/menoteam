@@ -36,7 +36,7 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
@@ -53,7 +53,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
       expect(generation).toBe(claim.run.generation);
       return authorize(effect);
     },
-    stagingProgress: async (_id: string, _generation: number, receipt: StagingReceipt) => { receipts.push(receipt); },
+    stagingProgress: async (_id: string, _generation: number, receipt: StagingReceipt) => { receipts.push(receipt);await options.receiptAck?.(receipt,receipts.length); },
     stagingBuildStatus:async(_id:string,_generation:number,status:string)=>{buildStatuses.push(status);return{run:claim.run};},
     stagingBuildReceipt:async(_id:string,_generation:number,receipt:StagingBuildReceipt)=>{await options.onBuildReceipt?.(receipt);buildReceipts.push(receipt);claim.run.operation!.buildReceipt={...receipt,verifiedAt:new Date().toISOString(),verifiedGeneration:claim.run.generation};claim.run.operation!.buildStatus='verified';claim.run.operation!.imageDigest=receipt.imageDigest;return{run:claim.run};},
     stopped: async (_id:string,generation:number)=>{expect(_id).toBe(runId);expect(generation).toBe(1);stoppedAcks.push(generation);await options.stopAck?.(stoppedAcks.length,await readJson<Record<string,unknown>>(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`)));claim.run.stoppedAt=new Date().toISOString();return claim.run;},
@@ -73,7 +73,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
     client:()=>withRecoveryState(client),
     staging: { transport: fakeTransport as never, provenanceVerifier: options.provenanceVerifier??attestation, targetValidator: async () => {}, ...(options.stopProcess?{stopProcess:options.stopProcess as never}:{}),...(options.buildDiscovery?{buildDiscovery:options.buildDiscovery}:{}) },
   });
-  if(options.recovery)await writeSecureJson(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`),{runId,generation:1,events:[],artifacts:[],stagingIntent:{targetId:'staging',commitSha,imageDigest,expectedCurrentDeploymentId:null},stagingTransportStarted:true,stagingTransportStopped:!options.recoveryIdentity,...(options.recoveryIdentity?{stagingProcessIdentity:identity}:{}),deliveryExecutor:{pid:process.pid,executionId:'crashed-fixture',stage:'staging'}});
+  if(options.recovery)await writeSecureJson(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`),{runId,generation:1,events:[],artifacts:[],stagingIntent:{targetId:'staging',commitSha,imageDigest,expectedCurrentDeploymentId:claim.run.operation!.expectedCurrentDeploymentId??null,...(claim.run.operation!.previousDeploymentId?{previousDeploymentId:claim.run.operation!.previousDeploymentId}:{})},stagingTransportStarted:true,stagingTransportStopped:!options.recoveryIdentity,...(options.recoveryIdentity?{stagingProcessIdentity:identity}:{}),deliveryExecutor:{pid:process.pid,executionId:'crashed-fixture',stage:'staging'}});
   options.onRunner?.(runner);
   try {
     await runner.run();await options.afterRun?.();
@@ -84,6 +84,22 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
 }
 
 describe('staging delivery Connector integration', () => {
+  it.each(['deploy', 'rollback'] as const)('converges a completed %s by status and retries a lost terminal receipt ACK without mutating', async action => {
+    const claim = stagingClaim('deploy_intent');
+    claim.run.operation!.expectedCurrentDeploymentId = 'deploy_current';
+    if (action === 'rollback') Object.assign(claim.run.operation!, { action: 'rollback_staging', previousDeploymentId: 'deploy_previous', phase: 'rollback_intent' });
+    const actions: string[] = [], effects: string[] = [];
+    const result = await execute(claim, async effect => { effects.push(effect); return { authorized: true, action: 'status' }; }, async request => {
+      actions.push(request.action);
+      expect(request).toMatchObject({ action: 'status', operationId: runId, expectedCurrentDeploymentId: 'deploy_current' });
+      expect(request.previousDeploymentId).toBeUndefined();
+      return { operationId: runId, targetId: 'staging', phase: 'rolled_back', deploymentId: action === 'rollback' ? 'deploy_previous' : 'deploy_current', commitSha, imageDigest, activeCommitSha: action === 'rollback' ? commitSha : 'c'.repeat(40), activeImageDigest: action === 'rollback' ? imageDigest : `sha256:${'d'.repeat(64)}`, previousDeploymentId: action === 'rollback' ? 'deploy_current' : `deploy_${runId.slice(4)}`, previousImageDigest: action === 'rollback' ? `sha256:${'d'.repeat(64)}` : imageDigest, checkedAt: new Date().toISOString() };
+    }, { recovery: true, receiptAck: async (_receipt, attempt) => { if (attempt === 1) throw new Error('terminal receipt ACK response lost'); } });
+    expect(actions).toEqual(['status']); expect(effects.every(effect => effect === 'status')).toBe(true);
+    expect(result.receipts).toHaveLength(2); expect(result.receipts[1]).toEqual(result.receipts[0]);
+    expect(result.completions).toEqual([{}]); expect(result.spools).toEqual([]);
+  });
+
   it('authorizes provenance and SSH, then completes only from the exact healthy receipt', async () => {
     const effects: string[] = [];
     const result = await execute(stagingClaim(), async effect => { effects.push(effect); return { authorized: true, action: 'deploy' }; }, async request => ({

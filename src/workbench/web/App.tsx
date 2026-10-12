@@ -129,19 +129,46 @@ function App() {
     setSessionState('authenticating');
     await authenticate(generation, accepted.email, password);
   };
+  const onJoinInvite = async (token: string, email?: string, password?: string) => {
+    let current = member;
+    const generation = invalidateSession(email ? 'authenticating' : 'loading');
+    if (!email) setMember(current);
+    try {
+      if (email) {
+        await workbenchApi.login(email, password ?? '');
+        if (generation !== sessionGenerationRef.current) return;
+        current = await workbenchApi.me();
+        if (generation !== sessionGenerationRef.current) return;
+        setMember(current);
+      }
+      await workbenchApi.joinInvite(token);
+    } catch (cause) {
+      if (generation !== sessionGenerationRef.current) return;
+      if (cause instanceof ApiError && cause.status === 401) { invalidateSession('anonymous'); current = null; }
+      if (current) snapshotRequestsEnabledRef.current = true;
+      setError(errorMessage(cause)); setSessionState(current ? 'ready' : 'anonymous');
+      return;
+    }
+    if (generation !== sessionGenerationRef.current) return;
+    window.history.replaceState(null, '', '/workbench/');
+    snapshotRequestsEnabledRef.current = true;
+    setSessionState('ready');
+    await requestSnapshot().catch(() => undefined);
+  };
+  const onLogout = async () => {
+    const generation = invalidateSession('loading');
+    try { await workbenchApi.logout(); }
+    catch (cause) { if (generation === sessionGenerationRef.current) setError(errorMessage(cause)); }
+    if (generation === sessionGenerationRef.current) setSessionState('anonymous');
+  };
 
-  if (inviteToken) return <InviteAccept key={inviteToken} token={inviteToken} onSubmit={onAcceptInvite} error={error} />;
+  if (inviteToken) return <InviteAccept key={inviteToken} token={inviteToken} member={member} onSubmit={onAcceptInvite} onJoin={onJoinInvite} onSwitchAccount={onLogout} error={error} />;
   if (sessionState === 'loading' || sessionState === 'authenticating') return <CenteredState title="Loading Menoteam" detail="Checking your workspace session…" />;
   if (sessionState === 'anonymous') return <Login onSubmit={onLogin} error={error} />;
   if (sessionState === 'error' && !snapshot) return <CenteredState title="Menoteam is unavailable" detail={error} action={<Button variant="outline" onClick={() => void checkSession()}>Try again</Button>} />;
   if (!member || !snapshot) return error ? <CenteredState title="Workspace is unavailable" detail={<span role="alert">{error}</span>} action={<Button variant="outline" onClick={() => void refresh().catch(() => undefined)}>Retry</Button>} /> : <CenteredState title="Loading workspace" detail="Preparing your projects…" />;
 
-  return <WorkbenchShell key={member.id} member={member} snapshot={snapshot} route={route} error={error} refresh={refresh} onLogout={async () => {
-    const generation = invalidateSession('loading');
-    try { await workbenchApi.logout(); }
-    catch (cause) { if (generation === sessionGenerationRef.current) setError(errorMessage(cause)); }
-    if (generation === sessionGenerationRef.current) setSessionState('anonymous');
-  }} />;
+  return <WorkbenchShell key={member.id} member={member} snapshot={snapshot} route={route} error={error} refresh={refresh} onLogout={onLogout} />;
 }
 
 function WorkbenchShell({ member, snapshot, route, error, refresh, onLogout }: { member: Member; snapshot: Snapshot; route: Route; error: string; refresh: () => Promise<void>; onLogout: () => Promise<void> }) {
@@ -223,13 +250,18 @@ function Login({ onSubmit, error }: { onSubmit: (email: string, password: string
   </form></main>;
 }
 
-function InviteAccept({ token, onSubmit, error }: { token: string; onSubmit: (token: string, name: string, password: string) => Promise<void>; error: string }) {
-  const [name, setName] = useState(''); const [password, setPassword] = useState(''); const [busy, setBusy] = useState(false);
-  return <main className="grid min-h-screen place-items-center bg-muted/50 p-4"><form className="grid w-full max-w-sm gap-5 rounded-xl border bg-background p-6 shadow-sm" onSubmit={async event => { event.preventDefault(); setBusy(true); try { await onSubmit(token, name, password); } finally { setBusy(false); } }}>
-    <header><h1 className="text-xl font-semibold">Join Menoteam</h1><p className="mt-1 text-sm text-muted-foreground">Set up your account to accept this invitation.</p></header>
-    <div className="grid gap-2"><Label htmlFor="invite-name">Name</Label><Input id="invite-name" autoComplete="name" required value={name} onChange={event => setName(event.target.value)} /></div>
-    <div className="grid gap-2"><Label htmlFor="invite-password">Password</Label><Input id="invite-password" autoComplete="new-password" type="password" minLength={12} required value={password} onChange={event => setPassword(event.target.value)} /></div>
-    {error && <p role="alert" className="text-sm text-destructive">{error}</p>}<Button disabled={busy}>{busy ? 'Joining…' : 'Accept invitation'}</Button>
+function InviteAccept({ token, member, onSubmit, onJoin, onSwitchAccount, error }: { token: string; member: Member | null; onSubmit: (token: string, name: string, password: string) => Promise<void>; onJoin: (token: string, email?: string, password?: string) => Promise<void>; onSwitchAccount: () => Promise<void>; error: string }) {
+  const [existing, setExisting] = useState(false);
+  const [name, setName] = useState(''); const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [busy, setBusy] = useState(false);
+  return <main className="grid min-h-screen place-items-center bg-muted/50 p-4"><form className="grid w-full max-w-sm gap-5 rounded-xl border bg-background p-6 shadow-sm" onSubmit={async event => { event.preventDefault(); setBusy(true); try { if (member) await onJoin(token); else if (existing) await onJoin(token, email, password); else await onSubmit(token, name, password); } finally { setBusy(false); } }}>
+    <header><h1 className="text-xl font-semibold">Join Menoteam</h1><p className="mt-1 text-sm text-muted-foreground">{member ? `Accept this project invitation as ${member.email}.` : existing ? 'Sign in with the account this invitation was sent to.' : 'Set up your account to accept this invitation.'}</p></header>
+    {member && <Button type="button" variant="outline" disabled={busy} onClick={async () => { setBusy(true); try { await onSwitchAccount(); } finally { setBusy(false); } }}>Use a different account</Button>}
+    {!member && <>
+      {existing ? <div className="grid gap-2"><Label htmlFor="invite-email">Email</Label><Input id="invite-email" autoComplete="email" type="email" required value={email} onChange={event => setEmail(event.target.value)} /></div> : <div className="grid gap-2"><Label htmlFor="invite-name">Name</Label><Input id="invite-name" autoComplete="name" required value={name} onChange={event => setName(event.target.value)} /></div>}
+      <div className="grid gap-2"><Label htmlFor="invite-password">Password</Label><Input id="invite-password" autoComplete={existing ? 'current-password' : 'new-password'} type="password" minLength={existing ? undefined : 12} required value={password} onChange={event => setPassword(event.target.value)} /></div>
+      <Button type="button" variant="outline" disabled={busy} onClick={() => { setExisting(!existing); setPassword(''); }}>{existing ? 'Create a new account' : 'Already have an account? Sign in'}</Button>
+    </>}
+    {error && <p role="alert" className="text-sm text-destructive">{error}</p>}<Button disabled={busy}>{busy ? 'Joining…' : existing && !member ? 'Sign in and join' : 'Accept invitation'}</Button>
   </form></main>;
 }
 
