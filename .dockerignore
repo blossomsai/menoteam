@@ -9,3 +9,12 @@ coverage
 backups
 *.dump
 *.log
+
+# Local runtime state, credentials, operator evidence and package cache.
+.local
+.pnpm-store
+.gstack
+.impeccable
+.DS_Store
+data
+handoffs

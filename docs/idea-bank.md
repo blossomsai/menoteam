@@ -1,5 +1,7 @@
 # Idea Bank
 
+> Historical research/proposal, retained for provenance. Not current UI requirements. The 2026-10-06 [product direction](../PRODUCT.md) and its linked requirements supersede conflicting navigation, workflows and feature claims here.
+
 Working notes for products, protocols, and reference systems that may inform Menoteam. This is not a product spec.
 
 Last checked: 2026-06-29.
