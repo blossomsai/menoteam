@@ -61,6 +61,9 @@ export interface DiffFile {
   binary: boolean;
   additions: number | null;
   deletions: number | null;
+  textBytes?: number;
+  chunkCount?: number;
+  fileSha256?: string;
   hunks: DiffHunk[];
 }
 
@@ -74,6 +77,7 @@ export interface DiffArtifactData {
   totalFiles: number;
   patch: string;
   truncated: boolean;
+  diffFileChunksVersion?: 1;
 }
 
 export interface QaCheck {

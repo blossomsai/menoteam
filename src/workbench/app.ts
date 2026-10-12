@@ -23,6 +23,36 @@ function fail(statusCode: number, message: string): never {
         statusCode
     });
 }
+async function readDiffFilePage(store:WorkbenchStore,tx:Sql,parent:Artifact,filePath:string,revision:string,cursor?:string){
+    if(parent.kind!=='diff'||revision!==parent.revision)fail(409,'Diff revision is stale');
+    const data=parent.data as Record<string,unknown>;const files=Array.isArray(data.files)?data.files.filter(item=>item&&typeof item==='object') as Array<Record<string,unknown>>:[];
+    const file=files.find(item=>item.path===filePath);if(!file)fail(404,'Diff path is not in this candidate');
+    if(file.binary)return {path:filePath,binary:true,complete:true,contentBase64:'',chunkIndex:0,chunkCount:0,nextCursor:null};
+    const chunkCount=Number(file.chunkCount),fileSha256=String(file.fileSha256??'');
+    if(!Number.isSafeInteger(chunkCount)||chunkCount<1||!/^[a-f0-9]{64}$/u.test(fileSha256))return {path:filePath,binary:false,complete:false,incomplete:true,reason:'Diff file chunks are not recorded'};
+    let index=0;
+    if(cursor){try{const value=JSON.parse(Buffer.from(cursor,'base64url').toString('utf8')) as unknown;if(!Array.isArray(value)||value.length!==4||value[0]!==parent.id||value[1]!==parent.revision||value[2]!==filePath||!Number.isSafeInteger(value[3])||value[3]<0||value[3]>=chunkCount)fail(409,'Diff cursor is stale or bound to another file');index=value[3] as number;}catch(error){if((error as {statusCode?:number}).statusCode)throw error;fail(400,'Diff cursor is invalid');}}
+    const rows=await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${parent.projectId} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'path'=${filePath} AND data->'data'->>'chunkIndex'=${String(index)} LIMIT 1`;
+    if(!rows[0])return {path:filePath,binary:false,complete:false,incomplete:true,chunkIndex:index,chunkCount,reason:`Diff file is incomplete: chunk ${index+1} of ${chunkCount} is missing`};
+    const artifact=rows[0].data as Artifact,chunk=artifact.data as Record<string,unknown>,bytes=Buffer.from(String(chunk.contentBase64??''),'base64');
+    if(artifact.projectId!==parent.projectId||artifact.workId!==parent.workId||artifact.runId!==parent.runId||artifact.revision!==parent.revision||chunk.parentArtifactId!==parent.id||chunk.projectId!==parent.projectId||chunk.workId!==parent.workId||chunk.runId!==parent.runId||chunk.diffRevision!==parent.revision||chunk.candidateRevision!==data.candidateRevision||chunk.baseRevision!==data.baseRevision||chunk.path!==filePath||chunk.oldPath!==file.oldPath||chunk.chunkIndex!==index||chunk.fileSha256!==fileSha256||chunk.fileByteLength!==Number(file.textBytes)||chunk.chunkCount!==chunkCount||createHash('sha256').update(bytes).digest('hex')!==chunk.chunkSha256)return {path:filePath,binary:false,complete:false,incomplete:true,chunkIndex:index,chunkCount,reason:'Diff file chunk failed its identity or hash check'};
+    const count=await tx`SELECT count(*)::int AS count,count(DISTINCT (data->'data'->>'chunkIndex')::int)::int AS unique_count,coalesce(sum(octet_length(decode(data->'data'->>'contentBase64','base64'))),0)::bigint AS byte_count,min((data->'data'->>'chunkIndex')::int)::int AS first_index,max((data->'data'->>'chunkIndex')::int)::int AS last_index FROM wb_records WHERE kind='artifact' AND project_id=${parent.projectId} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'path'=${filePath} AND data->'data'->>'diffRevision'=${parent.revision} AND data->'data'->>'candidateRevision'=${String(data.candidateRevision)} AND data->'data'->>'baseRevision'=${String(data.baseRevision)} AND data->'data'->>'fileSha256'=${fileSha256} AND data->'data'->>'chunkCount'=${String(chunkCount)}`;
+    const allChunks=count[0];let completeSet=Number(allChunks?.count)===chunkCount&&Number(allChunks?.unique_count)===chunkCount&&Number(allChunks?.first_index)===0&&Number(allChunks?.last_index)===chunkCount-1&&Number(allChunks?.byte_count)===Number(file.textBytes);
+    if(completeSet&&index===chunkCount-1){
+        const fileHash=createHash('sha256');let reconstructedBytes=0;
+        for(let part=0;part<chunkCount;part++){
+            const saved=part===index?artifact:(await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${parent.projectId} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'path'=${filePath} AND data->'data'->>'chunkIndex'=${String(part)} LIMIT 1`)[0]?.data as Artifact|undefined;
+            if(!saved){completeSet=false;break;}
+            const savedData=saved.data as Record<string,unknown>,savedBytes=Buffer.from(String(savedData.contentBase64??''),'base64');
+            if(saved.projectId!==parent.projectId||saved.workId!==parent.workId||saved.runId!==parent.runId||saved.revision!==parent.revision||savedData.parentArtifactId!==parent.id||savedData.projectId!==parent.projectId||savedData.workId!==parent.workId||savedData.runId!==parent.runId||savedData.diffRevision!==parent.revision||savedData.candidateRevision!==data.candidateRevision||savedData.baseRevision!==data.baseRevision||savedData.chunkIndex!==part||savedData.chunkCount!==chunkCount||savedData.path!==filePath||savedData.oldPath!==file.oldPath||savedData.fileByteLength!==Number(file.textBytes)||savedData.fileSha256!==fileSha256||createHash('sha256').update(savedBytes).digest('hex')!==savedData.chunkSha256){completeSet=false;break;}
+            reconstructedBytes+=savedBytes.length;fileHash.update(savedBytes);
+        }
+        if(reconstructedBytes!==Number(file.textBytes)||fileHash.digest('hex')!==fileSha256)completeSet=false;
+    }
+    const complete=completeSet&&index===chunkCount-1;
+    const nextCursor=index+1<chunkCount?Buffer.from(JSON.stringify([parent.id,parent.revision,filePath,index+1])).toString('base64url'):null;
+    return {path:filePath,binary:false,complete,incomplete:!completeSet,chunkIndex:index,chunkCount,fileSha256,contentBase64:String(chunk.contentBase64),nextCursor};
+}
 export interface WorkbenchOptions {
     sql: Sql;
     bootstrapEmail?: string;
@@ -840,6 +870,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         });
     });
     app.get('/api/workbench/artifacts/:id',async req=>{const a=await store.get<Artifact>('artifact',(req.params as {id:string}).id);if(!a)fail(404,'Artifact missing');await grant(await member(req),a!.projectId);return a;});
+    app.get('/api/workbench/artifacts/:id/diff-file',async req=>store.transaction('diff-file-read',async tx=>{
+        const parent=await store.get<Artifact>('artifact',(req.params as {id:string}).id,tx);if(!parent)fail(404,'Diff artifact missing');
+        await grant(await member(req,tx),parent!.projectId,false,tx);
+        const query=z.object({path:z.string().min(1).max(4096),revision:z.string().length(64),cursor:z.string().max(4096).optional()}).strict().parse(req.query);
+        return readDiffFilePage(store,tx,parent!,query.path,query.revision,query.cursor);
+    }));
     app.post("/api/workbench/projects/:id/messages", async (req) => {
         const u = await member(req);
         const pid = (req.params as {
@@ -1452,9 +1488,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         id: string;
     }).id}`, async (tx) => {
         const r = await leased(req, tx,false,false,false);
+        if(Buffer.byteLength(JSON.stringify(req.body),'utf8')>=1_000_000)fail(413,'Serialized artifact POST must be below 1 MiB');
         const b = z.object({
             generation: z.number(),
-            kind: z.enum(["diff", "qa", "delivery", "source"]),
+            kind: z.enum(["diff", "diff_file_chunk", "qa", "delivery", "source"]),
             revision: text,
             data: z.unknown(),
             requestId: z.string().min(1).max(200)
@@ -1462,6 +1499,21 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (b.data && typeof b.data === 'object' && ('reviewDisposition' in b.data || 'reviewResult' in b.data || 'typedReview' in b.data))
             fail(403, 'Typed review results must use the assigned review endpoint');
         if(b.kind==='delivery')fail(403,'Delivery receipts require the fixed delivery-progress endpoint');
+        if(b.kind==='diff_file_chunk'){
+            const d=z.object({parentArtifactId:z.string().min(1).max(300),projectId:z.string().min(1).max(200),workId:z.string().min(1).max(200),runId:z.string().min(1).max(200),candidateRevision:z.string().regex(/^[a-f0-9]{40,64}$/u),baseRevision:z.string().regex(/^[a-f0-9]{40,64}$/u),diffRevision:z.string().length(64),path:z.string().min(1).max(4096),oldPath:z.string().min(1).max(4096).optional(),chunkIndex:z.number().int().min(0),chunkCount:z.number().int().min(1).max(100000),fileSha256:z.string().regex(/^[a-f0-9]{64}$/u),fileByteLength:z.number().int().min(0).max(1_000_000_000),chunkSha256:z.string().regex(/^[a-f0-9]{64}$/u),contentBase64:z.string().max(400000)}).strict().parse(b.data);
+            if(d.projectId!==r.projectId||d.workId!==r.workId||d.runId!==r.id||d.diffRevision!==b.revision||d.chunkIndex>=d.chunkCount)fail(403,'Diff chunk is outside the assigned run scope');
+            const parent=await store.get<Artifact>('artifact',d.parentArtifactId,tx);
+            if(!parent||parent.kind!=='diff'||parent.projectId!==r.projectId||parent.workId!==r.workId||parent.runId!==r.id||parent.revision!==b.revision)fail(409,'Diff parent artifact is stale or unavailable');
+            const parentData=parent.data as Record<string,unknown>;const expectedDiffRevision=createHash('sha256').update(d.baseRevision).update('\0').update(d.candidateRevision).digest('hex');if(parentData.candidateRevision!==d.candidateRevision||parentData.baseRevision!==d.baseRevision||expectedDiffRevision!==d.diffRevision)fail(409,'Diff chunk candidate binding does not match its parent');
+            const files=Array.isArray(parentData.files)?parentData.files.filter(item=>item&&typeof item==='object') as Array<Record<string,unknown>>:[];const file=files.find(item=>item.path===d.path);
+            if(!file||file.binary===true||file.oldPath!==d.oldPath&&((file.oldPath!==undefined)||d.oldPath!==undefined)||file.chunkCount!==d.chunkCount||file.fileSha256!==d.fileSha256||file.textBytes!==d.fileByteLength)fail(409,'Diff chunk path or content is not in the parent manifest');
+            const bytes=Buffer.from(d.contentBase64,'base64');if(bytes.toString('base64')!==d.contentBase64||bytes.length>256*1024||createHash('sha256').update(bytes).digest('hex')!==d.chunkSha256)fail(400,'Diff chunk encoding, size, or hash is invalid');
+            const expectedRequestId=`diff-file:${d.candidateRevision}:${createHash('sha256').update(d.path).digest('hex')}:${d.chunkIndex}`;if(b.requestId!==expectedRequestId)fail(409,'Diff chunk stable ID does not match its content binding');
+            const sibling=await tx`SELECT data->'data' AS data FROM wb_records WHERE kind='artifact' AND project_id=${r.projectId} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'path'=${d.path} LIMIT 1`;
+            if(sibling[0]){const prior=sibling[0].data as Record<string,unknown>;if(prior.fileSha256!==d.fileSha256||prior.fileByteLength!==d.fileByteLength||prior.chunkCount!==d.chunkCount||prior.candidateRevision!==d.candidateRevision||prior.baseRevision!==d.baseRevision)fail(409,'Diff file content binding conflicts with an earlier chunk');}
+            const id=`artifact:${r.id}:${b.requestId}`,prior=await store.get<Artifact>('artifact',id,tx);if(prior){if(prior.revision!==b.revision||!isDeepStrictEqual(prior.data,d))fail(409,'Diff chunk ID was reused for different content');return prior;}
+            const artifact:Artifact={id,projectId:r.projectId,workId:r.workId,runId:r.id,kind:'diff_file_chunk',revision:b.revision,data:d,createdAt:now()};await store.put('artifact',artifact,tx);return artifact;
+        }
         if(b.data&&typeof b.data==='object'&&'localQaContract' in b.data){
             if(r.kind!=='implementation'||b.kind!=='qa'||b.requestId!==`required-qa:${r.id}:${r.generation}`)fail(403,'Fixed QA snapshots require the implementation parent capture');
             const snapshot=fixedQaSnapshot.parse(b.data);
@@ -1594,16 +1646,17 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await grant(actors[0] as unknown as Member, r.projectId, false, tx);
         const b = z.object({
             generation: z.number(),
-            action: z.enum(["read_context", "read_work", "read_run", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "request_staging_deploy", "request_staging_rollback", "retire_staging_deploy", "submit_review_result", "post_message", "update_settings", "create_skill"]),
+            action: z.enum(["read_context", "read_work", "read_run", "read_diff_file", "create_work", "update_work", "dispatch", "request_delivery", "request_merge", "request_staging_deploy", "request_staging_rollback", "retire_staging_deploy", "submit_review_result", "post_message", "update_settings", "create_skill"]),
             input: z.record(z.string(), z.unknown()),
             requestId: z.string().min(1).max(200)
         }).parse(req.body);
         if (r.kind === 'review') {
-            if (!['read_work', 'read_run', 'submit_review_result'].includes(b.action)) fail(403, 'Reviewer grant is read-only except for its typed result');
+            if (!['read_work', 'read_run', 'read_diff_file', 'submit_review_result'].includes(b.action)) fail(403, 'Reviewer grant is read-only except for assigned evidence and its typed result');
             if (b.action === 'read_work' && (!r.workId || b.input.workId !== r.workId))
                 fail(403, 'Reviewer can read only the assigned Work');
             if (b.action === 'read_run' && (!r.targetRunId || b.input.runId !== r.targetRunId))
                 fail(403, 'Reviewer can read only the assigned candidate run');
+            if(b.action==='read_diff_file'&&(!r.reviewBinding||!r.workId||r.reviewBinding.diffArtifactId!==b.input.diffArtifactId||r.reviewBinding.diffRevision!==b.input.revision))fail(403,'Diff is outside the current review assignment');
         }
         if(b.action==='request_delivery'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request delivery');
         if(b.action==='request_merge'&&(r.kind!=='master'||r.sourceIds?.length))fail(403,'Only a Project Master can request merge');
@@ -1687,6 +1740,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 ...(reviewAssignment ? { reviewAssignment } : {})
             };
         }
+        else if(b.action==='read_diff_file'){
+            if(r.kind!=='review'||!r.reviewBinding||r.reviewBinding.diffArtifactId!==b.input.diffArtifactId||r.reviewBinding.diffRevision!==b.input.revision)fail(403,'Assigned review run required');
+            const binding=r.reviewBinding,candidate=await store.get<Run>('run',binding.candidateRunId,tx),parent=await store.get<Artifact>('artifact',binding.diffArtifactId,tx);
+            const artifacts=await store.list<Artifact>('artifact',r.projectId,tx),latest=artifacts.filter(a=>a.kind==='diff'&&a.workId===r.workId).at(-1);
+            if(!candidate||candidate.kind!=='implementation'||candidate.status!=='completed'||candidate.projectId!==r.projectId||candidate.workId!==r.workId||candidate.id!==r.targetRunId||!parent||parent.kind!=='diff'||parent.runId!==candidate.id||latest?.id!==parent.id||parent.revision!==binding.diffRevision||(parent.data as Record<string,unknown>).candidateRevision!==binding.commitSha)fail(409,'Review assignment or candidate diff is stale');
+            const input=z.object({diffArtifactId:z.string().min(1).max(300),revision:z.string().length(64),path:z.string().min(1).max(4096),cursor:z.string().max(4096).optional()}).strict().parse(b.input);
+            result=await readDiffFilePage(store,tx,parent,input.path,input.revision,input.cursor);
+        }
         else if (b.action === "read_run") {
             const target = await store.get<Run>("run", String(b.input.runId), tx);
             if (target?.projectId !== r.projectId)
@@ -1696,7 +1757,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             result = {
                 run: target,
                 events: (await tx`SELECT data FROM wb_records WHERE kind='event' AND project_id=${r.projectId} AND data->>'runId'=${target!.id} ORDER BY (data->>'sequence')::int LIMIT 500`).map(row=>row.data as RunEvent),
-                artifacts: (await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${r.projectId} AND data->>'runId'=${target!.id} ORDER BY updated_at,id LIMIT 100`).map(row=>row.data as Artifact)
+                artifacts: await store.runArtifacts(r.projectId,target!.id,tx)
             };
         }
         else if (b.action === 'submit_review_result') {

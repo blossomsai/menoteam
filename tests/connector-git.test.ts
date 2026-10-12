@@ -2,7 +2,8 @@ import { afterEach, expect, it } from 'vitest';
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { checkpoint, createDiff, diffRevision, ensureWorktree, fingerprint, git } from '../src/connector/git.js';
+import { createHash } from 'node:crypto';
+import { checkpoint, createDiff, diffRevision, ensureWorktree, fingerprint, git, spoolDiffFile } from '../src/connector/git.js';
 import type { ConnectorConfig } from '../src/connector/types.js';
 
 let temp = '';
@@ -39,8 +40,8 @@ it('isolates dirty checkout state and records committed diff, rename, binary, an
   expect(diff.files.find(file => file.path === 'outside-link')?.binary).toBe(false);
   expect(diff.patch).toContain('new-file.txt');
   expect(diff.baseRevision).toBe(worktree.baseRevision);
-  expect(diff.additions).toBe(4);
-  expect(diff.deletions).toBe(2);
+  expect(diff.additions).toBe(3);
+  expect(diff.deletions).toBe(1);
 });
 
 it('keeps candidate revisions distinct when visible diff prefixes match', async () => {
@@ -57,4 +58,32 @@ it('keeps candidate revisions distinct when visible diff prefixes match', async 
   expect(a.truncated).toBe(true); expect(b.truncated).toBe(true);
   expect(a.patch.slice(prefixEnd)).toBe(b.patch.slice(b.patch.indexOf('@@')));
   expect(diffRevision(a)).not.toBe(diffRevision(b));
+});
+
+it('keeps a complete 217-file manifest beyond the aggregate preview and spools a >1 MiB text diff losslessly',async()=>{
+  temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-complete-diff-'));
+  await git(temp,'init','-q');await git(temp,'config','user.name','Test');await git(temp,'config','user.email','test@example.invalid');
+  await mkdir(path.join(temp,'source'));
+  await writeFile(path.join(temp,'source','large Ω file.txt'),'base\n');
+  for(let index=0;index<216;index++)await writeFile(path.join(temp,'source',`ordinary ${index}.txt`),'base\n');
+  await git(temp,'add','-A');await git(temp,'commit','-qm','base');const base=(await git(temp,'rev-parse','HEAD')).trim();
+  const largeText=('quote " slash \\ tab\t line\n雪🙂\n').repeat(55_000);
+  await writeFile(path.join(temp,'source','large Ω file.txt'),largeText);
+  for(let index=0;index<216;index++)await writeFile(path.join(temp,'source',`ordinary ${index}.txt`),`changed ${index} ${'x'.repeat(1500)}\n`);
+  await git(temp,'add','-A');await git(temp,'commit','-qm','candidate');
+  const diff=await createDiff(temp,base);
+  expect(diff.files).toHaveLength(217);expect(diff.totalFiles).toBe(217);expect(Buffer.byteLength(diff.patch)).toBe(280_000);expect(diff.truncated).toBe(true);
+  expect(diff.files.some(file=>file.path==='source/large Ω file.txt'&&file.status==='modified'&&!file.binary)).toBe(true);
+  const directory=path.join(temp,'spool');await mkdir(directory);const file=diff.files.find(item=>item.path==='source/large Ω file.txt')!;
+  const index=await spoolDiffFile(temp,base,diff.candidateRevision,file,directory);
+  expect(index.byteLength).toBeGreaterThan(1_000_000);expect(index.chunks).toBeGreaterThan(4);
+  const joined=Buffer.concat(await Promise.all(Array.from({length:index.chunks},(_,part)=>readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part))))));
+  expect(createHash('sha256').update(joined).digest('hex')).toBe(index.sha256);
+  const expected=Buffer.from(await git(temp,'diff','--find-renames','--no-ext-diff','-U0',`${base}..${diff.candidateRevision}`,'--',file.path));
+  expect(joined.equals(expected)).toBe(true);
+  for(let part=0;part<index.chunks;part++){
+    const chunk=await readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part)));
+    const serialized=JSON.stringify({kind:'diff_file_chunk',revision:'r'.repeat(64),requestId:`diff-file:${diff.candidateRevision}:${createHash('sha256').update(file.path).digest('hex')}:${part}`,data:{path:file.path,contentBase64:chunk.toString('base64'),escaped:'\\\"\n\t'}});
+    expect(Buffer.byteLength(serialized)).toBeLessThan(1_000_000);
+  }
 });

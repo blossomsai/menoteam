@@ -539,27 +539,42 @@ describe('mounted provider connection settings', () => {
   });
 
   it.each([
-    [{ totalFiles: 1, truncated: false }, 'Showing 1 of 1 changed file', 'This diff is untruncated'],
-    [{ totalFiles: 4, truncated: true }, 'Showing 1 of 4 changed files', 'This diff was truncated'],
-    [{ truncated: true }, 'Showing 1 changed file · total unknown', 'This diff was truncated'],
-    [{ truncated: false }, 'Showing 1 changed file · total unknown', 'This diff is untruncated'],
-    [{}, 'Showing 1 changed file · total unknown', 'Truncation status is unknown'],
-    [{ totalFiles: 0, truncated: false }, 'Showing 1 changed file · total unknown', 'This diff is untruncated'],
-    [{ totalFiles: 1.5, truncated: 'true' }, 'Showing 1 changed file · total unknown', 'Truncation status is unknown'],
+    [{ totalFiles: 1, truncated: false }, 'Showing 1 of 1 changed file', 'Aggregate preview is complete'],
+    [{ totalFiles: 4, truncated: true }, 'Showing 1 of 4 changed files', 'Aggregate preview is truncated'],
+    [{ truncated: true }, 'Showing 1 changed file · total unknown', 'Aggregate preview is truncated'],
+    [{ truncated: false }, 'Showing 1 changed file · total unknown', 'Aggregate preview is complete'],
+    [{}, 'Showing 1 changed file · total unknown', 'Aggregate preview status is unknown'],
+    [{ totalFiles: 0, truncated: false }, 'Showing 1 changed file · total unknown', 'Aggregate preview is complete'],
+    [{ totalFiles: 1.5, truncated: 'true' }, 'Showing 1 changed file · total unknown', 'Aggregate preview status is unknown'],
   ])('renders authoritative shown/total count and truncation honestly', async (metadata, label, truncated) => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
     const work = { id: 'work-1', projectId: project.id, title: 'Diff proof', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
     const artifact = { id: 'diff-1', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'diff' as const, revision: 'diff-revision', createdAt: '2026-10-06T10:00:00.000Z', data: { ...metadata, baseRevision: 'base-sha', additions: 1, deletions: 1, files: [{ path: 'src/example.ts', status: 'modified', binary: false, additions: 1, deletions: 1, hunks: [{ header: '@@ -2 +2 @@', lines: [{ type: 'remove', oldLine: 2, text: 'old' }, { type: 'add', newLine: 2, text: 'new' }] }] }] } };
     const current = { ...snapshot(), works: [work], artifacts: [artifact] } as Snapshot;
     vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(artifact);
+    vi.spyOn(workbenchApi,'diffFile').mockRejectedValue(new Error('Diff reads must remain lazy'));
     await mount(current);
     await flush();
     expect(host.textContent).toContain(label);
     expect(host.querySelector('[role="status"]')?.textContent).toContain(truncated);
-    expect(host.textContent).toContain('old'); expect(host.textContent).toContain('new');
-    expect(host.querySelector('.bg-red-50')).not.toBeNull(); expect(host.querySelector('.bg-emerald-50')).not.toBeNull();
-    expect(host.querySelector('.bg-red-50')?.children[0]?.textContent).toBe('2');
-    expect(host.querySelector('.bg-emerald-50')?.children[1]?.textContent).toBe('2');
+    const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/example.ts'))!;
+    expect(file.open).toBe(false);
+    expect(workbenchApi.diffFile).not.toHaveBeenCalled();
+  });
+
+  it('loads only an expanded file page and follows its bound cursor',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Lazy diff',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const revision='a'.repeat(64),artifact={id:'diff-lazy',projectId:project.id,workId:work.id,runId:'run-lazy',kind:'diff' as const,revision,createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),totalFiles:2,truncated:true,files:[{path:'src/one.ts',status:'modified',binary:false,additions:2,deletions:0,chunkCount:2,textBytes:500000},{path:'src/two.ts',status:'added',binary:false,additions:1,deletions:0,chunkCount:1,textBytes:40}]}};
+    const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce({path:'src/one.ts',binary:false,complete:false,chunkIndex:0,chunkCount:2,contentBase64:btoa('first page'),nextCursor:'opaque-next'}).mockResolvedValueOnce({path:'src/one.ts',binary:false,complete:true,chunkIndex:1,chunkCount:2,contentBase64:btoa('second page'),nextCursor:null});
+    await mount({...snapshot(),works:[work],artifacts:[artifact]} as Snapshot);await flush();
+    expect(read).not.toHaveBeenCalled();
+    const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/one.ts'))!;
+    await flush(()=>{file.open=true;});await flush();
+    expect(read).toHaveBeenCalledTimes(1);expect(read.mock.calls[0]?.slice(0,4)).toEqual([artifact.id,'src/one.ts',revision,undefined]);expect(host.textContent).toContain('first page');
+    const next=[...file.querySelectorAll('button')].find(button=>button.textContent==='Next page')!;await flush(()=>next.click());await flush();
+    expect(read).toHaveBeenCalledTimes(2);expect(read.mock.calls[1]?.[3]).toBe('opaque-next');expect(host.textContent).toContain('second page');
+    const other=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/two.ts'))!;expect(other.open).toBe(false);
   });
 
   it('keeps QA evidence bound to the latest diff revision', async () => {

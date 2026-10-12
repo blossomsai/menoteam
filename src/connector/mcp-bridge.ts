@@ -33,6 +33,7 @@ function tool(name: string, description: string, schema: z.ZodType, action: stri
 tool('read_context', 'Read this project, its Works, conversation, runs, and artifacts.', z.object({}).strict(), 'read_context');
 tool('read_work', 'Read one Work, its conversation, and artifacts.', z.object({ workId }), 'read_work');
 tool('read_run', 'Read a run, its events, and artifacts.', z.object({ runId: workId }), 'read_run');
+tool('read_diff_file', 'Read one bounded page from a file in the current assigned candidate diff.', z.object({ diffArtifactId:workId,revision:z.string().length(64),path:z.string().min(1).max(4096),cursor:z.string().max(4096).optional() }).strict(), 'read_diff_file');
 tool('submit_review_result', 'Submit the structured disposition and findings for this assigned candidate review.', z.object({ disposition: z.enum(['approved','changes_requested','insufficient_evidence']), findings: z.array(z.object({ id: z.string().min(1).max(120), blocking: z.boolean(), summary: z.string().min(1).max(2000) }).strict()).max(100), evidenceArtifactIds: z.array(workId).max(100) }).strict(), 'submit_review_result');
 tool('create_work', 'Create a Work in this project.', createWorkSchema, 'create_work');
 tool('update_work', 'Update a Work overview or status using its current revision.', z.object({ workId, revision: z.number().int().min(1), overview: z.string().max(32_000).optional(), status: z.enum(['queued','in_progress','paused','done']).optional() }).strict(), 'update_work');
