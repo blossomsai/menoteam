@@ -1669,7 +1669,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const scope = `tools:${r.id}`;
         const prior = await tx `SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${b.requestId}`;
         // Reviewer reads observe current policy after the existing lease/actor/scope checks.
-        if (prior[0] && !(r.kind === 'review' && b.action === 'read_work')) {
+        if (prior[0] && !(r.kind === 'review' && ['read_work','read_diff_file'].includes(b.action))) {
             if (skillInput) {
                 const stored = prior[0].result as Record<string, unknown>;
                 const binding = stored && typeof stored === 'object' ? stored.__toolRequest as Record<string, unknown> | undefined : undefined;
@@ -1718,14 +1718,14 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const binding = r.reviewBinding;
                 const candidate = await store.get<Run>('run', binding.candidateRunId, tx);
                 const project = await store.get<Project>('project', r.projectId, tx);
-                const artifacts = await store.list<Artifact>('artifact', r.projectId, tx);
-                const latestDiff = artifacts.filter(a => a.workId === w!.id && a.kind === 'diff').at(-1);
+                const latestDiff = await store.latestWorkDiff(r.projectId,w!.id,tx);
                 const diffData = latestDiff?.data as { candidateRevision?: string } | undefined;
                 const candidateCurrent = candidate?.projectId === r.projectId && candidate.workId === w!.id && candidate.kind === 'implementation' && candidate.status === 'completed'
                     && latestDiff?.id === binding.diffArtifactId && latestDiff.runId === candidate.id && latestDiff.revision === binding.diffRevision && diffData?.candidateRevision === binding.commitSha;
                 const policy = savedQaPolicy(await store.list<Setting>('setting', undefined, tx), r.projectId, project?.repositoryUrl ?? '');
                 const policyMatchesSnapshot = !!policy && sameQaPolicy(candidate?.qaPolicySnapshot, policy);
-                const qaArtifactIds = candidateCurrent && policyMatchesSnapshot ? artifacts.filter(a => binding.qaArtifactIds.includes(a.id) && a.workId === w!.id && a.runId === binding.candidateRunId && a.kind === 'qa' && a.revision === binding.diffRevision
+                const assignedQa = candidateCurrent && policyMatchesSnapshot ? await store.assignedQaArtifacts(r.projectId,w!.id,binding.candidateRunId,binding.qaArtifactIds,tx) : [];
+                const qaArtifactIds = candidateCurrent && policyMatchesSnapshot ? assignedQa.filter(a => binding.qaArtifactIds.includes(a.id) && a.workId === w!.id && a.runId === binding.candidateRunId && a.kind === 'qa' && a.revision === binding.diffRevision
                     && hasRequiredLocalQa(a.data, binding.candidateFingerprint, policy)).map(a => a.id) : [];
                 reviewAssignment = { reviewerRunId: r.id, reviewBinding: binding, currentRequiredQaValidation: {
                     checkedAt: now(), validity: 'at-observation-only', candidateRunId: binding.candidateRunId, commitSha: binding.commitSha,
@@ -1745,7 +1745,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         else if(b.action==='read_diff_file'){
             if(r.kind!=='review'||!r.reviewBinding||r.reviewBinding.diffArtifactId!==b.input.diffArtifactId||r.reviewBinding.diffRevision!==b.input.revision)fail(403,'Assigned review run required');
             const binding=r.reviewBinding,candidate=await store.get<Run>('run',binding.candidateRunId,tx),parent=await store.get<Artifact>('artifact',binding.diffArtifactId,tx);
-            const artifacts=await store.list<Artifact>('artifact',r.projectId,tx),latest=artifacts.filter(a=>a.kind==='diff'&&a.workId===r.workId).at(-1);
+            const latest=await store.latestWorkDiff(r.projectId,r.workId!,tx);
             if(!candidate||candidate.kind!=='implementation'||candidate.status!=='completed'||candidate.projectId!==r.projectId||candidate.workId!==r.workId||candidate.id!==r.targetRunId||!parent||parent.kind!=='diff'||parent.runId!==candidate.id||latest?.id!==parent.id||parent.revision!==binding.diffRevision||(parent.data as Record<string,unknown>).candidateRevision!==binding.commitSha)fail(409,'Review assignment or candidate diff is stale');
             const input=z.object({diffArtifactId:z.string().min(1).max(300),revision:z.string().length(64),path:z.string().min(1).max(4096),cursor:z.string().max(4096).optional()}).strict().parse(b.input);
             result=await readDiffFilePage(store,tx,parent,input.path,input.revision,input.cursor);
@@ -1861,7 +1861,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             }
         }
         const storedResult = skillInput ? { __toolRequest: { action: b.action, runId: r.id, generation: r.generation, requestedBy: r.requestedBy, projectId: r.projectId, scope: skillInput.scope, name: skillInput.name, data: settingData('skill', skillInput.data) }, result } : result;
-        if (!(prior[0] && r.kind === 'review' && b.action === 'read_work')) await tx `INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(storedResult as never)})`;
+        if (!(prior[0] && r.kind === 'review' && ['read_work','read_diff_file'].includes(b.action))) await tx `INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(storedResult as never)})`;
         return result;
     }));
     app.post("/api/workbench/runs/:id/reconcile", async (req) => {

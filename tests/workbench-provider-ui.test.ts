@@ -2,6 +2,7 @@
 import { qaPolicyFixture, requiredQaFixture } from './helpers/local-qa-fixture';
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
 import { workbenchApi, type Snapshot } from '../src/workbench/web/api';
@@ -761,4 +762,49 @@ it('puts execution history after the actual diff and keeps it collapsed without 
   expect(file.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   await flush(()=>{history.open=true;});
   expect(history.textContent).toContain('Implementation run');expect(history.textContent).toContain('Actual execution failed');expect(history.textContent).toContain('failed');
+});
+
+describe('lazy diff review regressions',()=>{
+  function current(file:Record<string,unknown>={}){
+    const work={id:'work-1',projectId:project.id,title:'Diff regression',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const artifact={id:'diff-regression',projectId:project.id,workId:work.id,runId:'run-regression',kind:'diff' as const,revision:'a'.repeat(64),createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),candidateRevision:'c'.repeat(40),files:[{path:'src/regression.ts',status:'modified',binary:false,additions:2,deletions:1,chunkCount:2,textBytes:500_000,...file}]}};
+    return {...snapshot(),works:[work],artifacts:[artifact]} as Snapshot;
+  }
+  function fileDetails(){return [...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/regression.ts'))!;}
+  async function expand(){await flush(()=>{fileDetails().open=true;});await flush();}
+  function page(content:string,index:number,nextCursor:string|null,extra:Record<string,unknown>={}){return {path:'src/regression.ts',binary:false,complete:index===1,chunkIndex:index,chunkCount:2,contentBase64:content,nextCursor,...extra};}
+
+  it('keeps the bound cursor and verification state when invalid UTF-8 pages continue as raw base64',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const first=btoa(String.fromCharCode(0xff,0x61)),second=btoa('valid tail bytes');
+    const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce(page(first,0,'bound-raw-next',{integrity:'pending',incomplete:true})).mockResolvedValueOnce(page(second,1,null,{integrity:'verified',verified:true}));
+    await mount(current());expect(read).not.toHaveBeenCalled();await expand();
+    expect(fileDetails().textContent).toContain(`base64:${first}`);expect(host.textContent).toContain('whole-file SHA-256 is pending');expect(button('Next page').disabled).toBe(false);
+    await flush(()=>button('Next page').click());expect(read.mock.calls[1]?.slice(0,4)).toEqual(['diff-regression','src/regression.ts','a'.repeat(64),'bound-raw-next']);
+    expect(fileDetails().textContent).toContain(`base64:${second}`);expect(host.textContent).toContain('Whole-file SHA-256 verified');expect(host.textContent).toContain('Page 2 of 2');expect(button('Next page').disabled).toBe(true);
+  });
+
+  it('renders +++ and --- hunk content with correct colors and numbers across pages',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce(page(btoa('--- a/file\n+++ b/file\n@@ -7,2 +9,2 @@\n---removed\n+'),0,'hunk-next')).mockResolvedValueOnce(page(btoa('++added\n context\n'),1,null));
+    await mount(current());await expand();const removed=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('---removed'))!;
+    expect(removed.className).toContain('bg-red-100');expect(removed.children[0]?.textContent).toBe('7');await flush(()=>button('Next page').click());
+    const added=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('++added'))!;expect(added.className).toContain('bg-emerald-100');expect(added.children[1]?.textContent).toBe('9');expect(added.getAttribute('aria-label')).toContain('Continuation');
+    const context=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes(' context'))!;expect(context.children[0]?.textContent).toBe('8');expect(context.children[1]?.textContent).toBe('10');
+  });
+
+  it('caps the long-line DOM while the raw-page download preserves every source byte',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const source='@@ -0,0 +1,2 @@\n+'+'x'.repeat(200_000);
+    let saved:NodeBlob|undefined;vi.stubGlobal('Blob',NodeBlob);vi.stubGlobal('URL',class extends URL {static createObjectURL=vi.fn((blob:NodeBlob)=>{saved=blob;return 'blob:diff-page';});static revokeObjectURL=vi.fn();});vi.spyOn(HTMLAnchorElement.prototype,'click').mockImplementation(()=>undefined);
+    vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce(page(btoa(source),0,'long-next')).mockResolvedValueOnce(page(btoa('\n+after\n'),1,null));await mount(current());await expand();
+    const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.length).toBeLessThanOrEqual(1024);expect(rows.every(row=>(row.children[2]?.textContent?.length??0)<=4096)).toBe(true);expect(rows.reduce((sum,row)=>sum+(row.children[2]?.textContent?.length??0),0)).toBeLessThanOrEqual(64*1024);expect(host.textContent).toContain('Page display is limited');
+    await flush(()=>button('Download raw page').click());expect(Buffer.from(await saved!.arrayBuffer()).equals(Buffer.from(source))).toBe(true);await flush(()=>button('Next page').click());const after=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('+after'))!;expect(after.children[1]?.textContent).toBe('2');expect(host.textContent).not.toContain('x'.repeat(100));
+  });
+
+  it('renders existing historical hunks as a partial preview without fetching or claiming full-file verification',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const read=vi.spyOn(workbenchApi,'diffFile').mockRejectedValue(new Error('Historical previews must not fetch missing chunks'));
+    await mount(current({chunkCount:undefined,textBytes:undefined,hunks:[{header:'@@ -3 +5 @@',lines:[{type:'remove',oldLine:3,text:'historical old'},{type:'add',newLine:5,text:'historical new'}]}]}));expect(fileDetails().open).toBe(false);expect(read).not.toHaveBeenCalled();await expand();
+    expect(read).not.toHaveBeenCalled();expect(host.textContent).toContain('Historical partial preview');expect(host.textContent).toContain('full-file integrity is unverified');expect(host.textContent).toContain('historical old');expect(host.textContent).toContain('historical new');expect(host.textContent).not.toContain('Whole-file SHA-256 verified');
+    const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.find(row=>row.textContent?.includes('-historical old'))?.children[0]?.textContent).toBe('3');expect(rows.find(row=>row.textContent?.includes('+historical new'))?.children[1]?.textContent).toBe('5');
+  });
 });

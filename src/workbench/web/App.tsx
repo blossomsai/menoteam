@@ -5,6 +5,7 @@ import { Input } from '../../local/web/src/components/ui/input';
 import { Label } from '../../local/web/src/components/ui/label';
 import { Textarea } from '../../local/web/src/components/ui/textarea';
 import { ProviderConnections } from './ProviderConnections';
+import { DIFF_VISIBLE_CHARS, historicalDiffRows, initialDiffPageState, parseDiffPage, type DiffPageState, type DiffRow } from './diff-page';
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { isCausalMasterWake } from '../types';
 import { hasRequiredLocalQa, qaPolicySnapshot } from '../local-qa';
@@ -708,33 +709,53 @@ function EvidenceSection({title,status,detail}:{title:string;status:string;detai
 
 function FullArtifactCard({artifact}:{artifact:Artifact}){const [full,setFull]=useState<Artifact|null>(null);useEffect(()=>{let active=true;void workbenchApi.artifact(artifact.id).then(value=>{if(active)setFull(value);}).catch(()=>undefined);return()=>{active=false;};},[artifact.id]);return full?<ArtifactCard sessionKey="delivery" artifact={full}/>:<p className="rounded-lg border p-3 text-sm text-muted-foreground">Loading delivery evidence…</p>;}
 
+function DiffRows({rows}:{rows:DiffRow[]}){
+  return <div role="table" aria-label="Unified diff" className="max-h-[32rem] overflow-auto rounded bg-muted font-mono text-xs">{rows.map((line,index)=><div role="row" key={index} aria-label={line.continuation?'Continuation of the same diff line':undefined} className={`grid grid-cols-[3.5rem_3.5rem_1fr] whitespace-pre ${line.type==='add'?'bg-emerald-100 text-emerald-950':line.type==='remove'?'bg-red-100 text-red-950':''}`}><span className="select-none text-right text-muted-foreground">{line.oldLine??''}</span><span className="select-none text-right text-muted-foreground">{line.newLine??''}</span><span>{line.text}</span></div>)}</div>;
+}
+
 function DiffFileViewer({artifactId,revision,file}:{artifactId:string;revision:string;file:DiffFileManifest}){
-  const [busy,setBusy]=useState(false),[page,setPage]=useState(0),[pageLines,setPageLines]=useState<Array<{text:string;oldLine?:number;newLine?:number;type:'context'|'add'|'remove'|'meta'}>>(),[rawPage,setRawPage]=useState(''),[warning,setWarning]=useState(''),[integrity,setIntegrity]=useState(''),[error,setError]=useState('');
-  const cursors=useRef<Array<string|undefined>>([undefined]),lineStates=useRef<Array<{oldLine:number;newLine:number;carry:string}>>([{oldLine:0,newLine:0,carry:''}]),request=useRef<AbortController|null>(null),generation=useRef(0);
+  const historical=!(file.chunkCount&&file.chunkCount>0)&&Array.isArray(file.hunks)&&file.hunks.length>0;
+  const [busy,setBusy]=useState(false),[page,setPage]=useState(0),[pageLines,setPageLines]=useState<DiffRow[]>(),[rawPage,setRawPage]=useState(''),[pageBase64,setPageBase64]=useState(''),[hasNext,setHasNext]=useState(false),[continues,setContinues]=useState(false),[limited,setLimited]=useState(false),[warning,setWarning]=useState(''),[integrity,setIntegrity]=useState(''),[error,setError]=useState('');
+  const cursors=useRef<Array<string|undefined>>([undefined]),lineStates=useRef<DiffPageState[]>([initialDiffPageState()]),unsupportedEncoding=useRef(file.encodingUnsupported===true),request=useRef<AbortController|null>(null),generation=useRef(0);
   useEffect(()=>()=>{generation.current++;request.current?.abort();},[artifactId,file.path,revision]);
   const load=async(index:number)=>{
+    if(historical){const preview=historicalDiffRows(file.hunks);setPageLines(preview.rows);setLimited(preview.truncated);setWarning('Historical partial preview · full-file integrity is unverified.');return;}
     request.current?.abort();const controller=new AbortController();request.current=controller;const current=++generation.current;setBusy(true);setError('');
-    setPageLines(undefined);setRawPage('');setIntegrity('');
-    try{const result=await workbenchApi.diffFile(artifactId,file.path,revision,cursors.current[index],controller.signal);if(current!==generation.current)return;
+    setPageLines(undefined);setRawPage('');setPageBase64('');setIntegrity('');setLimited(false);setContinues(false);setHasNext(false);
+    try{
+      const result=await workbenchApi.diffFile(artifactId,file.path,revision,cursors.current[index],controller.signal);if(current!==generation.current)return;
+      // Persist page identity, navigation and verification before any binary/decode branch returns.
+      setPage(index);setHasNext(!!result.nextCursor);if(result.nextCursor)cursors.current[index+1]=result.nextCursor;
+      setIntegrity(result.integrity==='verified'?'Whole-file SHA-256 verified':result.integrity==='pending'?'Page hash checked; whole-file SHA-256 is pending until the final page':'');
+      setWarning(result.incomplete?result.reason??'Diff upload is incomplete; this page may not represent the full file.':'');
       if(result.binary){setWarning('Binary file change');return;}
-      if(result.contentBase64){const raw=atob(result.contentBase64);const bytes=Uint8Array.from(raw,char=>char.charCodeAt(0));let decoded:string;try{decoded=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}catch{setRawPage(result.contentBase64);setWarning('Unsupported UTF-8 encoding · raw page bytes are retained as base64.');setPage(index);return;}
-        if(result.encodingUnsupported){setRawPage(result.contentBase64);setWarning('Unsupported UTF-8 encoding · raw page bytes are retained as base64.');setPage(index);return;}
-        const state={...(lineStates.current[index]??lineStates.current[0]!)},input=state.carry+decoded,completeLines=input.split('\n');state.carry=completeLines.pop()??'';const rendered:Array<{text:string;oldLine?:number;newLine?:number;type:'context'|'add'|'remove'|'meta'}>=[];
-        for(const line of completeLines){let type:'context'|'add'|'remove'|'meta'='meta',oldLine:number|undefined,newLine:number|undefined;if(line.startsWith('@@ ')){const m=/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/u.exec(line);if(m){state.oldLine=Number(m[1]);state.newLine=Number(m[2]);} }
-          else if(line.startsWith('+')&&!line.startsWith('+++')){type='add';newLine=state.newLine++;}
-          else if(line.startsWith('-')&&!line.startsWith('---')){type='remove';oldLine=state.oldLine++;}
-          else if(line.startsWith(' ')){type='context';oldLine=state.oldLine++;newLine=state.newLine++;}
-          rendered.push({text:line,oldLine,newLine,type});}
-        if(state.carry)rendered.push({text:state.carry,type:'meta'});lineStates.current[index+1]=state;setPageLines(rendered);setPage(index);}
-      if(result.nextCursor){cursors.current[index+1]=result.nextCursor;}
-      setWarning(result.incomplete?result.reason??'Diff upload is incomplete; this page may not represent the full file.':'');setIntegrity(result.integrity==='verified'?'Whole-file SHA-256 verified':result.integrity==='pending'?'Page hash checked; whole-file SHA-256 is pending until the final page':'');
-      if(!result.contentBase64&&!result.complete)setError(result.reason??'Diff page is missing; file is INCOMPLETE.');
+      if(result.contentBase64){
+        setPageBase64(result.contentBase64);const bytes=Uint8Array.from(atob(result.contentBase64),char=>char.charCodeAt(0));let decoded:string;
+        const unsupported=()=>{unsupportedEncoding.current=true;setRawPage(result.contentBase64.slice(0,DIFF_VISIBLE_CHARS));setLimited(result.contentBase64.length>DIFF_VISIBLE_CHARS);setWarning(`Unsupported UTF-8 encoding · raw page bytes are retained as base64.${result.reason?` ${result.reason}`:''}`);};
+        if(result.encodingUnsupported||unsupportedEncoding.current){unsupported();return;}
+        try{decoded=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}catch{unsupported();return;}
+        const before=lineStates.current[index];if(!before)throw new Error('This page has no preceding hunk state. Read the previous page first.');
+        const parsed=parseDiffPage(decoded,before);lineStates.current[index+1]=parsed.state;setPageLines(parsed.rows);setLimited(parsed.truncated);setContinues(parsed.continues);
+      }else if(!result.complete)setError(result.reason??'Diff page is missing; file is INCOMPLETE.');
     }catch(cause){if(!controller.signal.aborted&&current===generation.current)setError(cause instanceof Error?cause.message:'Unable to read this diff page.');}
     finally{if(current===generation.current)setBusy(false);}
   };
+  const downloadPage=()=>{
+    const bytes=Uint8Array.from(atob(pageBase64),char=>char.charCodeAt(0)),url=URL.createObjectURL(new Blob([bytes]));
+    const link=document.createElement('a');link.href=url;link.download=`diff-page-${page+1}.bin`;link.click();setTimeout(()=>URL.revokeObjectURL(url),0);
+  };
   return <details className="overflow-hidden rounded-md border" onToggle={event=>{const expanded=event.currentTarget.open;if(expanded&&!file.binary&&pageLines===undefined&&!rawPage)void load(page);if(!expanded){generation.current++;request.current?.abort();}}}>
-    <summary className="flex cursor-pointer flex-wrap items-center gap-3 bg-muted/30 px-3 py-2 font-mono text-sm"><span className="min-w-0 flex-1 break-all">{file.oldPath?`${file.oldPath} → ${file.path}`:file.path}</span><span className="text-emerald-700">+{file.additions??'—'}</span><span className="text-red-700">−{file.deletions??'—'}</span><Badge variant="outline">{file.status}</Badge>{file.binary&&<Badge variant="secondary">Binary</Badge>}</summary>
-    {file.binary?<p className="p-3 text-sm text-muted-foreground">Binary file change · no text diff is available.</p>:<div className="space-y-2 p-3">{busy&&<p role="status" className="text-xs text-muted-foreground">Loading diff page…</p>}{error&&<p role="alert" className="text-sm text-destructive">{error}</p>}{warning&&<p role="status" className="text-sm text-amber-800">{warning}</p>}{integrity&&<p role="status" className="text-xs text-muted-foreground">{integrity}</p>}{(pageLines||rawPage)&&<><p className="text-xs text-muted-foreground">Page {page+1} of {file.chunkCount??'unknown'} · {file.textBytes??0} bytes</p>{rawPage?<pre aria-label="Unsupported encoding raw page" className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 font-mono text-xs">base64:{rawPage}</pre>:<div role="table" aria-label="Unified diff" className="max-h-[32rem] overflow-auto rounded bg-muted font-mono text-xs">{pageLines?.map((line,index)=><div role="row" key={`${page}:${index}`} className={`grid grid-cols-[3.5rem_3.5rem_1fr] whitespace-pre ${line.type==='add'?'bg-emerald-100 text-emerald-950':line.type==='remove'?'bg-red-100 text-red-950':''}`}><span className="select-none text-right text-muted-foreground">{line.oldLine??''}</span><span className="select-none text-right text-muted-foreground">{line.newLine??''}</span><span>{line.text}</span></div>)}</div>}{lineStates.current[page]?.carry&&<p role="status" className="text-xs text-muted-foreground">A diff line continues across the next byte page.</p>}<div className="flex gap-2"><Button size="sm" variant="outline" disabled={page===0||busy} onClick={()=>void load(page-1)}>Previous page</Button><Button size="sm" variant="outline" disabled={!file.chunkCount||page+1>=file.chunkCount||busy} onClick={()=>void load(page+1)}>Next page</Button></div></>}</div>}
+    <summary className="flex cursor-pointer flex-wrap items-center gap-3 bg-muted/30 px-3 py-2 font-mono text-sm"><span className="min-w-0 flex-1 break-all">{file.oldPath?`${file.oldPath} → ${file.path}`:file.path}</span><span className="text-emerald-700">+{file.additions??'—'}</span><span className="text-red-700">−{file.deletions??'—'}</span><Badge variant="outline">{file.status}</Badge>{file.binary&&<Badge variant="secondary">Binary</Badge>}{historical&&<Badge variant="outline">Historical preview</Badge>}</summary>
+    {file.binary?<p className="p-3 text-sm text-muted-foreground">Binary file change · no text diff is available.</p>:<div className="space-y-2 p-3">
+      {busy&&<p role="status" className="text-xs text-muted-foreground">Loading diff page…</p>}{error&&<p role="alert" className="text-sm text-destructive">{error}</p>}{warning&&<p role="status" className="text-sm text-amber-800">{warning}</p>}{integrity&&<p role="status" className="text-xs text-muted-foreground">{integrity}</p>}
+      {(pageLines||rawPage)&&<>
+        {!historical&&<p className="text-xs text-muted-foreground">Page {page+1} of {file.chunkCount??'unknown'} · {file.textBytes??0} bytes</p>}
+        {rawPage?<pre aria-label="Unsupported encoding raw page" className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 font-mono text-xs">base64:{rawPage}</pre>:<DiffRows rows={pageLines??[]}/>}
+        {continues&&<p role="status" className="text-xs text-muted-foreground">The same diff line continues on the next byte page.</p>}
+        {limited&&<p role="status" className="text-xs text-muted-foreground">Page display is limited.{historical?' Only the stored historical preview is available.':' Download this page for its exact bytes.'}</p>}
+        {!historical&&<div className="flex gap-2"><Button size="sm" variant="outline" disabled={page===0||busy} onClick={()=>void load(page-1)}>Previous page</Button><Button size="sm" variant="outline" disabled={!hasNext||busy} onClick={()=>void load(page+1)}>Next page</Button>{pageBase64&&<Button size="sm" variant="outline" onClick={downloadPage}>Download raw page</Button>}</div>}
+      </>}
+    </div>}
   </details>;
 }
 
@@ -760,7 +781,7 @@ function ArtifactCard({ artifact,sessionKey }: { artifact: Artifact;sessionKey:s
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }
-type DiffFileManifest={path:string;oldPath?:string;status:string;binary:boolean;encodingUnsupported?:boolean;additions:number|null;deletions:number|null;textBytes?:number;chunkCount?:number;fileSha256?:string};
+type DiffFileManifest={path:string;oldPath?:string;status:string;binary:boolean;encodingUnsupported?:boolean;hunks?:unknown;additions:number|null;deletions:number|null;textBytes?:number;chunkCount?:number;fileSha256?:string};
 function isDiffFile(value: unknown): value is DiffFileManifest {
   if (!isRecord(value) || typeof value.path !== 'string' || !['added', 'modified', 'deleted', 'renamed'].includes(String(value.status)) || typeof value.binary !== 'boolean') return false;
   const validCount = (count: unknown) => count === null || typeof count === 'number';

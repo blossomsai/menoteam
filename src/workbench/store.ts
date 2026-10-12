@@ -39,6 +39,14 @@ export class WorkbenchStore {
         const rows=await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${projectId} AND data->>'runId'=${runId} AND data->>'kind'<>'diff_file_chunk' ORDER BY updated_at,id LIMIT 100`;
         return rows.map(r=>r.data as import('./types.js').Artifact);
     }
+    async latestWorkDiff(projectId:string,workId:string,tx=this.sql):Promise<import('./types.js').Artifact|undefined>{
+        const rows=await tx`SELECT jsonb_set(data,'{data}',jsonb_build_object('candidateRevision',data->'data'->'candidateRevision')) AS data FROM wb_records WHERE kind='artifact' AND project_id=${projectId} AND data->>'workId'=${workId} AND data->>'kind'='diff' ORDER BY updated_at DESC,id DESC LIMIT 1`;
+        return rows[0]?.data as import('./types.js').Artifact|undefined;
+    }
+    async assignedQaArtifacts(projectId:string,workId:string,runId:string,artifactIds:string[],tx=this.sql):Promise<import('./types.js').Artifact[]>{
+        const rows=await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${projectId} AND data->>'workId'=${workId} AND data->>'runId'=${runId} AND data->>'kind'='qa' AND id=ANY(${artifactIds}) LIMIT 100`;
+        return rows.map(r=>r.data as import('./types.js').Artifact);
+    }
     async messages(projectId: string, workId: string | undefined, before?: string, after?: string, tx = this.sql): Promise<{messages: import('./types.js').Message[]; nextBefore:string|null}> {
         let time:string|null=null;let cursorId:string|null=null;
         if(before){try{const parsed=JSON.parse(Buffer.from(before,'base64url').toString());if(!Array.isArray(parsed)||parsed.length!==2||typeof parsed[0]!=='string'||typeof parsed[1]!=='string')throw new Error();[time,cursorId]=parsed;}catch{throw Object.assign(new Error('Invalid history cursor'),{statusCode:400});}}

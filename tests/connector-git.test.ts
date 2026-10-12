@@ -91,3 +91,20 @@ it('keeps a complete 217-file manifest beyond the aggregate preview and spools a
 it('marks invalid UTF-8 text diffs unsupported while retaining exact raw spool bytes',async()=>{
   temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-invalid-utf8-'));await git(temp,'init','-q');await git(temp,'config','user.name','Test');await git(temp,'config','user.email','test@example.invalid');await writeFile(path.join(temp,'encoding.bin'),Buffer.from([0x61,0x0a]));await git(temp,'add','-A');await git(temp,'commit','-qm','base');const base=(await git(temp,'rev-parse','HEAD')).trim();await writeFile(path.join(temp,'encoding.bin'),Buffer.from([0xff,0x0a,0x62,0x0a]));await git(temp,'add','-A');await git(temp,'commit','-qm','invalid utf8 candidate');const diff=await createDiff(temp,base),file=diff.files.find(item=>item.path==='encoding.bin')!;expect(file.binary).toBe(false);const directory=path.join(temp,'spool');await mkdir(directory);const index=await spoolDiffFile(temp,base,diff.candidateRevision,file,directory);expect(index.encodingUnsupported).toBe(true);const reconstructed=Buffer.concat(await Promise.all(Array.from({length:index.chunks},(_,part)=>readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part))))));expect(createHash('sha256').update(reconstructed).digest('hex')).toBe(index.sha256);expect(reconstructed.includes(Buffer.from([0xff]))).toBe(true);
 });
+
+it('spools wildcard, pathspec-magic and renamed paths literally without selecting sibling files',async()=>{
+  temp=await mkdtemp(path.join(os.tmpdir(),'menoteam-literal-diff-'));await git(temp,'init','-q');await git(temp,'config','user.name','Test');await git(temp,'config','user.email','test@example.invalid');
+  const names=['wild*.txt','wild-one.txt','question?.txt','questionx.txt','bracket[ab].txt','bracketa.txt',':(glob)*.txt',':(exclude)hidden.txt','hidden.txt','old*.txt','olda.txt','newa.txt'];
+  for(let index=0;index<names.length;index++)await writeFile(path.join(temp,names[index]!),`BASE_MARKER_${index}\n`);
+  await git(temp,'add','-A');await git(temp,'commit','-qm','base');const base=(await git(temp,'rev-parse','HEAD')).trim();
+  for(let index=0;index<names.length;index++)if(names[index]!=='old*.txt')await writeFile(path.join(temp,names[index]!),`CHANGED_MARKER_${index}\n`);
+  await rm(path.join(temp,'old*.txt'));await writeFile(path.join(temp,'new[ab].txt'),'BASE_MARKER_9\n');await git(temp,'add','-A');await git(temp,'commit','-qm','candidate');
+  const diff=await createDiff(temp,base),directory=path.join(temp,'spool');await mkdir(directory);expect(diff.files).toHaveLength(names.length);
+  expect(diff.files.find(file=>file.path==='new[ab].txt')).toMatchObject({oldPath:'old*.txt',status:'renamed'});
+  for(const file of diff.files){
+    const index=await spoolDiffFile(temp,base,diff.candidateRevision,file,directory),chunks=await Promise.all(Array.from({length:index.chunks},(_,part)=>readFile(path.join(directory,createHash('sha256').update(file.path).digest('hex'),String(part))))),bytes=Buffer.concat(chunks);
+    const selected=[...(file.oldPath?[file.oldPath]:[]),file.path],expected=await git(temp,'--literal-pathspecs','diff','--find-renames','--no-ext-diff','-U0',`${base}..${diff.candidateRevision}`,'--',...selected);
+    expect(bytes.toString('utf8')).toBe(expected);expect(expected.match(/^diff --git /gmu)).toHaveLength(1);
+    const paths=(await git(temp,'--literal-pathspecs','diff','--name-only','-z','--find-renames',`${base}..${diff.candidateRevision}`,'--',...selected)).split('\0').filter(Boolean);expect(paths).toEqual([file.path]);
+  }
+});
