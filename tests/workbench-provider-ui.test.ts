@@ -65,6 +65,35 @@ beforeEach(() => {
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
 });
 
+it('shows a saved Agent profile name in the Work composer without exposing its setting ID', async () => {
+  const profileId = 'setting_263d-profile';
+  const work = { id: 'work', projectId: project.id, title: 'Current Work', overview: '', status: 'in_progress' as const, revision: 1, profileId, connectionId: 'provider-1', sources: [], createdAt: '', updatedAt: '' };
+  const current = snapshot(owner, [{ ...profileSetting, id: profileId, name: 'Readable Builder' }]);
+  current.works = [work];
+  window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+  await mount(current);
+
+  const composer = host.querySelector<HTMLInputElement>('input[placeholder="Message Readable Builder…"]');
+  expect(composer?.getAttribute('aria-label')).toBe('Message Readable Builder');
+  expect(composer?.placeholder).toBe('Message Readable Builder…');
+  expect(composer?.outerHTML).not.toContain(profileId);
+  expect(current.works[0]?.profileId).toBe(profileId);
+});
+
+it('falls back to Agent when a saved Work profile is unavailable', async () => {
+  const profileId = 'setting_missing-profile';
+  const work = { id: 'work', projectId: project.id, title: 'Current Work', overview: '', status: 'in_progress' as const, revision: 1, profileId, connectionId: 'provider-1', sources: [], createdAt: '', updatedAt: '' };
+  const current = snapshot();
+  current.works = [work];
+  window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+  await mount(current);
+
+  const composer = host.querySelector<HTMLInputElement>('input[placeholder="Message Agent…"]');
+  expect(composer?.getAttribute('aria-label')).toBe('Message Agent');
+  expect(composer?.placeholder).toBe('Message Agent…');
+  expect(composer?.outerHTML).not.toContain(profileId);
+});
+
 describe('mounted marketplace skill selection', () => {
   const catalogUrl = 'https://github.com/example/catalog/blob/main/marketplace.json';
   const listing = { name: 'Catalog', url: catalogUrl, commit: 'catalog-a', plugins: [{ name: 'alpha', description: '', category: 'Test' }, { name: 'beta', description: '', category: 'Test' }] };
