@@ -23,7 +23,7 @@ async function fixture(overrides:Partial<Run>={}){
     if(query.startsWith('UPDATE wb_connectors')){endpoint.capabilities=copy(values[0] as typeof endpoint.capabilities);endpoint.last_seen=new Date().toISOString();return [];}
     if(query.startsWith('INSERT INTO wb_records')){records.set(`${values[1]}:${values[0]}`,copy(values[3]));return [{id:values[0]}];}
     if(query.includes('FROM wb_records WHERE id=')){const data=records.get(`${values[1]}:${values[0]}`);return data?[{data:copy(data)}]:[];}
-    if(query.includes('FROM wb_records WHERE kind='))return [...records.entries()].filter(([key,data])=>key.startsWith(`${values[0]}:`)&&(values[1]===undefined||data.projectId===values[1])).map(([,data])=>({data:copy(data)}));
+    if(query.includes('FROM wb_records WHERE kind='))return [...records.entries()].filter(([key,data])=>key.startsWith(`${values[0]}:`)&&(!query.includes('project_id=')||data.projectId===values[1])&&(values[0]!=='artifact'||data.kind!=='diff_file_chunk')).map(([,data])=>({data:copy(data)}));
     throw new Error('Unexpected isolated persistence query');
   }) as unknown as Sql;
   sql.json=(value=>copy(value)) as typeof sql.json;
