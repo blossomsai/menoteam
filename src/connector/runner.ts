@@ -68,6 +68,14 @@ export class ConnectorRunner {
   private readonly activeKinds = new Map<string,ClaimedRun['run']['kind']>();
   private readonly activeStagingProcesses = new Map<string,CodexProcessIdentity>();
   private readonly reportedRecovery = new Set<string>();
+  private readonly recoveryAfter = new Map<string,number>();
+  private pollBlockedUntil = 0;
+  private pollingBackoff(error:unknown):boolean {
+    if(!(error instanceof ConnectorHttpError)||error.status!==429)return false;
+    const wait=Math.max(1_000,Math.min(86_400_000,(error.retryAfterSeconds??3)*1_000));
+    this.pollBlockedUntil=Math.max(this.pollBlockedUntil,Date.now()+wait);
+    return true;
+  }
   private readonly spoolWrites = new WeakMap<Spool,Promise<void>>();
   private client?: WorkbenchConnectorClient;
   constructor(private readonly config: ConnectorConfig, private readonly dependencies?: {
@@ -125,8 +133,10 @@ export class ConnectorRunner {
     this.client = this.dependencies?.client(models,discovery.modelReasoningEfforts) ?? new WorkbenchConnectorClient(this.config,fetch,models,discovery.modelReasoningEfforts);
     await this.recover();
     while (!this.closing) {
+      if(Date.now()<this.pollBlockedUntil){await delay(Math.min(1_000,this.pollBlockedUntil-Date.now()));continue;}
       try {
         await this.recover();
+        if(Date.now()<this.pollBlockedUntil)continue;
         if (this.tasks.size >= 2) { await Promise.race(this.tasks); continue; }
         const kinds=[...this.activeKinds.values()];
         const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
@@ -141,7 +151,7 @@ export class ConnectorRunner {
       } catch (error) {
         // Never print server bodies, prompts, tokens, or native command output.
         console.error(error instanceof ConnectorHttpError ? error.safeSummary : 'Connector operation failed; preserved local state');
-        await delay(3000);
+        if(!this.pollingBackoff(error))await delay(3000);
       }
     }
     await Promise.all(this.tasks);
@@ -225,16 +235,22 @@ export class ConnectorRunner {
   private async recover():Promise<void> {
     const directory = path.join(this.config.dataDir,'spool');
     await mkdir(directory,{recursive:true,mode:0o700});
-    for (const file of await readdir(directory)) {
+    if(Date.now()<this.pollBlockedUntil)return;
+    const files=await readdir(directory),present=new Set(files);
+    for(const file of this.recoveryAfter.keys())if(!present.has(file))this.recoveryAfter.delete(file);
+    for (const file of files) {
       if (!/^[a-f0-9]{64}\.json$/.test(file)) continue;
       try {
       const spool = await readJson<Spool>(path.join(directory,file));
       if (!spool || this.activeRuns.has(spool.runId)) continue;
+      if(Date.now()<(this.recoveryAfter.get(file)??0))continue;
+      // Retained evidence stays recoverable without polling each old spool every idle tick.
+      this.recoveryAfter.set(file,Date.now()+30_000);
       const remote = await this.client!.recoveryState(spool.runId,spool.generation);
       if(remote.generation!==spool.generation)continue; // Never stop/release another execution.
-      if(spool.stagingReceipt){try{await this.flush(spool);}catch{/* Durable receipt remains for the next pass. */}continue;}
+      if(spool.stagingReceipt){try{await this.flush(spool);}catch(error){if(this.pollingBackoff(error))break;/* Durable receipt remains for the next pass. */}continue;}
       if(spool.stagingIntent&&spool.completion&&!spool.stagingProcessIdentity&&spool.deliveryExecutor?.stage==='completion'){
-        try{await this.flush(spool);}catch{/* Durable completion remains for the next pass. */}continue;
+        try{await this.flush(spool);}catch(error){if(this.pollingBackoff(error))break;/* Durable completion remains for the next pass. */}continue;
       }
       if(spool.stagingIntent&&spool.deliveryExecutor?.stage==='staging'){
         const executor=spool.deliveryExecutor;let executorStopped=false;
@@ -250,10 +266,10 @@ export class ConnectorRunner {
         if(['paused','cancelled','interrupted'].includes(remote.status)){
           // Local stop proof unlocks resume/retry; it does not resolve the remote
           // deployment. Keep a failed acknowledgement durable for the next pass.
-          if(!remote.stoppedAt||spool.stopped){spool.stopped=true;await this.save(spool);try{await this.flush(spool);}catch{/* Retry only the same-generation local stop acknowledgement. */}}
+          if(!remote.stoppedAt||spool.stopped){spool.stopped=true;await this.save(spool);try{await this.flush(spool);}catch(error){if(this.pollingBackoff(error))break;/* Retry only the same-generation local stop acknowledgement. */}}
           continue;
         }
-        try{await this.reconcileStaging(spool);}catch{/* Unknown remote outcome and reservation stay durable. */}
+        try{await this.reconcileStaging(spool);}catch(error){if(this.pollingBackoff(error))break;/* Unknown remote outcome and reservation stay durable. */}
         continue;
       }
       if(spool.gitStopUnconfirmed){
@@ -340,6 +356,7 @@ export class ConnectorRunner {
       } catch (error) {
         // Keep this spool/reservation intact; it must not block unrelated authorized Work.
         console.error(error instanceof ConnectorHttpError ? error.safeSummary : 'Scoped recovery failed; preserved spool and reservation');
+        if(this.pollingBackoff(error))break;
       }
     }
   }

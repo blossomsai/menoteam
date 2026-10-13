@@ -1979,6 +1979,28 @@ describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
    await sql`DELETE FROM wb_records WHERE id=${runId}`;
   }
  });
+ it('keeps finite read and renewal control available after ordinary Connector traffic exhausts its budget',async()=>{
+  const actor=(await sql`SELECT id FROM wb_users WHERE email=${owner}`)[0]!.id;
+  const project=(await app.inject({method:'POST',url:'/api/workbench/projects',headers:{cookie},payload:{name:'Lease control fixture'}})).json();
+  const connectorId=`rate-control-${suffix}`,raw=randomUUID(),runId=`control-run-${suffix}`,otherRunId=`control-other-${suffix}`;
+  connectorIds.push(connectorId);await sql`INSERT INTO wb_connectors(id,digest,project_ids) VALUES (${connectorId},${digest(raw)},${sql.json([project.id])})`;
+  const stamp=new Date().toISOString(),before=new Date(Date.now()+30000).toISOString();
+  const run:Run={id:runId,projectId:project.id,connectorId,requestedBy:actor,kind:'master',model:'gpt-6.1-sol',reasoning:'medium',prompt:'Fixture',status:'running',generation:1,leaseUntil:before,createdAt:stamp,updatedAt:stamp};
+  const store=new WorkbenchStore(sql);await store.put('run',run);await store.put('run',{...run,id:otherRunId});
+  const headers={authorization:`Bearer ${raw}`};
+  try{
+   for(let n=0;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{}})).statusCode).toBe(204);
+   expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{}})).statusCode).toBe(429);
+   expect((await app.inject({url:`/api/workbench/connector/runs/${runId}`,headers})).statusCode).toBe(200);
+   const renewed=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:1}});expect(renewed.statusCode).toBe(200);expect(Date.parse(renewed.json().leaseUntil)).toBeGreaterThan(Date.parse(before));
+   expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:2}})).statusCode).toBe(409);
+   await sql`UPDATE wb_users SET role='member' WHERE id=${actor}`;await sql`DELETE FROM wb_memberships WHERE project_id=${project.id} AND user_id=${actor}`;
+   expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:1}})).statusCode).toBe(403);await sql`UPDATE wb_users SET role='owner' WHERE id=${actor}`;
+   // The same Connector changing run IDs still shares one finite control budget.
+   for(let n=4;n<180;n++)expect((await app.inject({url:`/api/workbench/connector/runs/${n%2?runId:otherRunId}`,headers})).statusCode).toBe(200);
+   expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${otherRunId}/renew`,headers,payload:{generation:1}})).statusCode).toBe(429);
+  }finally{await sql`UPDATE wb_users SET role='owner' WHERE id=${actor}`;await sql`DELETE FROM wb_memberships WHERE project_id=${project.id}`;await sql`DELETE FROM wb_records WHERE id=ANY(${[runId,otherRunId,project.id]})`;}
+ });
  it('unknown routes remain anonymous even with a valid session',async()=>{
   const key=rateLimitKey(sql);
   expect(await key({ip:'127.0.0.23',routeOptions:{url:'/*'},headers:{cookie}} as FastifyRequest)).toBe('ip:127.0.0.23');
