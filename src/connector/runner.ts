@@ -1,12 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
 import { ZodError } from 'zod';
 import { materializeRunSkills, selectedSkillPrompt, cleanupRunSkills, type RunSkillFiles } from './skill-files.js';
-import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, unlink, rename } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readdir, unlink, rename, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { CodexAppServer, readGitProcessIdentity, terminateVerifiedGitProcessGroup, terminateVerifiedProcessGroup, waitProcessGroup, type CodexProcessIdentity, type GitProcessIdentity } from './codex.js';
 import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
-import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, waitForGit, GitCommandError, type GitOptions } from './git.js';
+import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, spoolDiffFile, waitForGit, GitCommandError, type GitOptions, type DiffFileChunkIndex } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
 import { assertExecutionSelection } from './selection.js';
 import { isPreEffectStagingRun } from '../workbench/types.js';
@@ -26,6 +26,7 @@ interface Spool {
   generation: number;
   events: ConnectorEvent[];
   artifacts: UploadArtifact[];
+  diffFileUpload?: { directory:string; parentArtifactId:string; revision:string; baseRevision:string; candidateRevision:string; projectId:string; workId:string; files:DiffFileChunkIndex[]; fileIndex:number; chunkIndex:number };
   deliveryProgress?: {phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string};
   stagingIntent?: Omit<StagingRequest,'action'|'operationId'>;
   stagingReceipt?: StagingReceipt;
@@ -154,7 +155,7 @@ export class ConnectorRunner {
     this.spoolWrites.set(spool,write);await write;
   }
   private async retainOrRemove(spool:Spool):Promise<void> {
-    if(spool.events.length || spool.artifacts.length || spool.deliveryProgress || spool.stagingReceipt || spool.stagingIntent) {
+    if(spool.events.length || spool.artifacts.length || spool.diffFileUpload || spool.deliveryProgress || spool.stagingReceipt || spool.stagingIntent) {
       const directory=path.join(this.config.dataDir,'unsent-evidence');
       await mkdir(directory,{recursive:true,mode:0o700});
       await rename(this.spoolPath(spool.runId,spool.generation),path.join(directory,`${stateKey(spool.runId,String(spool.generation))}.json`));
@@ -187,6 +188,15 @@ export class ConnectorRunner {
     while (spool.artifacts.length) {
       await client.addArtifact(spool.runId,spool.generation,spool.artifacts[0]!);
       spool.artifacts.shift(); await this.save(spool);
+    }
+    while(spool.diffFileUpload){
+      const upload=spool.diffFileUpload,file=upload.files[upload.fileIndex];
+      if(!file){spool.diffFileUpload=undefined;await this.save(spool);await rm(upload.directory,{recursive:true,force:true});break;}
+      const chunk=await readFile(path.join(upload.directory,createHash('sha256').update(file.path).digest('hex'),String(upload.chunkIndex)));
+      const requestId=`diff-file:${upload.candidateRevision}:${createHash('sha256').update(file.path).digest('hex')}:${upload.chunkIndex}`;
+      const data={parentArtifactId:upload.parentArtifactId,projectId:upload.projectId,workId:upload.workId,runId:spool.runId,candidateRevision:upload.candidateRevision,baseRevision:upload.baseRevision,diffRevision:upload.revision,path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),chunkIndex:upload.chunkIndex,chunkCount:file.chunks,fileSha256:file.sha256,fileByteLength:file.byteLength,chunkSha256:createHash('sha256').update(chunk).digest('hex'),contentBase64:chunk.toString('base64'),...(file.encodingUnsupported?{encodingUnsupported:true}:{})};
+      await client.addArtifact(spool.runId,spool.generation,{kind:'diff_file_chunk',revision:upload.revision,requestId,data});
+      if(++upload.chunkIndex>=file.chunks){upload.fileIndex++;upload.chunkIndex=0;}await this.save(spool);
     }
     if(spool.deliveryProgress){await client.deliveryProgress(spool.runId,spool.generation,spool.deliveryProgress);spool.deliveryProgress=undefined;await this.save(spool);}
     if (spool.stopped) await client.stopped(spool.runId,spool.generation,spool.threadId);
@@ -280,6 +290,10 @@ export class ConnectorRunner {
           if(!spool.processIdentity || !await waitProcessGroup(spool.processIdentity.processGroupId,1)) continue;
           await cleanupRunSkills(spool.skillDirectory); spool.skillDirectory=undefined; await this.save(spool);
         }
+        // A terminal remote run cannot accept a resumed leased upload. Keep the
+        // acknowledged-cursor spool in place so evidence is not silently moved
+        // out of recovery or mistaken for a complete server-side diff.
+        if(spool.diffFileUpload)continue;
         await this.retainOrRemove(spool); continue;
       }
       if(spool.deliveryExecutor&&!spool.completion&&!spool.stopped){
@@ -439,9 +453,15 @@ export class ConnectorRunner {
         await checkpoint(cwd,`Menoteam Work ${claim.run.workId}`,gitOptions);
         const diff = await createDiff(cwd,baseRevision,gitOptions);
         const revision = diffRevision(diff);
+        const directory=path.join(this.config.dataDir,'diff-file-spool',stateKey(claim.run.id,String(claim.run.generation)));
+        await mkdir(directory,{recursive:true,mode:0o700});
+        const fileChunks:DiffFileChunkIndex[]=[];
+        for(const file of diff.files)if(!file.binary){const index=await spoolDiffFile(cwd,baseRevision,diff.candidateRevision,file,directory,gitOptions);file.textBytes=index.byteLength;file.chunkCount=index.chunks;file.fileSha256=index.sha256;file.encodingUnsupported=index.encodingUnsupported===true;fileChunks.push(index);}
         const saved = await readWorktreeMap(this.config.dataDir,claim.run.workId!);
         await persistWorktreeMap(this.config.dataDir,claim.run.workId!,{...saved!,artifactRevision:revision});
         spool.artifacts.push({kind:'diff',revision,data:diff,requestId:`diff:${claim.run.id}:${claim.run.generation}`});
+        spool.diffFileUpload={directory,parentArtifactId:`artifact:${claim.run.id}:diff:${claim.run.id}:${claim.run.generation}`,revision,baseRevision,candidateRevision:diff.candidateRevision,projectId:claim.run.projectId,workId:claim.run.workId!,files:fileChunks,fileIndex:0,chunkIndex:0};
+        await this.save(spool);
         spool.qaExecution={directory:path.join(this.config.dataDir,'qa',randomUUID()),nonce:randomUUID(),phase:'stopped'};await bindQaExecutor(spool.qaExecution);spool.qaInFlight=true;await this.save(spool);
         const currentQaPolicy=savedQaPolicy(claim.settings,claim.run.projectId,claim.project.repositoryUrl);
         const requiredQa=await captureRequiredLocalQa(cwd,{policy:sameQaPolicy(currentQaPolicy,claim.run.qaPolicySnapshot)?claim.run.qaPolicySnapshot:undefined,resources:this.config.qaResources??{},dataDirectory:path.join(this.config.dataDir,'qa'),state:spool.qaExecution,authorize:async()=>{await client.authorizeQaEffect(claim.run.id,claim.run.generation);},signal:runAbort.signal,gitOptions,save:async state=>{spool.qaExecution=state;await this.save(spool);}});

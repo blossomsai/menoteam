@@ -5,6 +5,7 @@ import { Input } from '../../local/web/src/components/ui/input';
 import { Label } from '../../local/web/src/components/ui/label';
 import { Textarea } from '../../local/web/src/components/ui/textarea';
 import { ProviderConnections } from './ProviderConnections';
+import { DIFF_VISIBLE_CHARS, historicalDiffRows, initialDiffPageState, parseDiffPage, type DiffPageState, type DiffRow } from './diff-page';
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { isCausalMasterWake } from '../types';
 import { hasRequiredLocalQa, qaPolicySnapshot } from '../local-qa';
@@ -426,7 +427,7 @@ function WorkDetail({ work, project, snapshot, refresh, setError }: { work: Work
   const canManageStaging=snapshot.member.role==='owner'||snapshot.member.role==='admin'&&['owner','admin'].includes(snapshot.projectRoles?.[project.id]??'');
   return <div className="grid min-h-[calc(100dvh-8.5rem)] gap-6 xl:h-[calc(100dvh-8.5rem)] xl:min-h-0 xl:grid-cols-[minmax(0,1.3fr)_minmax(360px,0.9fr)]">
     <section className="min-w-0 xl:min-h-0 xl:overflow-y-auto"><h1 className="mb-5 text-2xl font-semibold tracking-tight">{work.title}</h1>{tab === 'overview' && <WorkProfileSelector work={work} project={project} snapshot={snapshot} refresh={refresh} setError={setError} />}<nav className="mb-5 flex gap-5 border-b" aria-label="Work details">{(['overview', 'changes', 'qa'] as const).map(item => <a key={item} className={`border-b-2 px-1 py-3 text-sm capitalize no-underline ${tab === item ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground'}`} href={`${href('work-detail', project.id, work.id)}&tab=${item}`}>{item === 'qa' ? 'QA' : item}</a>)}</nav>
-      <WorkArtifacts tab={tab} work={work} project={project} artifacts={snapshot.artifacts.filter(item => item.workId === work.id)} runs={snapshot.runs.filter(item => item.workId === work.id)} projectRuns={snapshot.runs.filter(item => item.projectId === project.id)} settings={snapshot.settings} providerConnections={snapshot.providerConnections ?? []} runtimeProviders={snapshot.runtimeProviders} canManageStaging={canManageStaging} refresh={refresh} setError={setError} />
+      <WorkArtifacts sessionKey={snapshot.member.id} tab={tab} work={work} project={project} artifacts={snapshot.artifacts.filter(item => item.workId === work.id)} runs={snapshot.runs.filter(item => item.workId === work.id)} projectRuns={snapshot.runs.filter(item => item.projectId === project.id)} settings={snapshot.settings} providerConnections={snapshot.providerConnections ?? []} runtimeProviders={snapshot.runtimeProviders} canManageStaging={canManageStaging} refresh={refresh} setError={setError} />
     </section>
     <section className="flex min-h-[32rem] min-w-0 flex-col border-t pt-5 xl:min-h-0 xl:overflow-y-auto xl:border-l xl:border-t-0 xl:pl-6 xl:pt-0" aria-label={`${work.title} conversation`}><div className="mb-3"><h2 className="font-semibold">Conversation</h2><p className="text-xs text-muted-foreground">Master, responsible Agent, subagents, and you</p></div><ConversationPage title="" messages={messages} project={project} snapshot={snapshot} work={work} refresh={refresh} setError={setError} /></section>
   </div>;
@@ -445,7 +446,7 @@ function WorkProfileSelector({ work, project, snapshot, refresh, setError }: { w
   return <div className="mb-5 flex flex-wrap items-center gap-3"><Label htmlFor={`work-profile-${work.id}`}>Agent profile</Label><select id={`work-profile-${work.id}`} className="h-9 min-w-56 rounded-md border bg-background px-3 text-sm" value={work.profileId} disabled={busy} onChange={async event => { setBusy(true); setError(''); try { await workbenchApi.updateWork(work.id, { revision: work.revision, profileId: event.target.value }); await refresh(); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); } }}><option value="">No profile</option>{profiles.map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {profile.projectId ? 'Project' : 'Workspace'}</option>)}</select><span role="status" className="text-xs text-muted-foreground">A queued run snapshots the selected profile’s enabled skill content and provenance.</span></div>;
 }
 
-function WorkArtifacts({ tab, work, project, artifacts, runs, projectRuns, settings, providerConnections, runtimeProviders, canManageStaging, refresh, setError }: { tab: 'overview' | 'changes' | 'qa'; work: Work; project: Project; artifacts: Artifact[]; runs: Run[]; projectRuns: Run[]; settings: Setting[]; providerConnections: NonNullable<Snapshot['providerConnections']>; runtimeProviders: Snapshot['runtimeProviders']; canManageStaging:boolean; refresh:()=>Promise<void>; setError:(value:string)=>void }) {
+function WorkArtifacts({ sessionKey,tab, work, project, artifacts, runs, projectRuns, settings, providerConnections, runtimeProviders, canManageStaging, refresh, setError }: { sessionKey:string;tab: 'overview' | 'changes' | 'qa'; work: Work; project: Project; artifacts: Artifact[]; runs: Run[]; projectRuns: Run[]; settings: Setting[]; providerConnections: NonNullable<Snapshot['providerConnections']>; runtimeProviders: Snapshot['runtimeProviders']; canManageStaging:boolean; refresh:()=>Promise<void>; setError:(value:string)=>void }) {
   const latestDiff = [...artifacts.filter(artifact => artifact.kind === 'diff')].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
   const selected = artifacts.filter(artifact => {
     if (artifact.kind !== (tab === 'changes' ? 'diff' : 'qa') || (tab === 'qa' && latestDiff && artifact.revision !== latestDiff.revision)) return false;
@@ -458,6 +459,7 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, projectRuns, setti
   const [requestId,setRequestId]=useState(()=>crypto.randomUUID());const [deliveryBusy,setDeliveryBusy]=useState(false);
   const [reviewEvidence,setReviewEvidence]=useState<Artifact|null>(null);const [mergeRequestId,setMergeRequestId]=useState(()=>crypto.randomUUID());
   useEffect(() => {
+    if(tab==='changes') { setArtifact(latest??null);setArtifactState('idle');return; }
     if (tab === 'overview' || tab === 'qa' || !latest) { setArtifact(null); setArtifactState('idle'); return; }
     let active = true; setArtifactState('loading'); setArtifact(null);
     void workbenchApi.artifact(latest.id).then(result => {
@@ -478,7 +480,7 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, projectRuns, setti
   const priorPr=[...runs].reverse().find(run=>run.kind==='delivery'&&run.operation?.action==='create_draft_pr'&&run.status==='completed'&&run.operation.phase==='pr_created');
   const typedReview=isRecord(reviewEvidence?.data)&&isRecord(reviewEvidence.data.typedReview)?reviewEvidence.data.typedReview:null;
   useEffect(()=>{if(tab!=='overview'||!priorPr)return;let active=true;const candidates=artifacts.filter(item=>item.kind==='qa'&&runs.some(run=>run.id===item.runId&&run.kind==='review'&&run.status==='completed'));void Promise.all(candidates.map(item=>workbenchApi.artifact(item.id).catch(()=>null))).then(values=>{if(active)setReviewEvidence(values.find(item=>item&&isRecord(item.data)&&isRecord(item.data.typedReview)&&item.data.typedReview.disposition==='approved'&&item.data.typedReview.candidateRunId===priorPr.operation?.candidateRunId&&item.data.typedReview.commitSha===priorPr.operation?.commitSha)??null);});return()=>{active=false;};},[tab,priorPr?.id,artifacts,runs]);
-  if(tab==='qa')return <QaEvidencePanel work={work} latestDiff={latestDiff} artifacts={artifacts} runs={runs}/>;
+  if(tab==='qa')return <QaEvidencePanel sessionKey={sessionKey} work={work} latestDiff={latestDiff} artifacts={artifacts} runs={runs}/>;
   if (tab === 'overview') {
     const latestRun = [...runs].filter(run => run.kind === 'implementation' || run.kind === 'review').sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     const execution = latestRun?.execution;
@@ -513,7 +515,7 @@ function WorkArtifacts({ tab, work, project, artifacts, runs, projectRuns, setti
     {!selected.length && !relatedRuns.length && deliveries.length===0 ? <div className="rounded-lg border border-dashed p-6 text-sm text-muted-foreground">No change evidence has been recorded yet.</div> : <>
       {selected.length > 0 && artifactState === 'loading' && <p role="status" className="rounded-lg border p-4 text-sm text-muted-foreground">Loading latest evidence…</p>}
       {artifactState === 'error' && <p role="alert" className="rounded-lg border border-destructive/30 p-4 text-sm text-destructive">Could not load the latest evidence.</p>}
-      {artifact && <ArtifactCard key={artifact.id} artifact={artifact} />}
+      {artifact && <ArtifactCard key={`${sessionKey}:${artifact.id}:${artifact.revision}`} sessionKey={sessionKey} artifact={artifact} />}
       {relatedRuns.length>0&&<details className="rounded-lg border p-3"><summary className="cursor-pointer text-sm font-medium">Execution history · {relatedRuns.length} runs</summary><div className="mt-3 space-y-3">{relatedRuns.map(run => <div key={run.id} className="rounded-lg border p-3"><div className="flex items-center justify-between gap-2"><strong className="text-sm">{run.kind === 'review' ? 'Review run' : 'Implementation run'}</strong><Badge variant="outline" className="capitalize">{run.status}</Badge></div>{run.error && <p className="mt-2 text-sm text-destructive">{run.error}</p>}<p className="mt-2 text-xs text-muted-foreground">Updated {new Date(run.updatedAt).toLocaleString()}</p></div>)}</div></details>}
     </>}
   </section>;
@@ -605,7 +607,7 @@ function StagingOverview({work,project,runs,allRuns,settings,runtimeProviders,ca
     </article>;})}
   </section>;
 }
-function QaEvidencePanel({work,latestDiff,artifacts,runs}:{work:Work;latestDiff:Artifact|undefined;artifacts:Artifact[];runs:Run[]}){
+function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey:string;work:Work;latestDiff:Artifact|undefined;artifacts:Artifact[];runs:Run[]}){
   const candidate=latestDiff&&runs.find(run=>run.id===latestDiff.runId&&run.kind==='implementation');
   const candidateReviews=runs.filter(run=>run.kind==='review'&&run.workId===work.id&&run.reviewBinding?.candidateRunId===candidate?.id&&run.reviewBinding?.diffRevision===latestDiff?.revision);
   const latestBoundReview=[...candidateReviews].sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0];
@@ -695,7 +697,7 @@ function QaEvidencePanel({work,latestDiff,artifacts,runs}:{work:Work;latestDiff:
       <EvidenceSection title="Required checks" status={requiredStatus} detail={requiredDetail}/>
       <EvidenceSection title="Command checks" status={commandStatus} detail={commandDetail}/>
       <section className="space-y-2 rounded-lg border p-3"><header className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">Typed review</h3><Badge variant={statusVariant(reviewStatus)}>{reviewStatus==='Current'?'Current evidence':reviewStatus}</Badge></header><p className="text-sm text-muted-foreground">{reviewRun?`Run ${reviewRun.id} · ${reviewMatches?String(reviewData.disposition):reviewStatus==='Stale'?'does not match the latest candidate':'result unavailable'}`:'No review is recorded.'}</p>{reviewMatches&&Array.isArray(reviewData.findings)&&reviewData.findings.map((item,index)=>isRecord(item)?<p key={String(item.id??index)} className="text-sm">{item.blocking===true?'Blocking · ':''}{String(item.summary??'Finding')}</p>:null)}{reviewStatus==='Stale'&&<p className="text-xs text-amber-800">This review does not match the latest candidate and cannot approve it.</p>}</section>
-      <details className="rounded-lg border"><summary className="cursor-pointer px-3 py-2 text-sm">Evidence details</summary><div className="space-y-3 p-3">{diff&&<ArtifactCard artifact={diff}/ >}{localQa&&loaded[localQa.id]&&<ArtifactCard artifact={loaded[localQa.id]!}/ >}{commandQa&&loaded[commandQa.id]&&<ArtifactCard artifact={loaded[commandQa.id]!}/ >}{reviewArtifact&&reviewMatches&&<ArtifactCard artifact={reviewArtifact}/>}</div></details>
+      <details className="rounded-lg border"><summary className="cursor-pointer px-3 py-2 text-sm">Evidence details</summary><div className="space-y-3 p-3">{diff&&<ArtifactCard sessionKey={sessionKey} artifact={diff}/ >}{localQa&&loaded[localQa.id]&&<ArtifactCard sessionKey={sessionKey} artifact={loaded[localQa.id]!}/ >}{commandQa&&loaded[commandQa.id]&&<ArtifactCard sessionKey={sessionKey} artifact={loaded[commandQa.id]!}/ >}{reviewArtifact&&reviewMatches&&<ArtifactCard sessionKey={sessionKey} artifact={reviewArtifact}/>}</div></details>
     </>}
   </section>;
 }
@@ -705,9 +707,66 @@ function EvidenceSection({title,status,detail}:{title:string;status:string;detai
   return <section aria-label={title} className="space-y-2 rounded-lg border p-3"><header className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">{title}</h3><Badge variant={variant}>{status==='Current'?'Current evidence':status}</Badge></header><p className="text-sm text-muted-foreground">{detail}</p></section>;
 }
 
-function FullArtifactCard({artifact}:{artifact:Artifact}){const [full,setFull]=useState<Artifact|null>(null);useEffect(()=>{let active=true;void workbenchApi.artifact(artifact.id).then(value=>{if(active)setFull(value);}).catch(()=>undefined);return()=>{active=false;};},[artifact.id]);return full?<ArtifactCard artifact={full}/>:<p className="rounded-lg border p-3 text-sm text-muted-foreground">Loading delivery evidence…</p>;}
+function FullArtifactCard({artifact}:{artifact:Artifact}){const [full,setFull]=useState<Artifact|null>(null);useEffect(()=>{let active=true;void workbenchApi.artifact(artifact.id).then(value=>{if(active)setFull(value);}).catch(()=>undefined);return()=>{active=false;};},[artifact.id]);return full?<ArtifactCard sessionKey="delivery" artifact={full}/>:<p className="rounded-lg border p-3 text-sm text-muted-foreground">Loading delivery evidence…</p>;}
 
-function ArtifactCard({ artifact }: { artifact: Artifact }) {
+function DiffRows({rows}:{rows:DiffRow[]}){
+  return <div role="table" aria-label="Unified diff" className="max-h-[32rem] overflow-auto rounded bg-muted font-mono text-xs">{rows.map((line,index)=><div role="row" key={index} data-line-end={line.terminated?'true':undefined} aria-label={line.continuation?'Continuation of the same diff line':undefined} className={`grid grid-cols-[3.5rem_3.5rem_1fr] whitespace-pre ${line.type==='add'?'bg-emerald-100 text-emerald-950':line.type==='remove'?'bg-red-100 text-red-950':''}`}><span className="select-none text-right text-muted-foreground">{line.oldLine??''}</span><span className="select-none text-right text-muted-foreground">{line.newLine??''}</span><span>{line.text}</span></div>)}</div>;
+}
+
+function DiffFileViewer({artifactId,revision,file}:{artifactId:string;revision:string;file:DiffFileManifest}){
+  const historical=!(file.chunkCount&&file.chunkCount>0)&&Array.isArray(file.hunks)&&file.hunks.length>0;
+  const [busy,setBusy]=useState(false),[page,setPage]=useState(0),[pageLines,setPageLines]=useState<DiffRow[]>(),[rawPage,setRawPage]=useState(''),[pageBase64,setPageBase64]=useState(''),[hasNext,setHasNext]=useState(false),[continues,setContinues]=useState(false),[limited,setLimited]=useState(false),[portion,setPortion]=useState(0),[nextPortion,setNextPortion]=useState<number|null>(null),[warning,setWarning]=useState(''),[integrity,setIntegrity]=useState(''),[error,setError]=useState('');
+  const cursors=useRef<Array<string|undefined>>([undefined]),lineStates=useRef<DiffPageState[]>([initialDiffPageState()]),unsupportedEncoding=useRef(file.encodingUnsupported===true),request=useRef<AbortController|null>(null),generation=useRef(0);
+  const portionOffsets=useRef([0]),presentation=useRef<{text?:string;base64:string;before?:DiffPageState;unsupported:boolean}|null>(null);
+  const showPortion=(offset:number)=>{
+    const saved=presentation.current;if(!saved)return;
+    if(saved.unsupported){const end=Math.min(saved.base64.length,offset+DIFF_VISIBLE_CHARS);setRawPage(saved.base64.slice(offset,end));setNextPortion(end<saved.base64.length?end:null);setLimited(end<saved.base64.length);}
+    else if(saved.text!==undefined&&saved.before){const parsed=parseDiffPage(saved.text,saved.before,offset);setPageLines(parsed.rows);setNextPortion(parsed.nextOffset);setLimited(parsed.truncated);}
+  };
+  const navigatePortion=(index:number)=>{const offset=index>portion?nextPortion:portionOffsets.current[index];if(offset===null||offset===undefined)return;portionOffsets.current[index]=offset;setPortion(index);showPortion(offset);};
+  useEffect(()=>()=>{generation.current++;request.current?.abort();},[artifactId,file.path,revision]);
+  const load=async(index:number)=>{
+    if(historical){const preview=historicalDiffRows(file.hunks);setPageLines(preview.rows);setLimited(preview.truncated);setWarning('Historical partial preview · full-file integrity is unverified.');return;}
+    request.current?.abort();const controller=new AbortController();request.current=controller;const current=++generation.current;setBusy(true);setError('');
+    setPageLines(undefined);setRawPage('');setPageBase64('');setIntegrity('');setLimited(false);setContinues(false);setHasNext(false);setPortion(0);setNextPortion(null);portionOffsets.current=[0];presentation.current=null;
+    try{
+      const result=await workbenchApi.diffFile(artifactId,file.path,revision,cursors.current[index],controller.signal);if(current!==generation.current)return;
+      // Persist page identity, navigation and verification before any binary/decode branch returns.
+      setPage(index);setHasNext(!!result.nextCursor);if(result.nextCursor)cursors.current[index+1]=result.nextCursor;
+      setIntegrity(result.integrity==='verified'?'Whole-file SHA-256 verified':result.integrity==='pending'?'Page hash checked; whole-file SHA-256 is pending until the final page':'');
+      setWarning(result.incomplete?result.reason??'Diff upload is incomplete; this page may not represent the full file.':'');
+      if(result.binary){setWarning('Binary file change');return;}
+      if(result.contentBase64){
+        setPageBase64(result.contentBase64);const bytes=Uint8Array.from(atob(result.contentBase64),char=>char.charCodeAt(0));let decoded:string;
+        const unsupported=()=>{unsupportedEncoding.current=true;presentation.current={base64:result.contentBase64,unsupported:true};showPortion(0);setWarning(`Unsupported UTF-8 encoding · raw page bytes are retained as base64.${result.reason?` ${result.reason}`:''}`);};
+        if(result.encodingUnsupported||unsupportedEncoding.current){unsupported();return;}
+        try{decoded=new TextDecoder('utf-8',{fatal:true}).decode(bytes);}catch{unsupported();return;}
+        const before=lineStates.current[index];if(!before)throw new Error('This page has no preceding hunk state. Read the previous page first.');
+        const parsed=parseDiffPage(decoded,before);lineStates.current[index+1]=parsed.state;presentation.current={text:decoded,base64:result.contentBase64,before,unsupported:false};setPageLines(parsed.rows);setLimited(parsed.truncated);setNextPortion(parsed.nextOffset);setContinues(parsed.continues);
+      }else if(!result.complete)setError(result.reason??'Diff page is missing; file is INCOMPLETE.');
+    }catch(cause){if(!controller.signal.aborted&&current===generation.current)setError(cause instanceof Error?cause.message:'Unable to read this diff page.');}
+    finally{if(current===generation.current)setBusy(false);}
+  };
+  const downloadPage=()=>{
+    const bytes=Uint8Array.from(atob(pageBase64),char=>char.charCodeAt(0)),url=URL.createObjectURL(new Blob([bytes]));
+    const link=document.createElement('a');link.href=url;link.download=`diff-page-${page+1}.bin`;link.click();setTimeout(()=>URL.revokeObjectURL(url),0);
+  };
+  return <details className="overflow-hidden rounded-md border" onToggle={event=>{const expanded=event.currentTarget.open;if(expanded&&!file.binary&&pageLines===undefined&&!rawPage)void load(page);if(!expanded){generation.current++;request.current?.abort();}}}>
+    <summary className="flex cursor-pointer flex-wrap items-center gap-3 bg-muted/30 px-3 py-2 font-mono text-sm"><span className="min-w-0 flex-1 break-all">{file.oldPath?`${file.oldPath} → ${file.path}`:file.path}</span><span className="text-emerald-700">+{file.additions??'—'}</span><span className="text-red-700">−{file.deletions??'—'}</span><Badge variant="outline">{file.status}</Badge>{file.binary&&<Badge variant="secondary">Binary</Badge>}{historical&&<Badge variant="outline">Historical preview</Badge>}</summary>
+    {file.binary?<p className="p-3 text-sm text-muted-foreground">Binary file change · no text diff is available.</p>:<div className="space-y-2 p-3">
+      {busy&&<p role="status" className="text-xs text-muted-foreground">Loading diff page…</p>}{error&&<p role="alert" className="text-sm text-destructive">{error}</p>}{warning&&<p role="status" className="text-sm text-amber-800">{warning}</p>}{integrity&&<p role="status" className="text-xs text-muted-foreground">{integrity}</p>}
+      {(pageLines||rawPage)&&<>
+        {!historical&&<p className="text-xs text-muted-foreground">Page {page+1} of {file.chunkCount??'unknown'} · {file.textBytes??0} bytes</p>}
+        {rawPage?<pre aria-label="Unsupported encoding raw page" className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-3 font-mono text-xs">base64:{rawPage}</pre>:<DiffRows rows={pageLines??[]}/>}
+        {continues&&<p role="status" className="text-xs text-muted-foreground">The same diff line continues on the next byte page.</p>}
+        {limited&&<p role="status" className="text-xs text-muted-foreground">Page display is limited.{historical?' Only the stored historical preview is available.':' Continue with More of this page to read all remaining text in app.'}</p>}
+        {!historical&&<><p aria-label="Current page portion" className="text-xs text-muted-foreground">Portion {portion+1} of this page</p><div className="flex gap-2"><Button size="sm" variant="outline" disabled={portion===0||busy} onClick={()=>navigatePortion(portion-1)}>Previous portion</Button><Button size="sm" variant="outline" disabled={nextPortion===null||busy} onClick={()=>navigatePortion(portion+1)}>More of this page</Button></div><div className="flex gap-2"><Button size="sm" variant="outline" disabled={page===0||busy} onClick={()=>void load(page-1)}>Previous page</Button><Button size="sm" variant="outline" disabled={!hasNext||busy} onClick={()=>void load(page+1)}>Next page</Button>{pageBase64&&<Button size="sm" variant="outline" onClick={downloadPage}>Download raw page</Button>}</div></>}
+      </>}
+    </div>}
+  </details>;
+}
+
+function ArtifactCard({ artifact,sessionKey }: { artifact: Artifact;sessionKey:string }) {
   const data = isRecord(artifact.data) ? artifact.data : {};
   if(artifact.kind==='delivery'){const url=typeof data.pullRequestUrl==='string'?data.pullRequestUrl:'';const phase=typeof data.phase==='string'?data.phase:'queued';const action=data.action==='merge_pr'?'Merge receipt':'Draft PR delivery';return <section className="rounded-lg border p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div><strong className="text-sm">{action}</strong><p className="mt-1 text-xs text-muted-foreground">{url?<a href={url} target="_blank" rel="noreferrer">{url}</a>:`${phase} · ${String(data.operationId??artifact.runId)}`}</p></div><Badge variant={phase==='merged'?'secondary':'outline'}>{phase.replace('_',' ')}</Badge></div>{typeof data.commitSha==='string'&&<p className="mt-2 break-all font-mono text-[11px] text-muted-foreground">Candidate · {data.commitSha}</p>}{typeof data.mergeSha==='string'&&<p className="mt-1 break-all font-mono text-[11px] text-muted-foreground">Merged commit · {data.mergeSha}</p>}</section>;}
   if (artifact.kind === 'diff') {
@@ -715,8 +774,8 @@ function ArtifactCard({ artifact }: { artifact: Artifact }) {
     const totalFiles = typeof data.totalFiles === 'number' && Number.isSafeInteger(data.totalFiles) && data.totalFiles >= files.length ? data.totalFiles : undefined;
     const shown = `${files.length} changed file${files.length === 1 ? '' : 's'}`;
     const fileCount = totalFiles === undefined ? `Showing ${shown} · total unknown` : `Showing ${files.length} of ${totalFiles} changed file${totalFiles === 1 ? '' : 's'}`;
-    const diffStatus = data.truncated === true ? 'This diff was truncated; some changes are not shown.' : data.truncated === false ? 'This diff is untruncated.' : 'Truncation status is unknown.';
-    return <section className="space-y-3 rounded-lg border p-3"><header className="flex flex-wrap items-center justify-between gap-3"><div><strong>{fileCount}</strong><p className="text-xs text-muted-foreground">Base {String(data.baseRevision ?? 'unknown')}</p></div><span className="font-mono text-sm"><span className="text-emerald-700">+{Number(data.additions) || 0}</span> <span className="text-red-700">−{Number(data.deletions) || 0}</span></span></header><p role="status" className={`text-xs ${data.truncated === true ? 'text-amber-800' : 'text-muted-foreground'}`}>{diffStatus}</p>{files.map(file => <details key={`${file.path}:${file.status}`} className="overflow-hidden rounded-md border"><summary className="flex cursor-pointer flex-wrap items-center gap-3 bg-muted/30 px-3 py-2 font-mono text-sm"><span aria-hidden="true">▸</span><span className="min-w-0 flex-1 break-all">{file.path}</span><span className="text-emerald-700">+{file.additions ?? '—'}</span><span className="text-red-700">−{file.deletions ?? '—'}</span><Badge variant="outline">{file.status}</Badge></summary>{file.binary ? <p className="p-3 text-sm text-muted-foreground">Binary file change</p> : <div className="max-h-[32rem] overflow-auto font-mono text-xs">{file.hunks.map((hunk, index) => <div key={index}><div className="bg-blue-50 px-3 py-1 text-blue-900">{hunk.header}</div>{hunk.lines.map((line, lineIndex) => <div key={lineIndex} className={`grid grid-cols-[3rem_3rem_1fr] whitespace-pre ${line.type === 'add' ? 'bg-emerald-50 text-emerald-900' : line.type === 'remove' ? 'bg-red-50 text-red-900' : ''}`}><span className="select-none text-right opacity-60">{line.oldLine ?? ''}</span><span className="select-none text-right opacity-60">{line.newLine ?? ''}</span><span className="px-2">{line.type === 'add' ? '+' : line.type === 'remove' ? '−' : ' '}{line.text}</span></div>)}</div>)}</div>}</details>)}</section>;
+    const diffStatus = data.truncated === true ? 'Aggregate preview is truncated; the complete file manifest is listed below.' : data.truncated === false ? 'Aggregate preview is complete.' : 'Aggregate preview status is unknown.';
+    return <section className="space-y-3 rounded-lg border p-3"><header className="flex flex-wrap items-center justify-between gap-3"><div><strong>{fileCount}</strong><p className="text-xs text-muted-foreground">Base {String(data.baseRevision ?? 'unknown')}</p></div><span className="font-mono text-sm"><span className="text-emerald-700">+{Number(data.additions) || 0}</span> <span className="text-red-700">−{Number(data.deletions) || 0}</span></span></header><p role="status" className="text-xs text-muted-foreground">{diffStatus} Per-file text loads only when expanded.</p>{files.map(file => <DiffFileViewer key={`${sessionKey}:${artifact.projectId}:${artifact.workId}:${artifact.runId}:${artifact.id}:${artifact.revision}:${String(data.candidateRevision??'')}:${file.path}:${file.status}`} artifactId={artifact.id} revision={artifact.revision} file={file}/>)}</section>;
   }
   if (artifact.kind === 'qa') {
     const typedReview = isRecord(data.typedReview) ? data.typedReview : null;
@@ -729,10 +788,11 @@ function ArtifactCard({ artifact }: { artifact: Artifact }) {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> { return Boolean(value) && typeof value === 'object' && !Array.isArray(value); }
-function isDiffFile(value: unknown): value is { path: string; status: string; binary: boolean; additions: number | null; deletions: number | null; hunks: Array<{ header: string; lines: Array<{ type: string; oldLine?: number; newLine?: number; text: string }> }> } {
-  if (!isRecord(value) || typeof value.path !== 'string' || !['added', 'modified', 'deleted', 'renamed'].includes(String(value.status)) || typeof value.binary !== 'boolean' || !Array.isArray(value.hunks)) return false;
+type DiffFileManifest={path:string;oldPath?:string;status:string;binary:boolean;encodingUnsupported?:boolean;hunks?:unknown;additions:number|null;deletions:number|null;textBytes?:number;chunkCount?:number;fileSha256?:string};
+function isDiffFile(value: unknown): value is DiffFileManifest {
+  if (!isRecord(value) || typeof value.path !== 'string' || !['added', 'modified', 'deleted', 'renamed'].includes(String(value.status)) || typeof value.binary !== 'boolean') return false;
   const validCount = (count: unknown) => count === null || typeof count === 'number';
-  return validCount(value.additions) && validCount(value.deletions) && value.hunks.every(hunk => isRecord(hunk) && typeof hunk.header === 'string' && Array.isArray(hunk.lines) && hunk.lines.every(line => isRecord(line) && ['context', 'add', 'remove'].includes(String(line.type)) && typeof line.text === 'string' && (line.oldLine === undefined || typeof line.oldLine === 'number') && (line.newLine === undefined || typeof line.newLine === 'number')));
+  return validCount(value.additions) && validCount(value.deletions) && (value.oldPath===undefined||typeof value.oldPath==='string');
 }
 
 function ConnectProject({ refresh, setError }: { refresh: () => Promise<void>; setError: (value: string) => void }) {

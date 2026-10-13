@@ -96,8 +96,10 @@ export class WorkbenchConnectorClient {
   }
 
   addArtifact(runId: string, generation: number, artifact: UploadArtifact): Promise<Artifact> {
+    const body={ generation, ...artifact };
+    if(Buffer.byteLength(JSON.stringify(body),'utf8')>=1_000_000)throw new Error('Serialized artifact POST must be below 1 MiB');
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/artifacts`, {
-      method: 'POST', body: { generation, ...artifact },
+      method: 'POST', body,
     });
   }
   deliveryProgress(runId:string,generation:number,input:{phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string}):Promise<{run:Run;artifact:Artifact}>{return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/delivery-progress`,{method:'POST',body:{generation,...input}});}
@@ -187,7 +189,7 @@ function validateResponse(path: string, value: unknown): unknown {
   if (path.endsWith('/bridge-token')) return z.object({ token: z.string().min(32), expiresAt: z.string() }).parse(value);
   if (path.endsWith('/events')) return z.object({ accepted: z.boolean() }).parse(value);
   if (path.endsWith('/tools')) return z.record(z.string(), z.unknown()).parse(value);
-  if (path.includes('/artifacts')) return z.object({ id: z.string(), kind: z.enum(['diff','qa','delivery','source']), revision: z.string(), data: z.unknown() }).passthrough().parse(value);
+  if (path.includes('/artifacts')) return z.object({ id: z.string(), kind: z.enum(['diff','diff_file_chunk','qa','delivery','source']), revision: z.string(), data: z.unknown() }).passthrough().parse(value);
   if (path.endsWith('/qa-authorize')) return z.object({authorized:z.literal(true)}).strict().parse(value);
   if (path.endsWith('/delivery-authorize')) return z.object({ authorized: z.literal(true), repositoryUrl: z.string().url() }).parse(value);
   if (path.endsWith('/delivery-progress')) return z.object({

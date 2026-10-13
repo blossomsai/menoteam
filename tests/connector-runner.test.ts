@@ -1,5 +1,6 @@
 import { withRecoveryState } from './helpers/connector-recovery.js';
-import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -63,6 +64,26 @@ describe('Integrated connector lifecycle',()=>{
       }
     }finally{if(timer)clearTimeout(timer);await runner.stop();log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
   });
+    it('resumes a partially acknowledged diff upload from the same durable candidate cursor',async()=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-diff-resume-')),uploadDir=path.join(dataDir,'diff-file-spool','candidate');await mkdir(path.join(uploadDir,createHash('sha256').update('src/雪 file.ts').digest('hex')),{recursive:true});
+    const parts=[Buffer.from('first\n'),Buffer.from('second\n')],fileHash=createHash('sha256').update(Buffer.concat(parts)).digest('hex');for(let index=0;index<parts.length;index++)await writeFile(path.join(uploadDir,createHash('sha256').update('src/雪 file.ts').digest('hex'),String(index)),parts[index]!);
+    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'connector-token',connectorId:'one',dataDir,projects:{}};
+    const pending=new Map<string,string>(),attempts:Array<{id:string;serialized:string}>=[];let loseFirstAck=true;
+    const client={addArtifact:async(_run:string,_generation:number,value:unknown)=>{const artifact=value as {requestId:string};const serialized=JSON.stringify(value);attempts.push({id:artifact.requestId,serialized});const prior=pending.get(artifact.requestId);if(prior&&prior!==serialized)throw new Error('ID conflict');pending.set(artifact.requestId,serialized);if(loseFirstAck){loseFirstAck=false;throw new Error('ACK dropped after server persistence');}}} as unknown as WorkbenchConnectorClient;
+    const makeRunner=()=>new ConnectorRunner(cfg,{native:()=>({} as CodexAppServer),client:()=>client});
+    const first=makeRunner() as unknown as {client:WorkbenchConnectorClient;save:(spool:unknown)=>Promise<void>;flush:(spool:unknown)=>Promise<void>};first.client=client;
+    const spool={runId:'run-resume',generation:3,events:[],artifacts:[],diffFileUpload:{directory:uploadDir,parentArtifactId:'artifact:run-resume:diff:run-resume:3',revision:'d'.repeat(64),baseRevision:'b'.repeat(40),candidateRevision:'c'.repeat(40),projectId:'project-one',workId:'work-one',files:[{path:'src/雪 file.ts',sha256:fileHash,byteLength:Buffer.concat(parts).length,chunks:2}],fileIndex:0,chunkIndex:0}};
+    await first.save(spool);await expect(first.flush(spool)).rejects.toThrow('ACK dropped');
+    const stableId=`diff-file:${'c'.repeat(40)}:${createHash('sha256').update('src/雪 file.ts').digest('hex')}:0`;
+    const persisted=JSON.parse(await readFile(path.join(dataDir,'spool',`${stateKey('run-resume','3')}.json`),'utf8')) as typeof spool;
+    expect(persisted.diffFileUpload.chunkIndex).toBe(0);
+    const resumed=makeRunner() as unknown as {client:WorkbenchConnectorClient;flush:(spool:unknown)=>Promise<void>};resumed.client=client;
+    await resumed.flush(persisted);
+    expect(attempts.map(item=>item.id)).toEqual([stableId,stableId,`${stableId.slice(0,-1)}1`]);
+    expect(attempts[0]!.serialized).toBe(attempts[1]!.serialized);
+    expect(pending.size).toBe(2);expect(persisted.diffFileUpload).toBeUndefined();
+    await rm(dataDir,{recursive:true,force:true});
+  });
   it.each(['capture','setup-failure'])('keeps assigned-cwd capture and cleans owned fixture paths on %s',async mode=>{
     const bounded=<T>(promise:Promise<T>)=>{let timer:ReturnType<typeof setTimeout>;return Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Timed out waiting for bounded implementation capture')),5_000);})]).finally(()=>clearTimeout(timer));};
     let root:string|undefined;let dataDir:string|undefined;let runner:ConnectorRunner|undefined;let execution:Promise<void>|undefined;let executionSettled=false;let restoreQaAdapter:(()=>void)|undefined;
@@ -121,7 +142,12 @@ describe('Integrated connector lifecycle',()=>{
       expect(diff.truncated).toBe(false);
       expect(revision).toBe(diffRevision(diff));
       expect(diffArtifact!.requestId).toBe(`diff:${c.run.id}:${c.run.generation}`);
-      expect(diff.files.find(file=>file.path==='source.txt')?.hunks.flatMap(hunk=>hunk.lines).map(line=>line.text).join('\n')).toContain(nativeSource.trimEnd());
+      expect(diff.files.find(file=>file.path==='source.txt')?.hunks).toEqual([]);
+      expect(diff.files.find(file=>file.path==='source.txt')?.fileSha256).toMatch(/^[a-f0-9]{64}$/u);
+      const fileChunks=capturedArtifacts.filter(item=>item.kind==='diff_file_chunk');
+      expect(fileChunks).toHaveLength(1);
+      expect(fileChunks[0]!.data.contentBase64).toBeTypeOf('string');
+      expect(Buffer.from(String(fileChunks[0]!.data.contentBase64),'base64').toString('utf8')).toContain('+native source edit');
       expect(diff.patch).not.toContain(cloneOnlyFinal);
       expect(await git(assigned.path,'show',`${assigned.baseRevision}:source.txt`)).toBe('base source\n');
       expect(await git(assigned.path,'show','HEAD:source.txt')).toBe(nativeSource);
@@ -136,7 +162,7 @@ describe('Integrated connector lifecycle',()=>{
       expect(nativeQa.data.candidateFingerprint).toBe(candidateFingerprint);
       expect(nativeQa.data.revision).toBe(revision);
       expect(nativeQa.data.verification).toBe('unknown');
-      expect(artifacts).toHaveLength(3);
+      expect(artifacts).toHaveLength(4);
     }catch(error){primaryFailure=true;throw error;}finally{
       try{
         await runner?.stop();

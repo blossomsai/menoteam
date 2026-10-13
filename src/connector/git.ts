@@ -3,10 +3,11 @@ import { spawn } from 'node:child_process';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, readFile, readlink, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { ConnectorConfig, DiffArtifactData, DiffFile, DiffLine } from './types.js';
+import type { ConnectorConfig, DiffArtifactData, DiffFile } from './types.js';
 
 const DIFF_LIMIT = 280_000;
 const MAX_BUFFER = 4 * 1024 * 1024;
+const DIFF_FILE_CHUNK_BYTES = 256 * 1024;
 
 export interface GitDiagnostic {
   command: string; code: string; elapsedMs: number; timeoutMs: number; stdoutBytes: number; stderrBytes: number; pid?: number;
@@ -50,7 +51,7 @@ export async function gitWithEnv(cwd:string,env:NodeJS.ProcessEnv,args:string[],
 function runGit(cwd:string,args:string[],options:GitOptions):Promise<string>{
   return executeGit(cwd,{},args,options).then(result=>result.output);
 }
-function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOptions,onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,truncate=false):Promise<{output:string;truncated:boolean}>{
+function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOptions,onProcessStart?:(pid:number)=>Promise<void>,onProcessStop?:()=>Promise<void>,truncate=false,onOutput?:(chunk:Buffer)=>Promise<void>):Promise<{output:string;truncated:boolean}>{
   const {signal,timeoutMs=30_000}=options;
   signal?.throwIfAborted();
   if(process.platform==='win32')throw new Error('Bounded Connector Git requires process-group signals');
@@ -62,7 +63,7 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
     return new Promise<{output:string;truncated:boolean}>((resolve,reject)=>{
     const startedAt=Date.now();
     const child=spawn('git',args,{cwd,detached:true,stdio:['ignore','pipe','pipe'],shell:false,env:{...process.env,...env}});
-    const stdout:Buffer[]=[];let bytes=0;let captured=0;let stderrBytes=0;let stderr='';let timedOut=false;let oversized=false;let aborted=false;let startError:Error|undefined;let processError:Error|undefined;let startTask:Promise<void>|undefined;let settled=false;let stopTimer:NodeJS.Timeout|undefined;
+    const stdout:Buffer[]=[];let bytes=0;let captured=0;let stderrBytes=0;let stderr='';let timedOut=false;let oversized=false;let aborted=false;let startError:Error|undefined;let processError:Error|undefined;let startTask:Promise<void>|undefined;let outputTask=Promise.resolve();let outputError:Error|undefined;let settled=false;let stopTimer:NodeJS.Timeout|undefined;
     const killGroup=()=>{if(child.pid){try{process.kill(-child.pid,'SIGKILL');return;}catch{/* fall back to the direct child */}}child.kill('SIGKILL');};
     const unconfirmed=()=>Object.assign(new Error('Git process group could not be confirmed stopped'),{code:'EUNCONFIRMEDPROCESS'});
     const settle=(error?:Error,result?:{output:string;truncated:boolean})=>{
@@ -83,6 +84,7 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
     signal?.addEventListener('abort',abort,{once:true});
     child.stdout.on('data',(chunk:Buffer)=>{
       bytes+=chunk.length;
+      if(onOutput){child.stdout.pause();outputTask=outputTask.then(()=>onOutput(chunk)).catch(error=>{outputError=error instanceof Error?error:new Error('Diff spool write failed');terminate();}).finally(()=>child.stdout.resume());return;}
       if(!truncate&&bytes>MAX_BUFFER){oversized=true;terminate();return;}
       const keep=truncate?chunk.subarray(0,Math.max(0,DIFF_LIMIT-captured)):chunk;
       if(keep.length){stdout.push(keep);captured+=keep.length;}
@@ -92,6 +94,8 @@ function executeGit(cwd:string,env:NodeJS.ProcessEnv,args:string[],options:GitOp
     child.once('error',error=>{processError=error;terminate();});
     child.once('close',(code,exitSignal)=>{clearTimeout(timer);void (async()=>{
       if(settled)return;
+      await outputTask;
+      if(outputError)throw outputError;
       if(startTask)await startTask;
       if(child.pid&&!await waitGitProcessGroup(child.pid,100)){
         killGroup();
@@ -193,39 +197,58 @@ export async function createDiff(cwd: string, baseRevision: string, options: Git
     paths.push(state === 'renamed' ? { path: second!, oldPath: first!, status: state } : { path: first!, status: state });
   }
   const bounded = await boundedDiff(cwd, ['diff', '--find-renames', '--binary', '--no-ext-diff', '-U0', `${baseRevision}..${candidateRevision}`, '--'], options);
-  const patch = bounded.patch;
-  const patchStats = await runGit(cwd, ['diff', '--numstat', '-z', '--no-renames', `${baseRevision}..${candidateRevision}`, '--'], options);
+  let patch = bounded.patch;
+  const patchStats = await runGit(cwd, ['diff', '--numstat', '-z', '--find-renames', `${baseRevision}..${candidateRevision}`, '--'], options);
+  const stats = new Map<string,{additions:number|null;deletions:number|null;binary:boolean}>();
   let totalAdditions = 0; let totalDeletions = 0;
-  for (const row of patchStats.split('\0')) {
-    const first = row.indexOf('\t'); if (first < 0) continue;
-    const second = row.indexOf('\t', first + 1); if (second < 0) continue;
-    totalAdditions += Number(row.slice(0, first)) || 0; totalDeletions += Number(row.slice(first + 1, second)) || 0;
+  const statParts=patchStats.split('\0');
+  for(let i=0;i<statParts.length;){
+    const row=statParts[i++]!; if(!row)continue;
+    const first=row.indexOf('\t'),second=row.indexOf('\t',first+1);if(first<0||second<0)continue;
+    const addText=row.slice(0,first),delText=row.slice(first+1,second),binary=addText==='-'||delText==='-';
+    const additions=binary?null:Number(addText)||0,deletions=binary?null:Number(delText)||0;
+    let filePath=row.slice(second+1);let names=[filePath];
+    if(!filePath){names=[statParts[i++]??'',statParts[i++]??''];}
+    for(const name of names)if(name)stats.set(name,{additions,deletions,binary});
+    if(!binary){totalAdditions+=additions!;totalDeletions+=deletions!;}
   }
-  const files: DiffFile[] = [];
-  const sections = patch.split(/(?=^diff --git )/mu).filter(section => section.startsWith('diff --git '));
-  for (let index = 0; index < Math.min(sections.length, paths.length); index++) {
-    const { path: displayPath, oldPath, status: state } = paths[index]!;
-    const filePatch = sections[index]!;
-    const binary = filePatch.includes('Binary files ') || filePatch.includes('GIT binary patch');
-    const hunks: DiffFile['hunks'] = [];
-    let current: DiffFile['hunks'][number] | undefined;
-    let oldLine = 0; let newLine = 0;
-    for (const line of filePatch.split('\n')) {
-      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/u.exec(line);
-      if (hunk) { current = { header: line, lines: [] }; hunks.push(current); oldLine = Number(hunk[1]); newLine = Number(hunk[2]); continue; }
-      if (!current || line.startsWith('\\ No newline')) continue;
-      const type = line.startsWith('+') ? 'add' : line.startsWith('-') ? 'remove' : line.startsWith(' ') ? 'context' : undefined;
-      if (!type) continue;
-      const item: DiffLine = { type, text: line.slice(1) };
-      if (type !== 'add') item.oldLine = oldLine++;
-      if (type !== 'remove') item.newLine = newLine++;
-      current.lines.push(item);
+  const files:DiffFile[]=paths.map(({path:displayPath,oldPath,status})=>{
+    const counts=stats.get(displayPath)??(oldPath?stats.get(oldPath):undefined);
+    return {path:displayPath,...(oldPath?{oldPath}:{}),status,binary:counts?.binary??false,additions:counts?.additions??0,deletions:counts?.deletions??0,hunks:[]};
+  });
+  const previewData=()=>({source:'git' as const,baseRevision,candidateRevision,files,additions:totalAdditions,deletions:totalDeletions,totalFiles:paths.length,patch,truncated:bounded.truncated||patch!==bounded.patch,diffFileChunksVersion:1 as const});
+  let serialized=JSON.stringify({kind:'diff',revision:'r'.repeat(64),requestId:'x'.repeat(200),data:previewData()});
+  if(Buffer.byteLength(serialized)>=950_000){const codePoints=Array.from(patch);while(codePoints.length&&Buffer.byteLength(serialized)>=950_000){codePoints.length=Math.floor(codePoints.length*0.8);patch=codePoints.join('');serialized=JSON.stringify({kind:'diff',revision:'r'.repeat(64),requestId:'x'.repeat(200),data:previewData()});}}
+  if(Buffer.byteLength(serialized)>=1_000_000)throw new Error('Complete diff manifest exceeds the safe artifact POST size');
+  return previewData();
+}
+
+export interface DiffFileChunkIndex { path:string; oldPath?:string; sha256:string; byteLength:number; chunks:number; encodingUnsupported?:boolean; }
+export async function spoolDiffFile(cwd:string,baseRevision:string,candidateRevision:string,file:DiffFile,directory:string,options:GitOptions={}):Promise<DiffFileChunkIndex>{
+  const { createHash }=await import('node:crypto');
+  const safeName=createHash('sha256').update(file.path).digest('hex');const dir=path.join(directory,safeName);await mkdir(dir,{recursive:true,mode:0o700});
+  const paths=file.oldPath?[file.oldPath,file.path]:[file.path];
+  // Literal pathspecs recurse into descendants. Escaped glob matching compares the whole path,
+  // including both exact rename endpoints, without selecting sibling/descendant patches.
+  const exactPaths=paths.map(name=>`:(top,glob)${Array.from(name,char=>`\\${char}`).join('')}`);
+  const args=['--no-literal-pathspecs','diff','--find-renames','--no-ext-diff','-U0',`${baseRevision}..${candidateRevision}`,'--',...exactPaths];
+  let pending:Buffer=Buffer.alloc(0),index=0,byteLength=0,encodingUnsupported=false;const hash=createHash('sha256'),decoder=new TextDecoder('utf-8',{fatal:true});
+  const writeChunk=async(chunk:Buffer)=>{await writeFile(path.join(dir,String(index++)),chunk,{mode:0o600});};
+  const consume=async(chunk:Buffer)=>{
+    byteLength+=chunk.length;hash.update(chunk);try{decoder.decode(chunk,{stream:true});}catch{encodingUnsupported=true;}pending=pending.length?Buffer.concat([pending,chunk]):chunk;
+    while(pending.length>DIFF_FILE_CHUNK_BYTES){
+      let end=DIFF_FILE_CHUNK_BYTES;let start=end;
+      while(start>0&&(pending[start]!&0xc0)===0x80)start--;
+      const lead=pending[start]!;const width=lead<0x80?1:lead<0xe0?2:lead<0xf0?3:4;
+      if(start+width>end)end=start;
+      if(end===0)throw new Error('Diff chunk cannot split a UTF-8 sequence');
+      await writeChunk(pending.subarray(0,end));pending=pending.subarray(end);
     }
-    const add = filePatch.match(/^\+(?!\+).*$/gmu)?.length ?? 0;
-    const del = filePatch.match(/^-(?!--).*$/gmu)?.length ?? 0;
-    files.push({ path: displayPath, ...(oldPath ? { oldPath } : {}), status: state, binary, additions: binary ? null : add, deletions: binary ? null : del, hunks });
-  }
-  return { source: 'git', baseRevision, candidateRevision, files, additions: totalAdditions, deletions: totalDeletions, totalFiles: paths.length, patch, truncated: bounded.truncated || files.length < paths.length };
+  };
+  await executeGit(cwd,{},args,options,undefined,undefined,false,consume);
+  try{decoder.decode();}catch{encodingUnsupported=true;}
+  if(pending.length||index===0)await writeChunk(pending);
+  return {path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),sha256:hash.digest('hex'),byteLength,chunks:index,...(encodingUnsupported?{encodingUnsupported:true}:{})};
 }
 
 export async function persistWorktreeMap(dataDir: string, workId: string, worktree: Worktree): Promise<void> {

@@ -2,6 +2,7 @@
 import { qaPolicyFixture, requiredQaFixture } from './helpers/local-qa-fixture';
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
 import { workbenchApi, type Snapshot } from '../src/workbench/web/api';
@@ -539,27 +540,61 @@ describe('mounted provider connection settings', () => {
   });
 
   it.each([
-    [{ totalFiles: 1, truncated: false }, 'Showing 1 of 1 changed file', 'This diff is untruncated'],
-    [{ totalFiles: 4, truncated: true }, 'Showing 1 of 4 changed files', 'This diff was truncated'],
-    [{ truncated: true }, 'Showing 1 changed file · total unknown', 'This diff was truncated'],
-    [{ truncated: false }, 'Showing 1 changed file · total unknown', 'This diff is untruncated'],
-    [{}, 'Showing 1 changed file · total unknown', 'Truncation status is unknown'],
-    [{ totalFiles: 0, truncated: false }, 'Showing 1 changed file · total unknown', 'This diff is untruncated'],
-    [{ totalFiles: 1.5, truncated: 'true' }, 'Showing 1 changed file · total unknown', 'Truncation status is unknown'],
+    [{ totalFiles: 1, truncated: false }, 'Showing 1 of 1 changed file', 'Aggregate preview is complete'],
+    [{ totalFiles: 4, truncated: true }, 'Showing 1 of 4 changed files', 'Aggregate preview is truncated'],
+    [{ truncated: true }, 'Showing 1 changed file · total unknown', 'Aggregate preview is truncated'],
+    [{ truncated: false }, 'Showing 1 changed file · total unknown', 'Aggregate preview is complete'],
+    [{}, 'Showing 1 changed file · total unknown', 'Aggregate preview status is unknown'],
+    [{ totalFiles: 0, truncated: false }, 'Showing 1 changed file · total unknown', 'Aggregate preview is complete'],
+    [{ totalFiles: 1.5, truncated: 'true' }, 'Showing 1 changed file · total unknown', 'Aggregate preview status is unknown'],
   ])('renders authoritative shown/total count and truncation honestly', async (metadata, label, truncated) => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
     const work = { id: 'work-1', projectId: project.id, title: 'Diff proof', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
     const artifact = { id: 'diff-1', projectId: project.id, workId: work.id, runId: 'run-1', kind: 'diff' as const, revision: 'diff-revision', createdAt: '2026-10-06T10:00:00.000Z', data: { ...metadata, baseRevision: 'base-sha', additions: 1, deletions: 1, files: [{ path: 'src/example.ts', status: 'modified', binary: false, additions: 1, deletions: 1, hunks: [{ header: '@@ -2 +2 @@', lines: [{ type: 'remove', oldLine: 2, text: 'old' }, { type: 'add', newLine: 2, text: 'new' }] }] }] } };
     const current = { ...snapshot(), works: [work], artifacts: [artifact] } as Snapshot;
     vi.spyOn(workbenchApi, 'artifact').mockResolvedValue(artifact);
+    vi.spyOn(workbenchApi,'diffFile').mockRejectedValue(new Error('Diff reads must remain lazy'));
     await mount(current);
     await flush();
     expect(host.textContent).toContain(label);
     expect(host.querySelector('[role="status"]')?.textContent).toContain(truncated);
-    expect(host.textContent).toContain('old'); expect(host.textContent).toContain('new');
-    expect(host.querySelector('.bg-red-50')).not.toBeNull(); expect(host.querySelector('.bg-emerald-50')).not.toBeNull();
-    expect(host.querySelector('.bg-red-50')?.children[0]?.textContent).toBe('2');
-    expect(host.querySelector('.bg-emerald-50')?.children[1]?.textContent).toBe('2');
+    const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/example.ts'))!;
+    expect(file.open).toBe(false);
+    expect(workbenchApi.diffFile).not.toHaveBeenCalled();
+  });
+
+  it('loads only an expanded file page and follows its bound cursor',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Lazy diff',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const revision='a'.repeat(64),artifact={id:'diff-lazy',projectId:project.id,workId:work.id,runId:'run-lazy',kind:'diff' as const,revision,createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),totalFiles:2,truncated:true,files:[{path:'src/one.ts',status:'modified',binary:false,additions:2,deletions:0,chunkCount:2,textBytes:500000},{path:'src/two.ts',status:'added',binary:false,additions:1,deletions:0,chunkCount:1,textBytes:40}]}};
+    const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce({path:'src/one.ts',binary:false,complete:false,chunkIndex:0,chunkCount:2,contentBase64:btoa('first page'),nextCursor:'opaque-next'}).mockResolvedValueOnce({path:'src/one.ts',binary:false,complete:true,chunkIndex:1,chunkCount:2,contentBase64:btoa('second page'),nextCursor:null});
+    await mount({...snapshot(),works:[work],artifacts:[artifact]} as Snapshot);await flush();
+    expect(read).not.toHaveBeenCalled();
+    const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/one.ts'))!;
+    await flush(()=>{file.open=true;});await flush();
+    expect(read).toHaveBeenCalledTimes(1);expect(read.mock.calls[0]?.slice(0,4)).toEqual([artifact.id,'src/one.ts',revision,undefined]);expect(host.textContent).toContain('first page');
+    const next=[...file.querySelectorAll('button')].find(button=>button.textContent==='Next page')!;await flush(()=>next.click());await flush();
+    expect(read).toHaveBeenCalledTimes(2);expect(read.mock.calls[1]?.[3]).toBe('opaque-next');expect(host.textContent).toContain('second page');
+    const other=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/two.ts'))!;expect(other.open).toBe(false);
+  });
+
+  it('renders unified diff additions/removals with old and new line numbers',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Line diff',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};const artifact={id:'diff-lines',projectId:project.id,workId:work.id,runId:'run-lines',kind:'diff' as const,revision:'e'.repeat(64),createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),candidateRevision:'c'.repeat(40),files:[{path:'src/lines.ts',status:'modified',binary:false,additions:1,deletions:1,chunkCount:1,textBytes:64}]}};
+    const patch='diff --git a/src/lines.ts b/src/lines.ts\n@@ -4,2 +4,2 @@\n before\n-old value\n+new value\n after\n';vi.spyOn(workbenchApi,'diffFile').mockResolvedValue({path:'src/lines.ts',binary:false,complete:true,verified:true,integrity:'verified',chunkIndex:0,chunkCount:1,contentBase64:btoa(patch),nextCursor:null});await mount({...snapshot(),works:[work],artifacts:[artifact]} as Snapshot);await flush();
+    const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/lines.ts'))!;expect(file.open).toBe(false);await flush(()=>{file.open=true;});await flush();expect(host.textContent).toContain('old value');expect(host.textContent).toContain('new value');expect([...file.querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('-old value'))?.textContent).toContain('5');expect([...file.querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('+new value'))?.textContent).toContain('5');expect(host.textContent).toContain('Whole-file SHA-256 verified');
+  });
+
+  it('discards a diff page resolved after the file is collapsed',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const work={id:'work-1',projectId:project.id,title:'Stale page',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};const artifact={id:'diff-stale',projectId:project.id,workId:work.id,runId:'run-stale',kind:'diff' as const,revision:'f'.repeat(64),createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),files:[{path:'src/stale.ts',status:'modified',binary:false,additions:1,deletions:0,chunkCount:1,textBytes:12}]}};const pending=deferred<Awaited<ReturnType<typeof workbenchApi.diffFile>>>();const read=vi.spyOn(workbenchApi,'diffFile').mockImplementation(()=>pending.promise);await mount({...snapshot(),works:[work],artifacts:[artifact]} as Snapshot);await flush();const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/stale.ts'))!;await flush(()=>{file.open=true;});expect(read).toHaveBeenCalledTimes(1);const signal=read.mock.calls[0]?.[4];expect(signal?.aborted).toBe(false);await flush(()=>{file.open=false;});expect(signal?.aborted).toBe(true);pending.resolve({path:'src/stale.ts',binary:false,complete:true,chunkIndex:0,chunkCount:1,contentBase64:btoa('SECRET stale page'),nextCursor:null});await flush();expect(host.textContent).not.toContain('SECRET stale page');
+  });
+
+  it('shows unsupported UTF-8 bytes as retained base64 instead of crashing or dropping the page',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const work={id:'work-1',projectId:project.id,title:'Unsupported encoding',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};const artifact={id:'diff-encoding',projectId:project.id,workId:work.id,runId:'run-encoding',kind:'diff' as const,revision:'1'.repeat(64),createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),files:[{path:'src/raw.bin',status:'modified',binary:false,encodingUnsupported:true,additions:null,deletions:null,chunkCount:1,textBytes:2}]}};vi.spyOn(workbenchApi,'diffFile').mockResolvedValue({path:'src/raw.bin',binary:false,encodingUnsupported:true,complete:false,integrity:'pending',chunkIndex:0,chunkCount:1,contentBase64:btoa(String.fromCharCode(0xff,0x00)),nextCursor:null});await mount({...snapshot(),works:[work],artifacts:[artifact]} as Snapshot);const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/raw.bin'))!;await flush(()=>{file.open=true;});await flush();expect(host.textContent).toContain('Unsupported UTF-8 encoding');expect(host.querySelector('[aria-label="Unsupported encoding raw page"]')?.textContent).toContain('base64:');
+  });
+
+  it('aborts and discards a diff page when its Work view unmounts',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const work={id:'work-1',projectId:project.id,title:'Unmount page',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};const artifact={id:'diff-unmount',projectId:project.id,workId:work.id,runId:'run-unmount',kind:'diff' as const,revision:'2'.repeat(64),createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),files:[{path:'src/unmount.ts',status:'modified',binary:false,additions:1,deletions:0,chunkCount:1,textBytes:20}]}};const pending=deferred<Awaited<ReturnType<typeof workbenchApi.diffFile>>>();const read=vi.spyOn(workbenchApi,'diffFile').mockImplementation(()=>pending.promise);await mount({...snapshot(),works:[work],artifacts:[artifact]} as Snapshot);const file=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/unmount.ts'))!;await flush(()=>{file.open=true;});const signal=read.mock.calls[0]?.[4];expect(signal?.aborted).toBe(false);await flush(()=>root.unmount());expect(signal?.aborted).toBe(true);pending.resolve({path:'src/unmount.ts',binary:false,complete:true,chunkIndex:0,chunkCount:1,contentBase64:btoa('UNMOUNTED SECRET'),nextCursor:null});await flush();expect(host.textContent).not.toContain('UNMOUNTED SECRET');
   });
 
   it('keeps QA evidence bound to the latest diff revision', async () => {
@@ -727,4 +762,63 @@ it('puts execution history after the actual diff and keeps it collapsed without 
   expect(file.compareDocumentPosition(history)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   await flush(()=>{history.open=true;});
   expect(history.textContent).toContain('Implementation run');expect(history.textContent).toContain('Actual execution failed');expect(history.textContent).toContain('failed');
+});
+
+describe('lazy diff review regressions',()=>{
+  function current(file:Record<string,unknown>={}){
+    const work={id:'work-1',projectId:project.id,title:'Diff regression',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const artifact={id:'diff-regression',projectId:project.id,workId:work.id,runId:'run-regression',kind:'diff' as const,revision:'a'.repeat(64),createdAt:'2026-10-06',data:{baseRevision:'b'.repeat(40),candidateRevision:'c'.repeat(40),files:[{path:'src/regression.ts',status:'modified',binary:false,additions:2,deletions:1,chunkCount:2,textBytes:500_000,...file}]}};
+    return {...snapshot(),works:[work],artifacts:[artifact]} as Snapshot;
+  }
+  function fileDetails(){return [...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.includes('src/regression.ts'))!;}
+  async function expand(){await flush(()=>{fileDetails().open=true;});await flush();}
+  function page(content:string,index:number,nextCursor:string|null,extra:Record<string,unknown>={}){return {path:'src/regression.ts',binary:false,complete:index===1,chunkIndex:index,chunkCount:2,contentBase64:content,nextCursor,...extra};}
+
+  it('keeps the bound cursor and verification state when invalid UTF-8 pages continue as raw base64',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const first=btoa(String.fromCharCode(0xff,0x61)),second=btoa('valid tail bytes');
+    const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce(page(first,0,'bound-raw-next',{integrity:'pending',incomplete:true})).mockResolvedValueOnce(page(second,1,null,{integrity:'verified',verified:true}));
+    await mount(current());expect(read).not.toHaveBeenCalled();await expand();
+    expect(fileDetails().textContent).toContain(`base64:${first}`);expect(host.textContent).toContain('whole-file SHA-256 is pending');expect(button('Next page').disabled).toBe(false);
+    await flush(()=>button('Next page').click());expect(read.mock.calls[1]?.slice(0,4)).toEqual(['diff-regression','src/regression.ts','a'.repeat(64),'bound-raw-next']);
+    expect(fileDetails().textContent).toContain(`base64:${second}`);expect(host.textContent).toContain('Whole-file SHA-256 verified');expect(host.textContent).toContain('Page 2 of 2');expect(button('Next page').disabled).toBe(true);
+  });
+
+  it('renders +++ and --- hunk content with correct colors and numbers across pages',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce(page(btoa('--- a/file\n+++ b/file\n@@ -7,2 +9,2 @@\n---removed\n+'),0,'hunk-next')).mockResolvedValueOnce(page(btoa('++added\n context\n'),1,null));
+    await mount(current());await expand();const removed=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('---removed'))!;
+    expect(removed.className).toContain('bg-red-100');expect(removed.children[0]?.textContent).toBe('7');await flush(()=>button('Next page').click());
+    const added=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('++added'))!;expect(added.className).toContain('bg-emerald-100');expect(added.children[1]?.textContent).toBe('9');expect(added.getAttribute('aria-label')).toContain('Continuation');
+    const context=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes(' context'))!;expect(context.children[0]?.textContent).toBe('8');expect(context.children[1]?.textContent).toBe('10');
+  });
+
+  it('caps the long-line DOM while the raw-page download preserves every source byte',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const source='@@ -0,0 +1,2 @@\n+'+'x'.repeat(200_000);
+    let saved:NodeBlob|undefined;vi.stubGlobal('Blob',NodeBlob);vi.stubGlobal('URL',class extends URL {static createObjectURL=vi.fn((blob:NodeBlob)=>{saved=blob;return 'blob:diff-page';});static revokeObjectURL=vi.fn();});vi.spyOn(HTMLAnchorElement.prototype,'click').mockImplementation(()=>undefined);
+    vi.spyOn(workbenchApi,'diffFile').mockResolvedValueOnce(page(btoa(source),0,'long-next')).mockResolvedValueOnce(page(btoa('\n+after\n'),1,null));await mount(current());await expand();
+    const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.length).toBeLessThanOrEqual(1024);expect(rows.every(row=>(row.children[2]?.textContent?.length??0)<=4096)).toBe(true);expect(rows.reduce((sum,row)=>sum+(row.children[2]?.textContent?.length??0),0)).toBeLessThanOrEqual(64*1024);expect(host.textContent).toContain('Page display is limited');
+    await flush(()=>button('Download raw page').click());expect(Buffer.from(await saved!.arrayBuffer()).equals(Buffer.from(source))).toBe(true);await flush(()=>button('Next page').click());const after=[...fileDetails().querySelectorAll('[role="row"]')].find(row=>row.textContent?.includes('+after'))!;expect(after.children[1]?.textContent).toBe('2');expect(host.textContent).not.toContain('x'.repeat(100));
+  });
+
+  it('renders existing historical hunks as a partial preview without fetching or claiming full-file verification',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const read=vi.spyOn(workbenchApi,'diffFile').mockRejectedValue(new Error('Historical previews must not fetch missing chunks'));
+    await mount(current({chunkCount:undefined,textBytes:undefined,hunks:[{header:'@@ -3 +5 @@',lines:[{type:'remove',oldLine:3,text:'historical old'},{type:'add',newLine:5,text:'historical new'}]}]}));expect(fileDetails().open).toBe(false);expect(read).not.toHaveBeenCalled();await expand();
+    expect(read).not.toHaveBeenCalled();expect(host.textContent).toContain('Historical partial preview');expect(host.textContent).toContain('full-file integrity is unverified');expect(host.textContent).toContain('historical old');expect(host.textContent).toContain('historical new');expect(host.textContent).not.toContain('Whole-file SHA-256 verified');
+    const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.find(row=>row.textContent?.includes('-historical old'))?.children[0]?.textContent).toBe('3');expect(rows.find(row=>row.textContent?.includes('+historical new'))?.children[1]?.textContent).toBe('5');
+  });
+  it('reads all text beyond both limits inside the app without another server fetch',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const source='@@ -0,0 +1,1801 @@\n'+Array.from({length:1800},(_,i)=>`+line ${i} 雪\n`).join('')+'+'+'x'.repeat(4094)+'🙂'+'雪🙂'.repeat(22000)+'\n';
+    const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValue(page(Buffer.from(source).toString('base64'),0,null,{complete:true,chunkCount:1,integrity:'verified'}));await mount(current({chunkCount:1,textBytes:Buffer.byteLength(source)}));expect(read).not.toHaveBeenCalled();await expand();
+    let joined='',portions=0;do{const rows=[...fileDetails().querySelectorAll('[role="row"]')];expect(rows.length).toBeLessThanOrEqual(1024);expect(rows.reduce((n,row)=>n+(row.children[2]?.textContent?.length??0),0)).toBeLessThanOrEqual(64*1024);joined+=rows.map(row=>(row.children[2]?.textContent??'')+(row.getAttribute('data-line-end')==='true'?'\n':'')).join('');portions++;if(button('More of this page').disabled)break;await flush(()=>button('More of this page').click());expect(read).toHaveBeenCalledTimes(1);expect(portions).toBeLessThan(20);}while(true);
+    expect(portions).toBeGreaterThan(2);expect(joined).toBe(source);expect(host.textContent).toContain('Whole-file SHA-256 verified');await flush(()=>button('Previous portion').click());expect(read).toHaveBeenCalledTimes(1);expect(button('More of this page').disabled).toBe(false);
+  });
+
+  it('reads every unsupported raw byte in bounded in-app base64 portions without another server fetch',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');const bytes=Buffer.alloc(120_000,0xff),encoded=bytes.toString('base64');const read=vi.spyOn(workbenchApi,'diffFile').mockResolvedValue(page(encoded,0,null,{complete:true,chunkCount:1,encodingUnsupported:true,integrity:'verified'}));await mount(current({chunkCount:1,textBytes:bytes.length,encodingUnsupported:true}));await expand();let all='',portions=0;
+    do{const raw=host.querySelector('[aria-label="Unsupported encoding raw page"]')!.textContent!.slice('base64:'.length);expect(raw.length).toBeLessThanOrEqual(64*1024);all+=raw;portions++;if(button('More of this page').disabled)break;await flush(()=>button('More of this page').click());expect(read).toHaveBeenCalledTimes(1);}while(true);
+    expect(portions).toBeGreaterThan(1);expect(all).toBe(encoded);expect(Buffer.from(all,'base64').equals(bytes)).toBe(true);expect(host.textContent).toContain('Unsupported UTF-8 encoding');expect(host.textContent).toContain('Whole-file SHA-256 verified');
+  });
+
 });

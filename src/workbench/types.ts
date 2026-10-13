@@ -146,7 +146,7 @@ export interface Artifact {
     projectId: string;
     workId?: string;
     runId: string;
-    kind: 'diff' | 'qa' | 'delivery' | 'source';
+    kind: 'diff' | 'diff_file_chunk' | 'qa' | 'delivery' | 'source';
     revision: string;
     data?: unknown;
     createdAt: string;
