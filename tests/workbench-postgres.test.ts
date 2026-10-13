@@ -2063,6 +2063,21 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await readWithId(collisionId)).statusCode).toBe(409);expect((await sql`SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${collisionId}`)[0]!.result).toEqual(priorAction);
         const retryId=randomUUID();expect((await readWithId(retryId)).statusCode).toBe(200);expect((await readWithId(retryId)).statusCode).toBe(200);expect((await readWithId(retryId,'wrong/path')).statusCode).toBe(409);
         expect(Number((await sql`SELECT count(*) AS count FROM wb_requests WHERE scope=${scope} AND request_id=${retryId}`)[0]!.count)).toBe(1);
+        const journalBytes=async()=>(await sql`SELECT result::text AS bytes FROM wb_requests WHERE scope=${scope} AND request_id=${retryId}`)[0]!.bytes;
+        const savedJournal=await journalBytes();
+        const genericRead=(action:string,input:Record<string,unknown>,requestId=retryId)=>send(`/runs/${reviewer.id}/tools`,{generation:reviewer.generation,action,input,requestId});
+        const reverseCollision=async(action:string,input:Record<string,unknown>)=>{
+            const response=await genericRead(action,input);expect(response.statusCode,response.body).toBe(409);
+            expect(response.body).not.toContain('contentBase64');expect(response.body).not.toContain('__diffFileReadRequest');expect(await journalBytes()).toBe(savedJournal);
+        };
+        await reverseCollision('read_run',{runId:run.id});await reverseCollision('read_work',{workId:work.id});
+        const plainRetry=await readWithId(retryId);expect(plainRetry.statusCode,plainRetry.body).toBe(200);expect(plainRetry.json().integrity).toBe('verified');expect(plainRetry.json()).not.toHaveProperty('__diffFileReadRequest');expect(await journalBytes()).toBe(savedJournal);
+        const plainRun=await genericRead('read_run',{runId:run.id},randomUUID());expect(plainRun.statusCode,plainRun.body).toBe(200);expect(plainRun.json().run.id).toBe(run.id);expect(plainRun.json().artifacts.some((artifact:any)=>artifact.kind==='qa'&&artifact.revision===revision)).toBe(true);expect(plainRun.body).not.toContain('contentBase64');
+        await new WorkbenchStore(sql).put('artifact',staleParent);
+        await reverseCollision('read_run',{runId:run.id});await reverseCollision('read_work',{workId:work.id});
+        expect((await readWithId(retryId)).statusCode).toBe(409);expect(await journalBytes()).toBe(savedJournal);
+        const newerRun=await genericRead('read_run',{runId:run.id},randomUUID());expect(newerRun.statusCode,newerRun.body).toBe(200);expect(newerRun.json().run).toEqual(plainRun.json().run);expect(newerRun.json().artifacts.some((artifact:any)=>artifact.kind==='qa'&&artifact.revision===revision)).toBe(true);expect(newerRun.body).not.toContain('contentBase64');
+        await sql`DELETE FROM wb_records WHERE id=${staleParent.id}`;
         const stale=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json('e'.repeat(40))}) WHERE id=${reviewer.id}`;});expect(stale.statusCode).toBe(409);
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json(candidateRevision)}) WHERE id=${reviewer.id}`;
         const revoked=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{generation}',${sql.json(reviewer.generation+1)}) WHERE id=${reviewer.id}`;});expect(revoked.statusCode).toBe(409);

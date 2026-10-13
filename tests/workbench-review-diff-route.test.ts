@@ -33,6 +33,8 @@ it('authorizes current reviewer pages using bounded Work metadata without scanni
       if(loadedChunks.length%2===1&&onBatch)onBatch();
       return ids.flatMap(id=>{const row=records.get(id);if(!row)return [];loadedChunks.push(id);return [{id,project_id:row.data.projectId,data:row.data}];});
     }
+    if(query.includes("kind='event'"))return [];
+    if(query.endsWith('LIMIT 100'))return [{data:parent}];
     if(query.includes('LIMIT 200')){
       expect(query).toContain("data->>'kind'<>'diff_file_chunk'");return [{data:parent}];
     }
@@ -44,11 +46,25 @@ it('authorizes current reviewer pages using bounded Work metadata without scanni
   try{
     const work=await tool('read_work',{workId},'read-work');expect(work.statusCode,work.body).toBe(200);expect(work.json().reviewAssignment.currentRequiredQaValidation.candidateCurrent).toBe(true);expect(loadedChunks).toHaveLength(0);
     const input={diffArtifactId:parent.id,revision,path:filePath};const page=await tool('read_diff_file',input,'same-page-request');expect(page.statusCode,page.body).toBe(200);expect(page.json().integrity).toBe('verified');expect(Buffer.from(page.json().contentBase64,'base64').equals(bytes)).toBe(true);expect(loadedChunks).toEqual([chunk.id,chunk.id]);
+    const journalBytes=JSON.stringify(requests.get('same-page-request'));
+    const assertReverseCollision=async(action:string,input:Record<string,unknown>)=>{
+      const response=await tool(action,input,'same-page-request');expect(response.statusCode,response.body).toBe(409);
+      expect(response.body).not.toContain('contentBase64');expect(response.body).not.toContain('__diffFileReadRequest');
+      expect(JSON.stringify(requests.get('same-page-request'))).toBe(journalBytes);
+    };
+    await assertReverseCollision('read_run',{runId:candidateId});await assertReverseCollision('read_work',{workId});
+    const retry=await tool('read_diff_file',input,'same-page-request');expect(retry.statusCode,retry.body).toBe(200);
+    expect(retry.json()).toEqual(page.json());expect(retry.json()).not.toHaveProperty('__diffFileReadRequest');
+    expect(JSON.stringify(requests.get('same-page-request'))).toBe(journalBytes);
+    const freshRun=await tool('read_run',{runId:candidateId},'fresh-run');expect(freshRun.statusCode,freshRun.body).toBe(200);
+    expect(freshRun.json()).toMatchObject({run:candidate,events:[],artifacts:[parent]});expect(freshRun.body).not.toContain('contentBase64');
     requests.set('prior-action',{id:'old-action-result'});expect((await tool('read_diff_file',input,'prior-action')).statusCode).toBe(409);expect(requests.get('prior-action')).toEqual({id:'old-action-result'});
     expect((await tool('read_diff_file',{...input,path:'src/other'},'same-page-request')).statusCode).toBe(409);
     expect((await tool('read_diff_file',{...input,path:'src/other-not-present'},'wrong-path')).statusCode).toBe(404);expect((await tool('read_diff_file',{...input,revision:'e'.repeat(64)},'wrong-assignment')).statusCode).toBe(403);
     onBatch=()=>{reviewer.generation++;};expect((await tool('read_diff_file',input,'revoked-during-read')).statusCode).toBe(409);reviewer.generation--;onBatch=undefined;
-    latest={...parent,id:'diff-newer',revision:'f'.repeat(64)};expect((await tool('read_diff_file',input,'same-page-request')).statusCode).toBe(409);expect(loadedChunks).toEqual([chunk.id,chunk.id,chunk.id,chunk.id]);
+    latest={...parent,id:'diff-newer',revision:'f'.repeat(64)};expect((await tool('read_diff_file',input,'same-page-request')).statusCode).toBe(409);expect(loadedChunks).toEqual(Array(6).fill(chunk.id));
+    await assertReverseCollision('read_run',{runId:candidateId});await assertReverseCollision('read_work',{workId});
+    const newerRun=await tool('read_run',{runId:candidateId},'newer-run');expect(newerRun.statusCode,newerRun.body).toBe(200);expect(newerRun.json()).toEqual(freshRun.json());
     expect(queries.some(query=>query.includes('WHERE kind=? AND project_id=? ORDER BY updated_at,id')&&query.includes('wb_records'))).toBe(false);
   }finally{await app.close();}
 });

@@ -1720,6 +1720,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const skillInput = b.action === 'create_skill' ? z.object({ scope: z.enum(['project', 'workspace']).optional(), name: text, data: z.record(z.string(), z.unknown()) }).strict().parse(b.input) : undefined;
         const scope = `tools:${r.id}`;
         const prior = await tx `SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${b.requestId}`;
+        if (prior[0]?.result && typeof prior[0].result === 'object' && Object.hasOwn(prior[0].result, '__diffFileReadRequest')) fail(409, 'Tool request ID was reused for a different action');
         // Reviewer reads observe current policy after the existing lease/actor/scope checks.
         if (prior[0] && !(r.kind === 'review' && ['read_work','read_diff_file'].includes(b.action))) {
             if (skillInput) {
