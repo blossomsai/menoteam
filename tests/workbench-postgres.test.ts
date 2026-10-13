@@ -1989,8 +1989,8 @@ describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
   const store=new WorkbenchStore(sql);await store.put('run',run);await store.put('run',{...run,id:otherRunId});
   const headers={authorization:`Bearer ${raw}`};
   try{
-   for(let n=0;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{}})).statusCode).toBe(204);
-   expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{}})).statusCode).toBe(429);
+   for(let n=0;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{capabilities:{codexAppServer:true,localWorktrees:true,models:['gpt-6.1-sol']}}})).statusCode).toBe(204);
+   expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{capabilities:{codexAppServer:true,localWorktrees:true,models:['gpt-6.1-sol']}}})).statusCode).toBe(429);
    expect((await app.inject({url:`/api/workbench/connector/runs/${runId}`,headers})).statusCode).toBe(200);
    const renewed=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:1}});expect(renewed.statusCode).toBe(200);expect(Date.parse(renewed.json().leaseUntil)).toBeGreaterThan(Date.parse(before));
    expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:2}})).statusCode).toBe(409);

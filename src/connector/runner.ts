@@ -171,6 +171,23 @@ export class ConnectorRunner {
       await rename(this.spoolPath(spool.runId,spool.generation),path.join(directory,`${stateKey(spool.runId,String(spool.generation))}.json`));
     } else await unlink(this.spoolPath(spool.runId,spool.generation));
   }
+  private async flushEvidence(spool:Spool,signal:AbortSignal):Promise<void> {
+    // Retry only the durable, idempotent implementation outbox while its existing monitor remains active.
+    const position=()=>`${spool.events.length}:${spool.artifacts.length}:${spool.diffFileUpload?.fileIndex??-1}:${spool.diffFileUpload?.chunkIndex??-1}`;
+    let progress=position(),deadline=Date.now()+300_000;
+    while(true){
+      signal.throwIfAborted();if(this.closing)throw new Error('Connector is closing');
+      if(Date.now()>=deadline)throw new Error('Evidence upload did not make progress within five minutes');
+      try{await this.flush(spool);return;}catch(error){
+        if(!(error instanceof ConnectorHttpError)||error.status!==429)throw error;
+        const current=position();if(current!==progress){progress=current;deadline=Date.now()+300_000;}
+        this.pollingBackoff(error);
+        if(this.pollBlockedUntil>deadline||Date.now()>=deadline)throw error;
+        while(Date.now()<this.pollBlockedUntil){if(Date.now()>=deadline||this.pollBlockedUntil>deadline)throw error;signal.throwIfAborted();if(this.closing)throw new Error('Connector is closing');await delay(Math.min(1_000,this.pollBlockedUntil-Date.now()));}
+      }
+    }
+  }
+
   private async flush(spool:Spool):Promise<void> {
     const client = this.client!;
     if(spool.deliveryProgress?.phase==='merged'){await client.deliveryProgress(spool.runId,spool.generation,spool.deliveryProgress);spool.deliveryProgress=undefined;spool.stopped=false;spool.completion={};await this.save(spool);}
@@ -494,7 +511,7 @@ export class ConnectorRunner {
         if(reviewModified) throw new Error('Review modified immutable candidate');
       }
       runAbort.signal.throwIfAborted();
-      spool.completion={threadId:result.threadId}; await this.save(spool); await this.flush(spool);
+      spool.completion={threadId:result.threadId}; await this.save(spool); if(claim.run.kind==='implementation')await this.flushEvidence(spool,runAbort.signal);else await this.flush(spool);
     } catch (error) {
       try{await stopRunProcesses();}catch(stopError){if((stopError as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);}throw stopError;}
       if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);throw error;}
