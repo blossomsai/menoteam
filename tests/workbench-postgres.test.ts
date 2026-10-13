@@ -1982,6 +1982,23 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await sql`SELECT data FROM wb_records WHERE id=${retry.id}`)[0]!.data.data).toEqual(oldRequest.data);
         for(let index=1;index<parts.length;index++)await client.addArtifact(run.id,run.generation,payload(index));expect(await count()).toBe(parts.length);
         const artifactStore=new WorkbenchStore(sql);
+        // Actual latestWorkDiff SQL, with enough project-local payload rows to expose a project scan.
+        await sql`INSERT INTO wb_records(id,kind,project_id,data)
+            SELECT ${p.id}||':unrelated-chunk:'||n,'artifact',${p.id},jsonb_build_object('id',${p.id}||':unrelated-chunk:'||n,'projectId',${p.id}::text,'workId',${work.id}::text,'kind','diff_file_chunk','data',jsonb_build_object('contentBase64',repeat('eA==',1024))) FROM generate_series(1,10000) n`;
+        await sql`ANALYZE wb_records`;
+        let explained=false;
+        const explainSql=new Proxy(sql,{apply(target,thisArg,args){
+            const query=(args[0] as TemplateStringsArray).map((text,index)=>text+(index<args.length-1?`$${index+1}`:'')).join('');
+            return (async()=>{
+                const plans=await sql.unsafe('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) '+query,args.slice(1));
+                const nodes:any[]=[];const visit=(node:any)=>{nodes.push(node);for(const child of node.Plans??[])visit(child);};visit(plans[0]!['QUERY PLAN'][0].Plan);
+                expect(nodes.some(node=>node['Index Name']==='wb_records_latest_work_diff_idx')).toBe(true);
+                expect(nodes.some(node=>node['Node Type']==='Sort'||node['Relation Name']==='wb_records'&&node['Node Type']==='Seq Scan')).toBe(false);
+                const index=nodes.find(node=>node['Index Name']==='wb_records_latest_work_diff_idx');expect(index['Actual Rows']).toBeLessThanOrEqual(1);expect(index['Index Cond']).toContain('project_id');expect(index['Index Cond']).toContain('workId');
+                explained=true;return Reflect.apply(target,thisArg,args);
+            })();
+        }});
+        expect((await artifactStore.latestWorkDiff(p.id,work.id,explainSql))!.id).toBe(parent.id);expect(explained).toBe(true);
         for(const artifacts of [await artifactStore.list<Artifact>('artifact',p.id),await artifactStore.list<Artifact>('artifact'),await artifactStore.transaction(p.id,tx=>artifactStore.list<Artifact>('artifact',p.id,tx))]){
             expect(artifacts.some(item=>item.id===parent.id)).toBe(true);
             expect(artifacts.some(item=>item.kind==='diff_file_chunk')).toBe(false);
@@ -2003,7 +2020,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await app.close();let reached:()=>void=()=>{},release:()=>void=()=>{},barrier:Promise<void>|undefined;
         let gate=false,batchQueries=0;const sqlProxy=new Proxy(sql,{apply(target,thisArg,args){
             const query=(args[0] as TemplateStringsArray).join('?');
-            if(query.includes('LIMIT 4')&&query.includes('chunkIndex')){
+            if(query.startsWith('SELECT id,project_id,data FROM wb_records WHERE id=ANY')&&(args[1] as string[]).length>2){
+                expect((args[1] as string[]).length).toBeLessThanOrEqual(8);
                 batchQueries++;expect(query).not.toContain('decode(');
                 if(gate){gate=false;reached();return (async()=>{await barrier;return Reflect.apply(target,thisArg,args);})();}
             }
@@ -2039,6 +2057,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const reviewer=checkedJson(await send('/claim',{capabilities:{runKinds:['review']}})).run;expect(reviewer.id).toBe(review.id);
         const reviewerRead=()=>send(`/runs/${reviewer.id}/tools`,{generation:reviewer.generation,action:'read_diff_file',input:{diffArtifactId:parent.id,revision,path:filePath,cursor:finalCursor},requestId:randomUUID()});
         const reviewPage=await whileReading(reviewerRead,otherRun);expect(reviewPage.statusCode,reviewPage.body).toBe(200);expect(reviewPage.json().integrity).toBe('verified');
+        const collisionId=randomUUID(),scope=`tools:${reviewer.id}`,priorAction={id:'immutable-prior-action'};
+        await sql`INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${collisionId},${sql.json(priorAction)})`;
+        const readWithId=(requestId:string,path=filePath)=>send(`/runs/${reviewer.id}/tools`,{generation:reviewer.generation,action:'read_diff_file',input:{diffArtifactId:parent.id,revision,path,cursor:finalCursor},requestId});
+        expect((await readWithId(collisionId)).statusCode).toBe(409);expect((await sql`SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${collisionId}`)[0]!.result).toEqual(priorAction);
+        const retryId=randomUUID();expect((await readWithId(retryId)).statusCode).toBe(200);expect((await readWithId(retryId)).statusCode).toBe(200);expect((await readWithId(retryId,'wrong/path')).statusCode).toBe(409);
+        expect(Number((await sql`SELECT count(*) AS count FROM wb_requests WHERE scope=${scope} AND request_id=${retryId}`)[0]!.count)).toBe(1);
         const stale=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json('e'.repeat(40))}) WHERE id=${reviewer.id}`;});expect(stale.statusCode).toBe(409);
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json(candidateRevision)}) WHERE id=${reviewer.id}`;
         const revoked=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{generation}',${sql.json(reviewer.generation+1)}) WHERE id=${reviewer.id}`;});expect(revoked.statusCode).toBe(409);

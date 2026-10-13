@@ -30,22 +30,33 @@ async function readDiffFilePage(store:WorkbenchStore,tx:Sql,parent:Artifact,file
     const file=files.find(item=>item.path===filePath);if(!file)fail(404,'Diff path is not in this candidate');
     if(file.binary)return {path:filePath,binary:true,complete:true,contentBase64:'',chunkIndex:0,chunkCount:0,nextCursor:null};
     const chunkCount=Number(file.chunkCount),fileSha256=String(file.fileSha256??'');
-    if(!Number.isSafeInteger(chunkCount)||chunkCount<1||!/^[a-f0-9]{64}$/u.test(fileSha256))return {path:filePath,binary:false,complete:false,incomplete:true,reason:'Diff file chunks are not recorded'};
+    if(typeof file.chunkCount!=='number'||!Number.isSafeInteger(chunkCount)||chunkCount<1||chunkCount>100000||typeof file.textBytes!=='number'||!Number.isSafeInteger(file.textBytes)||file.textBytes<0||!parent.runId||!/^[a-f0-9]{40,64}$/u.test(String(data.candidateRevision??''))||!/^[a-f0-9]{40,64}$/u.test(String(data.baseRevision??''))||file.encodingUnsupported!==undefined&&typeof file.encodingUnsupported!=='boolean'||!/^[a-f0-9]{64}$/u.test(fileSha256))return {path:filePath,binary:false,complete:false,incomplete:true,reason:'Diff file chunks are not recorded'};
     let index=0;
     if(cursor){try{const value=JSON.parse(Buffer.from(cursor,'base64url').toString('utf8')) as unknown;if(!Array.isArray(value)||value.length!==4||value[0]!==parent.id||value[1]!==parent.revision||value[2]!==filePath||!Number.isSafeInteger(value[3])||value[3]<0||value[3]>=chunkCount)fail(409,'Diff cursor is stale or bound to another file');index=value[3] as number;}catch(error){if((error as {statusCode?:number}).statusCode)throw error;fail(400,'Diff cursor is invalid');}}
-    const rows=await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${parent.projectId} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'path'=${filePath} AND data->'data'->>'chunkIndex'=${String(index)} LIMIT 1`;
+    const pathHash=createHash('sha256').update(filePath).digest('hex'),parentHash=createHash('sha256').update(parent.id).digest('hex');
+    const slotIds=(part:number)=>[`artifact:${parent.runId}:diff-file:${parentHash}:${pathHash}:${part}`,`artifact:${parent.runId}:diff-file:${data.candidateRevision}:${pathHash}:${part}`];
+    const readSlots=async(offset:number,length:number)=>{
+        const slots=Array.from({length},(_,part)=>slotIds(offset+part)),ids=slots.flat();
+        const rows=await tx`SELECT id,project_id,data FROM wb_records WHERE id=ANY(${ids}) AND kind='artifact' AND data->>'kind'='diff_file_chunk'`;
+        return slots.map(([canonical,legacy])=>{
+            const matches=rows.filter(row=>row.id===canonical||(row.id===legacy&&(row.data as Artifact).data&&((row.data as Artifact).data as Record<string,unknown>).parentArtifactId===parent.id));
+            // Fail closed on ambiguous same-parent namespaces, even when bytes appear equivalent.
+            return matches.length===1&&matches[0]!.project_id===parent.projectId&&(matches[0]!.data as Artifact).id===matches[0]!.id?{data:matches[0]!.data}:undefined;
+        });
+    };
+    const rows=await readSlots(index,1);
     if(!rows[0])return {path:filePath,binary:false,complete:false,incomplete:true,chunkIndex:index,chunkCount,reason:`Diff file is incomplete: chunk ${index+1} of ${chunkCount} is missing`};
     const artifact=rows[0].data as Artifact,chunk=artifact.data as Record<string,unknown>,bytes=Buffer.from(String(chunk.contentBase64??''),'base64');
-    const validChunk=(artifact:Artifact,chunk:Record<string,unknown>,bytes:Buffer,index:number)=>!(artifact.projectId!==parent.projectId||artifact.workId!==parent.workId||artifact.runId!==parent.runId||artifact.revision!==parent.revision||chunk.parentArtifactId!==parent.id||chunk.projectId!==parent.projectId||chunk.workId!==parent.workId||chunk.runId!==parent.runId||chunk.diffRevision!==parent.revision||chunk.candidateRevision!==data.candidateRevision||chunk.baseRevision!==data.baseRevision||chunk.path!==filePath||chunk.oldPath!==file.oldPath||chunk.chunkIndex!==index||chunk.fileSha256!==fileSha256||chunk.fileByteLength!==Number(file.textBytes)||chunk.chunkCount!==chunkCount||(chunk.encodingUnsupported===true)!==(file.encodingUnsupported===true)||createHash('sha256').update(bytes).digest('hex')!==chunk.chunkSha256||bytes.length>256*1024||bytes.toString('base64')!==chunk.contentBase64);
+    const validChunk=(artifact:Artifact,chunk:Record<string,unknown>,bytes:Buffer,index:number)=>!(artifact.projectId!==parent.projectId||artifact.workId!==parent.workId||artifact.runId!==parent.runId||artifact.revision!==parent.revision||chunk.parentArtifactId!==parent.id||chunk.projectId!==parent.projectId||chunk.workId!==parent.workId||chunk.runId!==parent.runId||chunk.diffRevision!==parent.revision||chunk.candidateRevision!==data.candidateRevision||chunk.baseRevision!==data.baseRevision||chunk.path!==filePath||chunk.oldPath!==file.oldPath||chunk.chunkIndex!==index||chunk.fileSha256!==fileSha256||chunk.fileByteLength!==Number(file.textBytes)||chunk.chunkCount!==chunkCount||chunk.encodingUnsupported!==undefined&&typeof chunk.encodingUnsupported!=='boolean'||(chunk.encodingUnsupported===true)!==(file.encodingUnsupported===true)||createHash('sha256').update(bytes).digest('hex')!==chunk.chunkSha256||bytes.length>256*1024||bytes.toString('base64')!==chunk.contentBase64);
     if(!validChunk(artifact,chunk,bytes,index))return {path:filePath,binary:false,complete:false,incomplete:true,chunkIndex:index,chunkCount,reason:'Diff file chunk failed its identity or hash check'};
     let complete=false;
     if(index===chunkCount-1){
         const fileHash=createHash('sha256');let reconstructedBytes=0,expected=0,valid=true;
         for(let offset=0;offset<chunkCount;offset+=4){
-            const batch=await tx`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${parent.projectId} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'path'=${filePath} AND (data->'data'->>'chunkIndex')::int>=${offset} AND (data->'data'->>'chunkIndex')::int<${Math.min(offset+4,chunkCount)} ORDER BY (data->'data'->>'chunkIndex')::int LIMIT 4`;
-            if(batch.length!==Math.min(4,chunkCount-offset)){valid=false;break;}
+            const batch=await readSlots(offset,Math.min(4,chunkCount-offset));
+            if(batch.some(row=>!row)){valid=false;break;}
             for(const row of batch){
-                const artifact=row.data as Artifact,chunk=artifact.data as Record<string,unknown>,bytes=Buffer.from(String(chunk.contentBase64??''),'base64'),index=expected++;
+                const artifact=row!.data as Artifact,chunk=artifact.data as Record<string,unknown>,bytes=Buffer.from(String(chunk.contentBase64??''),'base64'),index=expected++;
                 if(!validChunk(artifact,chunk,bytes,index)){valid=false;break;}
                 reconstructedBytes+=bytes.length;fileHash.update(bytes);
             }
@@ -1651,6 +1662,12 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     app.post("/api/workbench/connector/runs/:id/tools", async (req) => {
         if((req.body as {action?:string})?.action==='read_diff_file'){
             const b=z.object({generation:z.number(),action:z.literal('read_diff_file'),input:z.object({diffArtifactId:z.string().min(1).max(300),revision:z.string().length(64),path:z.string().min(1).max(4096),cursor:z.string().max(4096).optional()}).strict(),requestId:z.string().min(1).max(200)}).parse(req.body);
+            const scope=`tools:${(req.params as {id:string}).id}`;
+            const requestBinding={action:b.action,runId:(req.params as {id:string}).id,generation:b.generation,input:b.input};
+            const checkJournal=async(tx:Sql)=>{
+                const prior=await tx`SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${b.requestId}`;
+                if(prior[0]&&!isDeepStrictEqual((prior[0].result as Record<string,unknown>).__diffFileReadRequest,requestBinding))fail(409,'Readonly request ID conflicts with a prior action or page binding');
+            };
             const authorize=async(tx:Sql)=>{
                 const r=await leased(req,tx,true);
                 if(r.kind!=='review'||!r.workId||!r.reviewBinding||r.reviewBinding.diffArtifactId!==b.input.diffArtifactId||r.reviewBinding.diffRevision!==b.input.revision)fail(403,'Assigned review run required');
@@ -1659,14 +1676,15 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 if(!actors[0])fail(403,'Run actor unavailable');await grant(actors[0] as unknown as Member,r.projectId,false,tx);
                 const binding=r.reviewBinding,candidate=await store.get<Run>('run',binding.candidateRunId,tx),parent=await store.get<Artifact>('artifact',binding.diffArtifactId,tx),latest=await store.latestWorkDiff(r.projectId,r.workId,tx);
                 if(!candidate||candidate.kind!=='implementation'||candidate.status!=='completed'||candidate.projectId!==r.projectId||candidate.workId!==r.workId||candidate.id!==r.targetRunId||!parent||parent.kind!=='diff'||parent.projectId!==r.projectId||parent.workId!==r.workId||parent.runId!==candidate.id||latest?.id!==parent.id||parent.revision!==binding.diffRevision||(parent.data as Record<string,unknown>).candidateRevision!==binding.commitSha)fail(409,'Review assignment or candidate diff is stale');
+                await checkJournal(tx);
                 return {parent,binding,generation:r.generation,requestedBy:r.requestedBy,connectorId:r.connectorId,candidateGeneration:candidate.generation};
             };
             const snapshot=await store.transaction('diff-file-authorize',authorize);
             const result=await readDiffFilePage(store,store.sql,snapshot.parent,b.input.path,b.input.revision,b.input.cursor);
             return store.transaction('diff-file-recheck',async tx=>{
                 if(!isDeepStrictEqual(await authorize(tx),snapshot))fail(409,'Review assignment changed while reading');
-                const scope=`tools:${(req.params as {id:string}).id}`;
-                await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(result as never)}) ON CONFLICT(scope,request_id) DO NOTHING`;
+                const recorded={__diffFileReadRequest:requestBinding,result};
+                await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${b.requestId},${tx.json(recorded as never)}) ON CONFLICT(scope,request_id) DO NOTHING`;
                 return result;
             });
         }

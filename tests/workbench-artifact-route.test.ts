@@ -67,8 +67,8 @@ it('does not turn long artifact IDs into a session, project or reviewer-bridge a
 it('reads bounded diff pages with exact parent/path/cursor binding and reports missing chunks incomplete',async()=>{
   const revision='a'.repeat(64),baseRevision='b'.repeat(40),candidateRevision='c'.repeat(40),filePath='src/雪 file.ts',parts=[Buffer.from('first page\n'),Buffer.from('second page\n')],fileSha256=createHash('sha256').update(Buffer.concat(parts)).digest('hex');
   const parent={id:'diff-fixture',projectId:'project-fixture',workId:'work-fixture',runId:'run-fixture',kind:'diff',revision,data:{baseRevision,candidateRevision,files:[{path:filePath,oldPath:'src/old name.ts',status:'renamed',binary:false,additions:1,deletions:1,textBytes:Buffer.concat(parts).length,chunkCount:2,fileSha256}]}};
-  const chunks=parts.map((bytes,chunkIndex)=>({id:`chunk-${chunkIndex}`,projectId:parent.projectId,workId:parent.workId,runId:parent.runId,kind:'diff_file_chunk',revision,data:{parentArtifactId:parent.id,projectId:parent.projectId,workId:parent.workId,runId:parent.runId,candidateRevision,baseRevision,diffRevision:revision,path:filePath,oldPath:'src/old name.ts',chunkIndex,chunkCount:2,fileSha256,fileByteLength:Buffer.concat(parts).length,chunkSha256:createHash('sha256').update(bytes).digest('hex'),contentBase64:bytes.toString('base64')}}));
-  let missingLast=false,memberRole='owner';
+  const chunks=parts.map((bytes,chunkIndex)=>({id:`artifact:${parent.runId}:diff-file:${candidateRevision}:${createHash('sha256').update(filePath).digest('hex')}:${chunkIndex}`,projectId:parent.projectId,workId:parent.workId,runId:parent.runId,kind:'diff_file_chunk',revision,data:{parentArtifactId:parent.id,projectId:parent.projectId,workId:parent.workId,runId:parent.runId,candidateRevision,baseRevision,diffRevision:revision,path:filePath,oldPath:'src/old name.ts',chunkIndex,chunkCount:2,fileSha256,fileByteLength:Buffer.concat(parts).length,chunkSha256:createHash('sha256').update(bytes).digest('hex'),contentBase64:bytes.toString('base64')}}));
+  let missingLast=false,memberRole='owner',duplicate=false,wrongLegacyParent=false;
   const sql=((strings:TemplateStringsArray,...values:unknown[])=>{
     const query=strings.join('?');
     if(query.includes('pg_advisory_xact_lock'))return [];
@@ -78,11 +78,13 @@ it('reads bounded diff pages with exact parent/path/cursor binding and reports m
       const [recordId,kind]=values;const item=kind==='artifact'?(recordId===parent.id?parent:chunks.find(chunk=>chunk.id===recordId)):kind==='project'&&recordId==='project-fixture'?{id:'project-fixture'}:undefined;
       return item?[{data:item}]:[];
     }
-    if(query.includes("chunkIndex'=?")){
-      const index=Number(values.at(-1));const chunk=index===1&&missingLast?undefined:chunks[index];return chunk?[{data:chunk}]:[];
-    }
     if(query.includes("jsonb_build_object('candidateRevision'"))return [{data:parent}];
-    if(query.includes('LIMIT 4'))return (missingLast?chunks.slice(0,1):chunks).slice(Number(values[3]),Number(values[4])).map(data=>({data}));
+    if(query.includes('id=ANY')){
+      const ids=values[0] as string[];expect(ids.length).toBeLessThanOrEqual(8);expect(query).not.toContain('ORDER BY');
+      const saved=(missingLast?chunks.slice(0,1):chunks).map(data=>({id:data.id,project_id:data.projectId,data}));
+      if(duplicate||wrongLegacyParent){const canonical={...chunks[0]!,id:`artifact:${parent.runId}:diff-file:${createHash('sha256').update(parent.id).digest('hex')}:${createHash('sha256').update(filePath).digest('hex')}:0`};saved.push({id:canonical.id,project_id:canonical.projectId,data:canonical});if(wrongLegacyParent)saved[0]!.data={...chunks[0]!,data:{...chunks[0]!.data,parentArtifactId:'old-parent'}};}
+      return saved.filter(row=>ids.includes(row.id));
+    }
     throw new Error(`Unexpected in-memory query: ${query}`);
   }) as unknown as Sql;
   Object.assign(sql,{begin:async<T>(fn:(tx:Sql)=>Promise<T>)=>fn(sql),json:(value:unknown)=>value});
@@ -95,6 +97,7 @@ it('reads bounded diff pages with exact parent/path/cursor binding and reports m
     expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision:'d'.repeat(64)}})).statusCode).toBe(409);
     const wrongPathCursor=Buffer.from(JSON.stringify([parent.id,revision,'src/other.ts',1])).toString('base64url');expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision,cursor:wrongPathCursor}})).statusCode).toBe(409);
     const invalidCursor=Buffer.from(JSON.stringify([parent.id,revision,filePath,3])).toString('base64url');expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision,cursor:invalidCursor}})).statusCode).toBe(409);
+    duplicate=true;expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision}})).json()).toMatchObject({complete:false,incomplete:true});expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision,cursor}})).json()).toMatchObject({complete:false,incomplete:true});duplicate=false;wrongLegacyParent=true;expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision}})).json().integrity).toBe('pending');expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision,cursor}})).json().complete).toBe(true);wrongLegacyParent=false;
     missingLast=true;const partial=await app.inject({method:'GET',url,headers,query:{path:filePath,revision}});expect(partial.statusCode).toBe(200);expect(partial.json().incomplete).toBe(true);expect(partial.json().complete).toBe(false);
     memberRole='member';expect((await app.inject({method:'GET',url,headers,query:{path:filePath,revision}})).statusCode).toBe(403);
     expect((await app.inject({method:'GET',url,query:{path:filePath,revision}})).statusCode).toBe(401);
@@ -116,9 +119,11 @@ it('resumes an interrupted >1 MiB diff upload through HTTP storage and reads byt
     if(query.startsWith('INSERT INTO wb_records')){const [id,kind,pid,data]=values;records.set(String(id),{id,kind,projectId:pid,runId:kind==='artifact'?data.runId:undefined,workId:kind==='artifact'?data.workId:undefined,revision:kind==='artifact'?data.revision:undefined,data});return [{id}];}
     if(query.includes('FROM wb_records')&&query.includes('WHERE id=? AND kind=?')){const item=records.get(String(values[0]));return item&&item.kind===values[1]?[{data:item.data}]:[];}
     if(query.includes("data->'data' AS data")){return [...records.values()].filter(item=>item.kind==='artifact'&&item.data.kind==='diff_file_chunk'&&item.data.data.parentArtifactId===values[1]&&item.data.data.path===values[2]).map(item=>({data:item.data.data}));}
-    if(query.includes("chunkIndex'=?")){expect(transactionDepth).toBe(0);chunkQueries++;const index=Number(values.at(-1));const item=[...records.values()].find(item=>item.kind==='artifact'&&item.data.kind==='diff_file_chunk'&&item.data.data.parentArtifactId===values[1]&&item.data.data.path===values[2]&&item.data.data.chunkIndex===index);return item?[{data:item.data}]:[];}
     if(query.includes("jsonb_build_object('candidateRevision'"))return [...records.values()].filter(item=>item.data.kind==='diff').map(item=>({data:item.data}));
-    if(query.includes('LIMIT 4')){expect(transactionDepth).toBe(0);expect(Number(values[4])-Number(values[3])).toBeLessThanOrEqual(4);batchQueries++;return [...records.values()].filter(item=>item.kind==='artifact'&&item.data.kind==='diff_file_chunk'&&item.data.data.parentArtifactId===values[1]&&item.data.data.path===values[2]&&item.data.data.chunkIndex>=Number(values[3])&&item.data.data.chunkIndex<Number(values[4])).sort((a,b)=>a.data.data.chunkIndex-b.data.data.chunkIndex).map(item=>({data:item.data}));}
+    if(query.includes('id=ANY')){
+      expect(transactionDepth).toBe(0);const ids=values[0] as string[];expect(ids.length).toBeLessThanOrEqual(8);expect(query).not.toContain('ORDER BY');if(ids.length===2&&chunkQueries<records.get(`artifact:${runId}:diff:${runId}:1`)!.data.data.files[0].chunkCount)chunkQueries++;else batchQueries++;
+      return ids.flatMap(id=>{const row=records.get(id);return row?.kind==='artifact'&&row.data.kind==='diff_file_chunk'?[{id,project_id:row.data.projectId,data:row.data}]:[];});
+    }
     throw new Error(`Unexpected integration SQL: ${query}`);
   }) as unknown as Sql;Object.assign(sql,{begin:async<T>(fn:(tx:Sql)=>Promise<T>)=>{transactionDepth++;try{return await fn(sql);}finally{transactionDepth--;}},json:(value:unknown)=>value});
   try{
