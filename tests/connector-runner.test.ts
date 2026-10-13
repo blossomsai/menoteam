@@ -64,7 +64,7 @@ describe('Integrated connector lifecycle',()=>{
       }
     }finally{if(timer)clearTimeout(timer);await runner.stop();log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
   });
-    it('resumes a partially acknowledged diff upload from the same durable candidate cursor',async()=>{
+    it.each([undefined,2])('resumes a partially acknowledged diff upload from the same durable candidate cursor (ID version %s)',async requestIdVersion=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-diff-resume-')),uploadDir=path.join(dataDir,'diff-file-spool','candidate');await mkdir(path.join(uploadDir,createHash('sha256').update('src/雪 file.ts').digest('hex')),{recursive:true});
     const parts=[Buffer.from('first\n'),Buffer.from('second\n')],fileHash=createHash('sha256').update(Buffer.concat(parts)).digest('hex');for(let index=0;index<parts.length;index++)await writeFile(path.join(uploadDir,createHash('sha256').update('src/雪 file.ts').digest('hex'),String(index)),parts[index]!);
     const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'connector-token',connectorId:'one',dataDir,projects:{}};
@@ -72,9 +72,9 @@ describe('Integrated connector lifecycle',()=>{
     const client={addArtifact:async(_run:string,_generation:number,value:unknown)=>{const artifact=value as {requestId:string};const serialized=JSON.stringify(value);attempts.push({id:artifact.requestId,serialized});const prior=pending.get(artifact.requestId);if(prior&&prior!==serialized)throw new Error('ID conflict');pending.set(artifact.requestId,serialized);if(loseFirstAck){loseFirstAck=false;throw new Error('ACK dropped after server persistence');}}} as unknown as WorkbenchConnectorClient;
     const makeRunner=()=>new ConnectorRunner(cfg,{native:()=>({} as CodexAppServer),client:()=>client});
     const first=makeRunner() as unknown as {client:WorkbenchConnectorClient;save:(spool:unknown)=>Promise<void>;flush:(spool:unknown)=>Promise<void>};first.client=client;
-    const spool={runId:'run-resume',generation:3,events:[],artifacts:[],diffFileUpload:{directory:uploadDir,parentArtifactId:'artifact:run-resume:diff:run-resume:3',revision:'d'.repeat(64),baseRevision:'b'.repeat(40),candidateRevision:'c'.repeat(40),projectId:'project-one',workId:'work-one',files:[{path:'src/雪 file.ts',sha256:fileHash,byteLength:Buffer.concat(parts).length,chunks:2}],fileIndex:0,chunkIndex:0}};
+    const spool={runId:'run-resume',generation:3,events:[],artifacts:[],diffFileUpload:{directory:uploadDir,requestIdVersion,parentArtifactId:'artifact:run-resume:diff:run-resume:3',revision:'d'.repeat(64),baseRevision:'b'.repeat(40),candidateRevision:'c'.repeat(40),projectId:'project-one',workId:'work-one',files:[{path:'src/雪 file.ts',sha256:fileHash,byteLength:Buffer.concat(parts).length,chunks:2}],fileIndex:0,chunkIndex:0}};
     await first.save(spool);await expect(first.flush(spool)).rejects.toThrow('ACK dropped');
-    const stableId=`diff-file:${'c'.repeat(40)}:${createHash('sha256').update('src/雪 file.ts').digest('hex')}:0`;
+    const stableId=`diff-file:${requestIdVersion===2?createHash('sha256').update(spool.diffFileUpload.parentArtifactId).digest('hex'):'c'.repeat(40)}:${createHash('sha256').update('src/雪 file.ts').digest('hex')}:0`;
     const persisted=JSON.parse(await readFile(path.join(dataDir,'spool',`${stateKey('run-resume','3')}.json`),'utf8')) as typeof spool;
     expect(persisted.diffFileUpload.chunkIndex).toBe(0);
     const resumed=makeRunner() as unknown as {client:WorkbenchConnectorClient;flush:(spool:unknown)=>Promise<void>};resumed.client=client;
