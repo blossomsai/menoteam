@@ -80,6 +80,38 @@ it('shows a saved Agent profile name in the Work composer without exposing its s
   expect(current.works[0]?.profileId).toBe(profileId);
 });
 
+it('prefers the frozen implementation profile name after the saved profile is renamed', async () => {
+  const profileId = 'setting_263d-profile';
+  const work = { id: 'work', projectId: project.id, title: 'Current Work', overview: '', status: 'in_progress' as const, revision: 1, profileId, connectionId: 'provider-1', sources: [], createdAt: '', updatedAt: '' };
+  const current = snapshot(owner, [{ ...profileSetting, id: profileId, name: 'Renamed Builder' }]);
+  current.works = [work];
+  const run = { id: 'implementation', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: '', model: 'gpt-6.1-sol', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '2026-10-06T10:00:00.000Z', updatedAt: '2026-10-06T10:01:00.000Z', execution: { provider: 'openai' as const, method: 'codex-host' as const, profileId, profile: { id: profileId, name: 'Original Builder', data: profileSetting.data }, skills: [], tools: [] } };
+  current.runs = [run];
+  window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+  await mount(current);
+
+  const composer = host.querySelector<HTMLInputElement>('input[placeholder="Message Original Builder…"]');
+  expect(composer?.getAttribute('aria-label')).toBe('Message Original Builder');
+  expect(composer?.outerHTML).not.toContain(profileId);
+  expect(current.runs[0]?.execution?.profileId).toBe(profileId);
+  expect(current.works[0]?.profileId).toBe(profileId);
+});
+
+it('uses the frozen profile name when its setting is no longer available', async () => {
+  const profileId = 'setting_removed-profile';
+  const work = { id: 'work', projectId: project.id, title: 'Current Work', overview: '', status: 'in_progress' as const, revision: 1, profileId, connectionId: 'provider-1', sources: [], createdAt: '', updatedAt: '' };
+  const current = snapshot();
+  current.works = [work];
+  current.runs = [{ id: 'implementation', projectId: project.id, workId: work.id, kind: 'implementation', prompt: '', model: 'gpt-6.1-sol', reasoning: 'medium', status: 'completed', generation: 1, createdAt: '2026-10-06T10:00:00.000Z', updatedAt: '2026-10-06T10:01:00.000Z', execution: { provider: 'openai', method: 'codex-host', profileId, profile: { id: profileId, name: 'Original Builder', data: profileSetting.data }, skills: [], tools: [] } } as Snapshot['runs'][number]];
+  window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+  await mount(current);
+
+  const composer = host.querySelector<HTMLInputElement>('input[placeholder="Message Original Builder…"]');
+  expect(composer?.getAttribute('aria-label')).toBe('Message Original Builder');
+  expect(composer?.outerHTML).not.toContain(profileId);
+  expect(current.runs[0]?.execution?.profileId).toBe(profileId);
+});
+
 it('falls back to Agent when a saved Work profile is unavailable', async () => {
   const profileId = 'setting_missing-profile';
   const work = { id: 'work', projectId: project.id, title: 'Current Work', overview: '', status: 'in_progress' as const, revision: 1, profileId, connectionId: 'provider-1', sources: [], createdAt: '', updatedAt: '' };

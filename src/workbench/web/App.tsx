@@ -306,7 +306,12 @@ function ConversationPage({ title, messages, project, snapshot, work, refresh, s
   const canManageProject = useProjectAdmin(project.id, snapshot.member, snapshot.projectRoles?.[project.id]);
   const history = useMessageHistory(project.id, work?.id);
   const displayedMessages = history.messages.length ? history.messages : messages;
-  const agentName = work ? snapshot.settings.find(setting => setting.kind === 'profile' && setting.id === work.profileId)?.name ?? 'Agent' : undefined;
+  const firstImplementation = work ? snapshot.runs.filter(run => run.projectId === project.id && run.workId === work.id && run.kind === 'implementation')
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0] : undefined;
+  const frozenProfileId = firstImplementation?.execution?.profileId ?? firstImplementation?.execution?.profile?.id ?? work?.profileId;
+  const agentName = work
+    ? firstImplementation?.execution?.profile?.name ?? snapshot.settings.find(setting => setting.kind === 'profile' && !setting.projectId && setting.id === frozenProfileId)?.name ?? 'Agent'
+    : undefined;
   return <div className={`${work ? 'flex min-h-0 flex-1 flex-col' : 'flex h-[calc(100dvh-7.5rem)] flex-col'}`}>
     {title && <div className="mb-5 flex items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{work ? 'Conversation with the responsible Agent, Master, and subagents.' : `Project conversation · ${project.name}`}</p></div>{work && <Badge variant="outline">{work.status.replace('_', ' ')}</Badge>}</div>}
     {workRuns.map(run => <RunNotice key={run.id} run={run} canManageProject={canManageProject} refresh={refresh} setError={setError} />)}
