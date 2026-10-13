@@ -489,6 +489,64 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(runtime.every((r:{connectorId:string}) => r.connectorId !== provider.id)).toBe(true);
         expect(runtime.some((r:{verifiedRunId?:string}) => !!r.verifiedRunId)).toBe(true);
     });
+    it('loads project skills for profile-free Master and implementation runs, then freezes same-kind history', async () => {
+        const isolatedProject = (await user('POST', '/projects', { name: 'Profile-free project skills' })).json();
+        await enrollProvider('project-skill-profile-free', [isolatedProject.id]);
+        const skill = (await user('POST', '/settings', { kind: 'skill', projectId: isolatedProject.id, name: 'Project-only execution rule', data: { content: 'Version one' } })).json();
+        const expected = [{ id: skill.id, name: skill.name, content: 'Version one', contentSha256: createHash('sha256').update('Version one').digest('hex') }];
+
+        const master = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Use project instructions', requestId: 'project-skill-profile-free-master' })).json().run;
+        expect(master.kind).toBe('master');
+        expect(master.execution.skills).toEqual(expected);
+
+        const work = (await user('POST', `/projects/${isolatedProject.id}/works`, { title: 'No profile implementation' })).json();
+        const first = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Start implementation', workId: work.id, requestId: 'project-skill-profile-free-implementation' })).json().run;
+        expect(first.kind).toBe('implementation');
+        expect(first.execution.profileId).toBeUndefined();
+        expect(first.execution.skills).toEqual(expected);
+
+        await user('PATCH', `/settings/${skill.id}`, { data: { content: 'Version two' } });
+        const continued = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Continue same execution', workId: work.id, requestId: 'project-skill-profile-free-continue' })).json().run;
+        expect(continued.id).not.toBe(first.id);
+        expect(continued.execution.skills).toEqual(expected);
+        const nextWork = (await user('POST', `/projects/${isolatedProject.id}/works`, { title: 'Fresh no-profile implementation' })).json();
+        const fresh = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Start a fresh execution', workId: nextWork.id, requestId: 'project-skill-profile-free-fresh' })).json().run;
+        expect(fresh.execution.skills).toEqual([{ id: skill.id, name: skill.name, content: 'Version two', contentSha256: createHash('sha256').update('Version two').digest('hex') }]);
+    });
+    it('merges project skills into new Run snapshots while keeping settings isolated and resumes frozen', async () => {
+        const project = (await user('POST', '/projects', { name: 'Profiled project skills' })).json();
+        const skillConnector = await enrollProvider('project-skill-profiled', [project.id]);
+        const otherProject = (await user('POST', '/projects', { name: 'Other project skill isolation' })).json();
+        const workspaceSkill = (await user('POST', '/settings', { kind: 'skill', name: 'Shared execution guidance', data: { content: 'Shared content' } })).json();
+        const projectSkill = (await user('POST', '/settings', { kind: 'skill', projectId: project.id, name: 'Project execution guidance', data: { content: 'Project version one' } })).json();
+        const disabledSkill = (await user('POST', '/settings', { kind: 'skill', projectId: project.id, name: 'Disabled project guidance', data: { content: 'Must stay disabled', enabled: false } })).json();
+        const outsideSkill = (await user('POST', '/settings', { kind: 'skill', projectId: otherProject.id, name: 'Other project guidance', data: { content: 'Must not leak' } })).json();
+        const profile = (await user('POST', '/settings', { kind: 'profile', name: 'Project skill fixture profile', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [workspaceSkill.id], tools: [] } })).json();
+        const work = (await user('POST', `/projects/${project.id}/works`, { title: 'Project skill snapshot', profileId: profile.id })).json();
+        const first = (await user('POST', `/projects/${project.id}/messages`, { text: 'Create the first implementation run', workId: work.id, requestId: 'project-skill-snapshot-first' })).json().run;
+        const expectedFirstSkills = [
+            { id: workspaceSkill.id, name: workspaceSkill.name, content: 'Shared content', contentSha256: createHash('sha256').update('Shared content').digest('hex') },
+            { id: projectSkill.id, name: projectSkill.name, content: 'Project version one', contentSha256: createHash('sha256').update('Project version one').digest('hex') }
+        ];
+        expect(first.execution.skills).toEqual(expectedFirstSkills);
+        expect(first.execution.skills.some((skill: any) => skill.id === disabledSkill.id || skill.id === outsideSkill.id)).toBe(false);
+
+        const claimed = (await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${skillConnector.token}` }, payload: connectorFixturePayload('/claim', {}) as never })).json().run;
+        expect(claimed.id).toBe(first.id);
+        expect((await user('POST', `/runs/${first.id}/pause`, {})).statusCode).toBe(200);
+        await user('PATCH', `/settings/${projectSkill.id}`, { data: { content: 'Project version two' } });
+        await user('PATCH', `/settings/${disabledSkill.id}`, { data: { enabled: true } });
+        expect((await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${first.id}/stopped`, headers: { authorization: `Bearer ${skillConnector.token}` }, payload: { generation: claimed.generation, threadId: 'project-skill-resume-thread' } })).statusCode).toBe(200);
+        expect((await user('POST', `/runs/${first.id}/resume`, {})).statusCode).toBe(200);
+        const resumed = (await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${skillConnector.token}` }, payload: connectorFixturePayload('/claim', {}) as never })).json().run;
+        expect(resumed.execution.skills).toEqual(expectedFirstSkills);
+
+        const nextWork = (await user('POST', `/projects/${project.id}/works`, { title: 'Read updated project skill', profileId: profile.id })).json();
+        const next = (await user('POST', `/projects/${project.id}/messages`, { text: 'Create a fresh implementation run', workId: nextWork.id, requestId: 'project-skill-snapshot-new-work' })).json().run;
+        expect(next.execution.skills.map((skill: any) => skill.id).sort()).toEqual([workspaceSkill.id, projectSkill.id, disabledSkill.id].sort());
+        expect(next.execution.skills.find((skill: any) => skill.id === projectSkill.id)).toMatchObject({ content: 'Project version two', contentSha256: createHash('sha256').update('Project version two').digest('hex') });
+        expect(next.execution.skills.some((skill: any) => skill.id === outsideSkill.id)).toBe(false);
+    });
     it("imports a commit-bound GitHub skill directory and rejects incomplete upstream listings", async () => {
         const importProjectId = (await user("POST", "/projects", { name: "GitHub skill import fixture" })).json().id as string;
         const ref = "a".repeat(40);
@@ -689,6 +747,13 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const createdSkill = createdSkillResponse.json(); if (createdSkill.id) recordIds.add(createdSkill.id);
             expect(createdSkillResponse.statusCode).toBe(200);
             expect(createdSkill.data.contentSha256).toBe(createHash('sha256').update('Created project skill body').digest('hex'));
+            const otherProject = await user('POST', '/projects', { name: 'Marketplace skill isolation' });
+            expect(otherProject.statusCode).toBe(200);
+            recordIds.add(otherProject.json().id);
+            const otherProjectSkillResponse = await user('POST', '/settings', { kind: 'skill', projectId: otherProject.json().id, name: 'Other project skill', data: { content: 'Must not enter this project run' } });
+            const otherProjectSkill = otherProjectSkillResponse.json();
+            recordIds.add(otherProjectSkill.id);
+            expect(otherProjectSkillResponse.statusCode).toBe(200);
             const legacyImportResponse = await user('POST', `/projects/${projectIdForCase}/skills/import`, { url: 'https://github.com/example/legacy/blob/main/SKILL.md' });
             const legacySkill = legacyImportResponse.json(); if (legacySkill.id) recordIds.add(legacySkill.id);
             expect(legacyImportResponse.statusCode).toBe(200);
@@ -701,6 +766,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(legacyCopyResponse.statusCode).toBe(200);
             expect(createdCopy.data.installed).toBe(false);
             expect(legacyCopy.data.installed).toBe(true);
+            const projectSkillIds = [imported[0]!.id, imported[1]!.id, createdSkill.id, legacySkill.id].sort();
+            const allWorkspaceCopyIds = [copied.id, resourceCopy.id, createdCopy.id, legacyCopy.id].sort();
+            const expectRunSkillIds = (skills: Array<{ id: string }>, workspaceCopyIds: string[]) => {
+                expect(skills.map(skill => skill.id).sort()).toEqual([...projectSkillIds, ...workspaceCopyIds].sort());
+                expect(skills.some(skill => skill.id === otherProjectSkill.id)).toBe(false);
+            };
             const createdEdit = await user('PATCH', `/settings/${createdCopy.id}`, { data: { content: 'Edited created skill' } });
             const legacyEdit = await user('PATCH', `/settings/${legacyCopy.id}`, { data: { content: 'Edited legacy GitHub skill' } });
             expect(createdEdit.statusCode).toBe(200);
@@ -781,7 +852,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(claimed1.run.id).toBe(run1.id);
             expect(claimed1.run.requestedBy).toBe(me.id);
             expect(claimed1.run.connectorId).toBe(connectorIdForCase);
-            expect(claimed1.execution.skills).toHaveLength(4);
+            expectRunSkillIds(claimed1.execution.skills, allWorkspaceCopyIds);
             expect(run1.execution.skills[0].bundle).toEqual(expectedFrozenBundle);
             expect(claimed1.execution.skills.find((skill:any)=>skill.id===resourceCopy.id).bundle).toEqual(imported[1]!.data.bundle);
             verifyBundle(claimed1.execution.skills.find((skill:any)=>skill.id===resourceCopy.id).bundle);
@@ -791,10 +862,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const disabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited after run one', enabled: false } });
             expect(disabled.statusCode).toBe(200);
             const run2 = await submitWork('Disabled next run', `marketplace-${randomUUID()}`);
-            expect(run2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
+            const remainingWorkspaceCopyIds = [resourceCopy.id, createdCopy.id, legacyCopy.id].sort();
+            expectRunSkillIds(run2.execution.skills, remainingWorkspaceCopyIds);
             const claimed2 = await claim();
             expect(claimed2.run.id).toBe(run2.id);
-            expect(claimed2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
+            expectRunSkillIds(claimed2.execution.skills, remainingWorkspaceCopyIds);
             const enabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited and re-enabled for a new run', enabled: true } });
             expect(enabled.statusCode).toBe(200);
             expect(enabled.json().data.contentSha256).toBe(createHash('sha256').update('Edited and re-enabled for a new run').digest('hex'));
@@ -802,6 +874,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(run3.execution.skills[0].content).toBe('Edited and re-enabled for a new run');
             const claimed3 = await claim();
             expect(claimed3.run.id).toBe(run3.id);
+            expectRunSkillIds(claimed3.execution.skills, allWorkspaceCopyIds);
             expect(claimed3.execution.skills[0]).toMatchObject({ id: copied.id, content: 'Edited and re-enabled for a new run', copiedFrom: copied.data.copiedFrom });
             const createdRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === createdCopy.id);
             const legacyRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === legacyCopy.id);
@@ -812,6 +885,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const run4 = await submitWork('Copied source edits are frozen', `marketplace-${randomUUID()}`);
             const claimed4 = await claim();
             expect(claimed4.run.id).toBe(run4.id);
+            expectRunSkillIds(claimed4.execution.skills, allWorkspaceCopyIds);
             expect(claimed4.execution.skills.find((skill: any) => skill.id === createdCopy.id)).toMatchObject({ content: 'Create copy edited after run', contentSha256: createHash('sha256').update('Create copy edited after run').digest('hex') });
             expect(claimed4.execution.skills.find((skill: any) => skill.id === legacyCopy.id)).toMatchObject({ content: 'Legacy copy edited after run', contentSha256: createHash('sha256').update('Legacy copy edited after run').digest('hex') });
             const frozenCopiedRun = (await sql`SELECT data FROM wb_records WHERE id=${run3.id} AND kind='run'`)[0]!.data as Run;
@@ -1855,7 +1929,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const work=(await user('POST',`/projects/${project.id}/works`,{title:'Use the shared profile',profileId:profile.id})).json();
             const dispatched=await user('POST',`/projects/${project.id}/messages`,{workId:work.id,text:'Use reusable instructions',requestId:`shared-profile-${project.id}`});
             expect(dispatched.statusCode).toBe(200);
-            expect(dispatched.json().run.execution.skills).toEqual([{id:global.id,name:'Reusable instructions',content:'All authorized Projects',contentSha256:createHash('sha256').update('All authorized Projects').digest('hex')}]);
+            expect(dispatched.json().run.execution.skills).toEqual([
+                {id:global.id,name:'Reusable instructions',content:'All authorized Projects',contentSha256:createHash('sha256').update('All authorized Projects').digest('hex')},
+                ...(project.id===a.id?[{id:scoped.id,name:scoped.name,content:'Only project A',contentSha256:createHash('sha256').update('Only project A').digest('hex')}]:[])
+            ]);
         }
     });
     it("survives service restart", async () => {
@@ -1978,6 +2055,28 @@ describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
    await sql`DELETE FROM wb_bridge_tokens WHERE run_id=${runId}`;
    await sql`DELETE FROM wb_records WHERE id=${runId}`;
   }
+ });
+ it('keeps finite read and renewal control available after ordinary Connector traffic exhausts its budget',async()=>{
+  const actor=(await sql`SELECT id FROM wb_users WHERE email=${owner}`)[0]!.id;
+  const project=(await app.inject({method:'POST',url:'/api/workbench/projects',headers:{cookie},payload:{name:'Lease control fixture'}})).json();
+  const connectorId=`rate-control-${suffix}`,raw=randomUUID(),runId=`control-run-${suffix}`,otherRunId=`control-other-${suffix}`;
+  connectorIds.push(connectorId);await sql`INSERT INTO wb_connectors(id,digest,project_ids) VALUES (${connectorId},${digest(raw)},${sql.json([project.id])})`;
+  const stamp=new Date().toISOString(),before=new Date(Date.now()+30000).toISOString();
+  const run:Run={id:runId,projectId:project.id,connectorId,requestedBy:actor,kind:'master',model:'gpt-6.1-sol',reasoning:'medium',prompt:'Fixture',status:'running',generation:1,leaseUntil:before,createdAt:stamp,updatedAt:stamp};
+  const store=new WorkbenchStore(sql);await store.put('run',run);await store.put('run',{...run,id:otherRunId});
+  const headers={authorization:`Bearer ${raw}`};
+  try{
+   for(let n=0;n<180;n++)expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{capabilities:{codexAppServer:true,localWorktrees:true,models:['gpt-6.1-sol']}}})).statusCode).toBe(204);
+   expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers,payload:{capabilities:{codexAppServer:true,localWorktrees:true,models:['gpt-6.1-sol']}}})).statusCode).toBe(429);
+   expect((await app.inject({url:`/api/workbench/connector/runs/${runId}`,headers})).statusCode).toBe(200);
+   const renewed=await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:1}});expect(renewed.statusCode).toBe(200);expect(Date.parse(renewed.json().leaseUntil)).toBeGreaterThan(Date.parse(before));
+   expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:2}})).statusCode).toBe(409);
+   await sql`UPDATE wb_users SET role='member' WHERE id=${actor}`;await sql`DELETE FROM wb_memberships WHERE project_id=${project.id} AND user_id=${actor}`;
+   expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${runId}/renew`,headers,payload:{generation:1}})).statusCode).toBe(403);await sql`UPDATE wb_users SET role='owner' WHERE id=${actor}`;
+   // The same Connector changing run IDs still shares one finite control budget.
+   for(let n=4;n<180;n++)expect((await app.inject({url:`/api/workbench/connector/runs/${n%2?runId:otherRunId}`,headers})).statusCode).toBe(200);
+   expect((await app.inject({method:'POST',url:`/api/workbench/connector/runs/${otherRunId}/renew`,headers,payload:{generation:1}})).statusCode).toBe(429);
+  }finally{await sql`UPDATE wb_users SET role='owner' WHERE id=${actor}`;await sql`DELETE FROM wb_memberships WHERE project_id=${project.id}`;await sql`DELETE FROM wb_records WHERE id=ANY(${[runId,otherRunId,project.id]})`;}
  });
  it('unknown routes remain anonymous even with a valid session',async()=>{
   const key=rateLimitKey(sql);

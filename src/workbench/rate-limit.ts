@@ -15,7 +15,11 @@ export function rateLimitKey(sql: Sql) {
       if (!raw || raw.length > 200) return anonymous;
       const tokenDigest = digest(raw);
       const connectors = await sql`SELECT id FROM wb_connectors WHERE digest=${tokenDigest}`;
-      if (connectors[0]) return `connector:${connectors[0].id}`;
+      if (connectors[0]) {
+        // Keep cancellation/lease checks available when ordinary traffic exhausts its budget.
+        const control = route === '/api/workbench/connector/runs/:id' || route === '/api/workbench/connector/runs/:id/renew';
+        return `connector:${connectors[0].id}${control ? ':lease-control' : ''}`;
+      }
       if (route === '/api/workbench/connector/runs/:id/tools') {
         const runId = (req.params as {id?: string}).id ?? '';
         const grants = await sql`
