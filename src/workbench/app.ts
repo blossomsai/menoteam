@@ -1,4 +1,5 @@
 import { verifyBundle, editBundleMarkdown, freezeSkillBundle, verifyExecutionSkills } from './skill-bundle.js';
+import { freezeRunSkills } from './run-skills.js';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import Fastify, { type FastifyRequest, type FastifyInstance } from "fastify";
@@ -468,9 +469,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if(targetWork?.profileId && !profile && !snapshotRun && !firstCrossKindReview)fail(400,"Agent profile missing");
         if (profile && (profile.kind !== "profile" || profile.projectId))
             fail(400, "Invalid agent profile");
-        const skills = snapshotRun?.execution?structuredClone(snapshotRun.execution.skills):profile ? (await resolveProfileSkills(profile, tx))
-            .filter(skill => skill.data.enabled !== false)
-            .map(skill => ({...(skill.data.bundle !== undefined ? {bundle: freezeSkillBundle(skill.data.bundle, String(skill.data.content))} : {}), id: skill.id, name: skill.name, content: String(skill.data.content), ...(typeof skill.data.provenance === 'string' ? {provenance: skill.data.provenance} : {}), ...(typeof skill.data.sourceUrl === 'string' ? {sourceUrl: skill.data.sourceUrl} : {}), ...(typeof skill.data.requestedRef === 'string' ? {requestedRef: skill.data.requestedRef} : {}), ...(typeof skill.data.resolvedSha === 'string' ? {resolvedSha: skill.data.resolvedSha} : {}), ...(typeof skill.data.sourcePath === 'string' ? {sourcePath: skill.data.sourcePath} : {}), ...(typeof skill.data.contentSha256 === 'string' ? {contentSha256: skill.data.contentSha256} : {}), ...(typeof skill.data.sourceContentSha256 === 'string' ? {sourceContentSha256: skill.data.sourceContentSha256} : {}), ...(typeof skill.data.catalogUrl === 'string' ? {catalogUrl: skill.data.catalogUrl} : {}), ...(typeof skill.data.catalogResolvedSha === 'string' ? {catalogResolvedSha: skill.data.catalogResolvedSha} : {}), ...(skill.data.copiedFrom && typeof skill.data.copiedFrom === 'object' ? {copiedFrom: structuredClone(skill.data.copiedFrom) as ExecutionContext['skills'][number]['copiedFrom']} : {})})) : [];
+        const skills = snapshotRun?.execution
+            ? structuredClone(snapshotRun.execution.skills)
+            : freezeRunSkills(profile ? await resolveProfileSkills(profile, tx) : [], await store.list<Setting>('setting', projectId, tx), projectId);
         verifyExecutionSkills(skills);
         if(snapshotRun&&!handoff&&input.model&&input.model!==snapshotRun.model)fail(409,'Frozen model cannot change');
         const model=handoff?.model??snapshotRun?.model??input.model ?? (input.kind==='implementation'&&profile?String(profile.data.model):input.kind==='implementation'?'gpt-6-luna':'gpt-6.1-sol');

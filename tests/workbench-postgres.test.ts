@@ -489,6 +489,64 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(runtime.every((r:{connectorId:string}) => r.connectorId !== provider.id)).toBe(true);
         expect(runtime.some((r:{verifiedRunId?:string}) => !!r.verifiedRunId)).toBe(true);
     });
+    it('loads project skills for profile-free Master and implementation runs, then freezes same-kind history', async () => {
+        const isolatedProject = (await user('POST', '/projects', { name: 'Profile-free project skills' })).json();
+        await enrollProvider('project-skill-profile-free', [isolatedProject.id]);
+        const skill = (await user('POST', '/settings', { kind: 'skill', projectId: isolatedProject.id, name: 'Project-only execution rule', data: { content: 'Version one' } })).json();
+        const expected = [{ id: skill.id, name: skill.name, content: 'Version one', contentSha256: createHash('sha256').update('Version one').digest('hex') }];
+
+        const master = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Use project instructions', requestId: 'project-skill-profile-free-master' })).json().run;
+        expect(master.kind).toBe('master');
+        expect(master.execution.skills).toEqual(expected);
+
+        const work = (await user('POST', `/projects/${isolatedProject.id}/works`, { title: 'No profile implementation' })).json();
+        const first = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Start implementation', workId: work.id, requestId: 'project-skill-profile-free-implementation' })).json().run;
+        expect(first.kind).toBe('implementation');
+        expect(first.execution.profileId).toBeUndefined();
+        expect(first.execution.skills).toEqual(expected);
+
+        await user('PATCH', `/settings/${skill.id}`, { data: { content: 'Version two' } });
+        const continued = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Continue same execution', workId: work.id, requestId: 'project-skill-profile-free-continue' })).json().run;
+        expect(continued.id).not.toBe(first.id);
+        expect(continued.execution.skills).toEqual(expected);
+        const nextWork = (await user('POST', `/projects/${isolatedProject.id}/works`, { title: 'Fresh no-profile implementation' })).json();
+        const fresh = (await user('POST', `/projects/${isolatedProject.id}/messages`, { text: 'Start a fresh execution', workId: nextWork.id, requestId: 'project-skill-profile-free-fresh' })).json().run;
+        expect(fresh.execution.skills).toEqual([{ id: skill.id, name: skill.name, content: 'Version two', contentSha256: createHash('sha256').update('Version two').digest('hex') }]);
+    });
+    it('merges project skills into new Run snapshots while keeping settings isolated and resumes frozen', async () => {
+        const project = (await user('POST', '/projects', { name: 'Profiled project skills' })).json();
+        const skillConnector = await enrollProvider('project-skill-profiled', [project.id]);
+        const otherProject = (await user('POST', '/projects', { name: 'Other project skill isolation' })).json();
+        const workspaceSkill = (await user('POST', '/settings', { kind: 'skill', name: 'Shared execution guidance', data: { content: 'Shared content' } })).json();
+        const projectSkill = (await user('POST', '/settings', { kind: 'skill', projectId: project.id, name: 'Project execution guidance', data: { content: 'Project version one' } })).json();
+        const disabledSkill = (await user('POST', '/settings', { kind: 'skill', projectId: project.id, name: 'Disabled project guidance', data: { content: 'Must stay disabled', enabled: false } })).json();
+        const outsideSkill = (await user('POST', '/settings', { kind: 'skill', projectId: otherProject.id, name: 'Other project guidance', data: { content: 'Must not leak' } })).json();
+        const profile = (await user('POST', '/settings', { kind: 'profile', name: 'Project skill fixture profile', data: { model: 'gpt-6-luna', reasoning: 'medium', skillIds: [workspaceSkill.id], tools: [] } })).json();
+        const work = (await user('POST', `/projects/${project.id}/works`, { title: 'Project skill snapshot', profileId: profile.id })).json();
+        const first = (await user('POST', `/projects/${project.id}/messages`, { text: 'Create the first implementation run', workId: work.id, requestId: 'project-skill-snapshot-first' })).json().run;
+        const expectedFirstSkills = [
+            { id: workspaceSkill.id, name: workspaceSkill.name, content: 'Shared content', contentSha256: createHash('sha256').update('Shared content').digest('hex') },
+            { id: projectSkill.id, name: projectSkill.name, content: 'Project version one', contentSha256: createHash('sha256').update('Project version one').digest('hex') }
+        ];
+        expect(first.execution.skills).toEqual(expectedFirstSkills);
+        expect(first.execution.skills.some((skill: any) => skill.id === disabledSkill.id || skill.id === outsideSkill.id)).toBe(false);
+
+        const claimed = (await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${skillConnector.token}` }, payload: connectorFixturePayload('/claim', {}) as never })).json().run;
+        expect(claimed.id).toBe(first.id);
+        expect((await user('POST', `/runs/${first.id}/pause`, {})).statusCode).toBe(200);
+        await user('PATCH', `/settings/${projectSkill.id}`, { data: { content: 'Project version two' } });
+        await user('PATCH', `/settings/${disabledSkill.id}`, { data: { enabled: true } });
+        expect((await app.inject({ method: 'POST', url: `/api/workbench/connector/runs/${first.id}/stopped`, headers: { authorization: `Bearer ${skillConnector.token}` }, payload: { generation: claimed.generation, threadId: 'project-skill-resume-thread' } })).statusCode).toBe(200);
+        expect((await user('POST', `/runs/${first.id}/resume`, {})).statusCode).toBe(200);
+        const resumed = (await app.inject({ method: 'POST', url: '/api/workbench/connector/claim', headers: { authorization: `Bearer ${skillConnector.token}` }, payload: connectorFixturePayload('/claim', {}) as never })).json().run;
+        expect(resumed.execution.skills).toEqual(expectedFirstSkills);
+
+        const nextWork = (await user('POST', `/projects/${project.id}/works`, { title: 'Read updated project skill', profileId: profile.id })).json();
+        const next = (await user('POST', `/projects/${project.id}/messages`, { text: 'Create a fresh implementation run', workId: nextWork.id, requestId: 'project-skill-snapshot-new-work' })).json().run;
+        expect(next.execution.skills.map((skill: any) => skill.id).sort()).toEqual([workspaceSkill.id, projectSkill.id, disabledSkill.id].sort());
+        expect(next.execution.skills.find((skill: any) => skill.id === projectSkill.id)).toMatchObject({ content: 'Project version two', contentSha256: createHash('sha256').update('Project version two').digest('hex') });
+        expect(next.execution.skills.some((skill: any) => skill.id === outsideSkill.id)).toBe(false);
+    });
     it("imports a commit-bound GitHub skill directory and rejects incomplete upstream listings", async () => {
         const importProjectId = (await user("POST", "/projects", { name: "GitHub skill import fixture" })).json().id as string;
         const ref = "a".repeat(40);
