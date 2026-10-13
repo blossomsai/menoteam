@@ -200,7 +200,7 @@ export async function runQaCommand(state:QaExecution,executable:string,args:stri
       signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
       child.once('error',()=>finish(new Error('QA launcher failed')));
       child.once('close',()=>finish(new Error('QA launcher stopped before result')));
-      child.on('message',(message:{ready?:boolean;exitCode?:number|null})=>{
+      child.on('message',(message:{ready?:boolean;exitCode?:number|null;spawnErrorCode?:string})=>{
         if(settled)return;
         if(message.ready){handshake=(async()=>{
           const identity=await readJson<CodexProcessIdentity>(identityFile);
@@ -216,7 +216,12 @@ export async function runQaCommand(state:QaExecution,executable:string,args:stri
             child.send({executable,args,cwd});
           });
         })().catch(error=>finish(error as Error));}
-        else finish(undefined,{exitCode:message.exitCode??null,output});
+        else {
+          const code=typeof message.spawnErrorCode==='string'&&/^[A-Z0-9_]{1,32}$/u.test(message.spawnErrorCode)?message.spawnErrorCode:undefined;
+          const executableName=path.basename(executable).replace(/[^A-Za-z0-9._+-]/gu,'?').slice(0,80)||'unknown';
+          const diagnostic=code?`QA command could not start: ${executableName} (${code}).\n`:'';
+          finish(undefined,{exitCode:message.exitCode??null,output:(output+diagnostic).slice(-30_000)});
+        }
       });
     });
   } finally {

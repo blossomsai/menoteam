@@ -1894,6 +1894,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const changed=Buffer.from('different bytes\n');await expect(client.addArtifact(run.id,run.generation,{...payload(0),data:{...payload(0).data,contentBase64:changed.toString('base64'),chunkSha256:createHash('sha256').update(changed).digest('hex')}})).rejects.toMatchObject({status:409});expect(await count()).toBe(1);
         const query=new URLSearchParams({path:filePath,revision});const partial=await fetch(`${serverUrl}/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file?${query}`,{headers:{cookie}});expect(partial.status).toBe(200);expect(await partial.json()).toMatchObject({complete:false,incomplete:true});
         for(let index=1;index<parts.length;index++)await client.addArtifact(run.id,run.generation,payload(index));expect(await count()).toBe(parts.length);
+        const artifactStore=new WorkbenchStore(sql);
+        for(const artifacts of [await artifactStore.list<Artifact>('artifact',p.id),await artifactStore.list<Artifact>('artifact'),await artifactStore.transaction(p.id,tx=>artifactStore.list<Artifact>('artifact',p.id,tx))]){
+            expect(artifacts.some(item=>item.id===parent.id)).toBe(true);
+            expect(artifacts.some(item=>item.kind==='diff_file_chunk')).toBe(false);
+        }
+        expect(await count()).toBe(parts.length);
         const saved=(await sql`SELECT data FROM wb_records WHERE id=${parent.id} AND kind='artifact'`)[0]!.data;expect(saved.data.files[0]).toMatchObject({path:filePath,textBytes:fileBytes,fileSha256,chunkCount:parts.length});
         // Restart the reader with the same PostgreSQL store; no Connector is used for the offline reads.
         await app.close();app=await createWorkbenchApp({sql,sourceFetcher:(...args)=>sourceFetch(...args)});const readerUrl=await app.listen({port:0,host:'127.0.0.1'});

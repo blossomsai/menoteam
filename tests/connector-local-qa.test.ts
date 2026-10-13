@@ -56,6 +56,18 @@ describe('generic authorized fixed-parent QA (real subprocesses, no network)',()
     saved.coverage='menoteam-full/v2';
     expect((await captureRequiredLocalQa(cwd,{...options,policy:saved,resources:{[saved.resource.id]:{url:'postgres://fixture-only@127.0.0.1:55439/fixture_test'}}})).checks).toEqual([]);
   },20_000),20_000);
+  it('retains a safe ENOENT diagnostic for a missing repo-bin without passing when QA cannot launch',async()=>fixture(async(cwd,f)=>{
+    const saved=policy(),database=`missing_${Date.now()}_test`,password='private%20fixture-secret';
+    const url=`postgres://qa-user:${password}@127.0.0.1:65432/${database}`;
+    saved.resource={id:'missing-executable-db',kind:'postgres',hostname:'127.0.0.1',port:65432,database,disposable:true};
+    saved.requirements=[{id:'missing-repo-bin',category:'typecheck',commands:[{executable:'repo-bin',bin:'menoteam-missing-qa-tool',args:['--token','private-argument-secret'],timeoutMs:10_000}],report:'none'}];
+    const qa=await f.track(captureRequiredLocalQa(cwd,{policy:saved,resources:{[saved.resource.id]:{url}},dataDirectory:path.join(cwd,'parent-state'),state:execution(f),signal:f.abort.signal,save:async state=>writeSecureJson(path.join(cwd,'parent-state','spool.json'),state)}));
+    const check=qa.checks[0]!;
+    expect(check.exitCode).toBeNull();expect(check.output).toContain('menoteam-missing-qa-tool (ENOENT)');
+    expect(check.output.length).toBeLessThanOrEqual(30_000);
+    expect(check.output).not.toContain(cwd);expect(check.output).not.toContain(url);expect(check.output).not.toContain(password);expect(check.output).not.toContain('private-argument-secret');
+    expect(qa.verification).toBe('unknown');expect(hasRequiredLocalQa(qa,qa.candidateFingerprint,saved)).toBe(false);
+  },45_000),45_000);
 });
 
 

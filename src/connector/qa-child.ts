@@ -17,7 +17,10 @@ process.on('message',(message:{executable:string;args:string[];cwd:string})=>{
   started=true;
   const child=spawn(message.executable,message.args,{cwd:message.cwd,env:process.env,stdio:['ignore','pipe','pipe'],shell:false,detached:false});
   child.stdout.on('data',chunk=>process.stdout.write(chunk));child.stderr.on('data',chunk=>process.stderr.write(chunk));
-  child.on('error',()=>process.send?.({exitCode:null}));
+  child.on('error',error=>{
+    const code=(error as NodeJS.ErrnoException).code;
+    process.send?.({exitCode:null,spawnErrorCode:typeof code==='string'&&/^[A-Z0-9_]{1,32}$/u.test(code)?code:'UNKNOWN'});
+  });
   child.on('close',(code,signal)=>process.send?.({exitCode:signal?null:code}));
 });
 process.send({ready:true});

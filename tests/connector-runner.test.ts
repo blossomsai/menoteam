@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
+import { z } from 'zod';
 import { WorkbenchConnectorClient as HttpClient } from '../src/connector/client.js';
 import { describe,it,expect,vi } from 'vitest';
 import { ConnectorRunner,buildRunPrompt } from '../src/connector/runner.js';
@@ -20,7 +21,50 @@ function claim():ClaimedRun {
 }
 const execFile=promisify(execFileCallback);
 describe('Integrated connector lifecycle',()=>{
-  it('resumes a partially acknowledged diff upload from the same durable candidate cursor',async()=>{
+  it.each([
+    {stage:'read-run',error:new ConnectorHttpError(429,'private-token https://private.invalid/path',[], 'GET','connector.runs.read'),category:'http-failure',status:429},
+    {stage:'renew',error:new ConnectorHttpError(403,'private-token https://private.invalid/path',[], 'POST','connector.runs.renew'),category:'http-failure',status:403},
+    {stage:'read-run',error:new DOMException('private-token https://private.invalid/path','TimeoutError'),category:'timeout'},
+    {stage:'renew',error:new TypeError('private-token https://private.invalid/path'),category:'transport-failure'},
+    {stage:'read-run',error:z.object({status:z.string()}).safeParse({status:123}).error!,category:'response-validation'},
+    {stage:'renew',error:new Error('private-token https://private.invalid/path'),category:'local-failure'},
+    {stage:'renew',error:new ConnectorHttpError(403,'private-token https://private.invalid/path'),category:'http-failure',status:403,diagnosticUnavailable:true},
+  ])('retains safe monitor failure for $stage/$category and stops before acknowledging',async({stage,error,category,status,diagnosticUnavailable})=>{
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-monitor-diagnostic-'));
+    const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'connector-secret',connectorId:'one',dataDir,projects:{},leaseRenewIntervalMs:5};
+    const nativeExit=new Error('Codex app-server exited (0)');
+    let nativeEntered=false;let rejectTurn:((error:Error)=>void)|undefined;let processStopped=false;let monitorFailures=0;
+    const order:string[]=[];
+    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),run:async()=>{nativeEntered=true;return new Promise((_resolve,reject)=>{rejectTurn=reject;});},stop:async()=>{if(nativeEntered&&!processStopped){processStopped=true;order.push('process-stop');rejectTurn!(nativeExit);}}} as unknown as CodexAppServer;
+    const stopped=vi.fn(async()=>{expect(processStopped).toBe(true);order.push('stopped-ack');});
+    const complete=vi.fn();
+    const client={createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),readRun:async()=>{if(nativeEntered&&!processStopped&&stage==='read-run'){monitorFailures++;throw error;}return claim().run;},renew:async()=>{if(nativeEntered&&!processStopped&&stage==='renew'){monitorFailures++;throw error;}return claim().run;},stopped,complete} as unknown as WorkbenchConnectorClient;
+    const runner=new ConnectorRunner(cfg,{native:()=>native,client:()=>client});
+    (runner as unknown as {client:WorkbenchConnectorClient}).client=client;
+    const log=vi.spyOn(console,'error').mockImplementation(()=>{});
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    try{
+      if(diagnosticUnavailable)await writeFile(path.join(dataDir,'diagnostics'),'blocked diagnostic directory');
+      const execution=runner.execute(claim());
+      await expect(Promise.race([execution,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Monitor did not stop the native run')),2_000);})])).rejects.toBe(nativeExit);
+      expect(monitorFailures).toBe(1);
+      expect(stopped).toHaveBeenCalledTimes(1);
+      expect(complete).not.toHaveBeenCalled();
+      expect(order).toEqual(['process-stop','stopped-ack']);
+      expect(log).toHaveBeenCalledWith(`Connector monitor failure stage=${stage} category=${category}${status===undefined?'':` status=${status}`}`);
+      const output=JSON.stringify(log.mock.calls);
+      for(const privateText of ['private-token','private.invalid','connector-secret'])expect(output).not.toContain(privateText);
+      if(!diagnosticUnavailable){
+        const file=path.join(dataDir,'diagnostics',`${stateKey('run-one','1')}.json`);
+        const record=JSON.parse(await readFile(file,'utf8'));
+        expect(record).toMatchObject({cause:nativeExit.message,monitorFailure:{stage,category,...(status===undefined?{}:{status})}});
+        expect(Object.keys(record.monitorFailure).sort()).toEqual((status===undefined?['stage','category']:['stage','category','status']).sort());
+        for(const privateText of ['private-token','private.invalid','connector-secret'])expect(JSON.stringify(record)).not.toContain(privateText);
+        expect((await stat(file)).mode&0o777).toBe(0o600);
+      }
+    }finally{if(timer)clearTimeout(timer);await runner.stop();log.mockRestore();await rm(dataDir,{recursive:true,force:true});}
+  });
+    it('resumes a partially acknowledged diff upload from the same durable candidate cursor',async()=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-diff-resume-')),uploadDir=path.join(dataDir,'diff-file-spool','candidate');await mkdir(path.join(uploadDir,createHash('sha256').update('src/雪 file.ts').digest('hex')),{recursive:true});
     const parts=[Buffer.from('first\n'),Buffer.from('second\n')],fileHash=createHash('sha256').update(Buffer.concat(parts)).digest('hex');for(let index=0;index<parts.length;index++)await writeFile(path.join(uploadDir,createHash('sha256').update('src/雪 file.ts').digest('hex'),String(index)),parts[index]!);
     const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'connector-token',connectorId:'one',dataDir,projects:{}};
