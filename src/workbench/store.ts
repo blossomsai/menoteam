@@ -18,7 +18,7 @@ export class WorkbenchStore {
         return rows[0]?.data as T | undefined;
     }
     async list<T>(kind: string, projectId?: string, tx = this.sql): Promise<T[]> {
-        const rows = projectId === undefined ? await tx `SELECT data FROM wb_records WHERE kind=${kind} ORDER BY updated_at,id` : await tx `SELECT data FROM wb_records WHERE kind=${kind} AND project_id=${projectId} ORDER BY updated_at,id`;
+        const rows = projectId === undefined ? await tx `SELECT data FROM wb_records WHERE kind=${kind} AND (${kind}<>'artifact' OR data->>'kind' IS DISTINCT FROM 'diff_file_chunk') ORDER BY updated_at,id` : await tx `SELECT data FROM wb_records WHERE kind=${kind} AND project_id=${projectId} AND (${kind}<>'artifact' OR data->>'kind' IS DISTINCT FROM 'diff_file_chunk') ORDER BY updated_at,id`;
         return rows.map(r => r.data as T);
     }
     async transaction<T>(scope: string, fn: (tx: Sql) => Promise<T>): Promise<T> {

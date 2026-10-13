@@ -43,3 +43,22 @@ it('bounds latest Work diff and assigned candidate QA reads without loading thou
   expect((await store.assignedQaArtifacts(projectId,workId,runId,['assigned-qa','other-qa','chunk-1'])).map(item=>item.id)).toEqual(['assigned-qa']);expect(loadedChunks).toBe(0);
   for(const query of queries)expect(query.indexOf("data->>'kind'=")).toBeLessThan(query.lastIndexOf('LIMIT'));
 });
+
+
+it('excludes internal diff payloads in scoped and global artifact lists while preserving legacy and other records',async()=>{
+  const rows=[{id:'chunk',projectId:'p',kind:'artifact',data:{id:'chunk',kind:'diff_file_chunk',contentBase64:'large'}},{id:'diff',projectId:'p',kind:'artifact',data:{id:'diff',kind:'diff'}},{id:'qa',projectId:'q',kind:'artifact',data:{id:'qa',kind:'qa'}},{id:'legacy',projectId:'p',kind:'artifact',data:{id:'legacy'}},{id:'run',projectId:'p',kind:'run',data:{id:'run',kind:'diff_file_chunk'}}];
+  let loadedChunks=0;
+  const sql=(async(strings:TemplateStringsArray,...values:unknown[])=>{
+    const query=strings.join('?'),scoped=query.includes('project_id=');
+    expect(query).toContain("OR data->>'kind' IS DISTINCT FROM 'diff_file_chunk'");
+    expect(query).toContain('ORDER BY updated_at,id');
+    const kind=values[0],project=scoped?values[1]:undefined;
+    return rows.filter(row=>row.kind===kind&&(project===undefined||row.projectId===project)&&(kind!=='artifact'||row.data.kind!=='diff_file_chunk')).map(row=>{if(row.id==='chunk')loadedChunks++;return {data:row.data};});
+  }) as unknown as Sql;
+  const store=new WorkbenchStore(sql);
+  expect((await store.list<{id:string}>('artifact','p')).map(row=>row.id)).toEqual(['diff','legacy']);
+  expect((await store.list<{id:string}>('artifact')).map(row=>row.id)).toEqual(['diff','qa','legacy']);
+  expect((await store.list<{id:string}>('run','p')).map(row=>row.id)).toEqual(['run']);
+  expect((await store.list<{id:string}>('run')).map(row=>row.id)).toEqual(['run']);
+  expect(loadedChunks).toBe(0);
+});
