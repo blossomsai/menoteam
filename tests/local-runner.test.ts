@@ -92,7 +92,7 @@ let input=''; process.stdin.on('data',c=>input+=c); process.stdin.on('end',()=>{
 
   it('kills TERM-resistant child trees before cancellation settles', async () => {
     const { handle, folder } = await fake(treeScript(false));
-    const heartbeat = join(folder, 'heartbeat'); await waitForFile(heartbeat);
+    const heartbeat = join(folder, 'heartbeat'); await waitForFile(heartbeat, 6_000, handle.result);
     const rejected = expect(handle.result).rejects.toThrow('Codex run cancelled');
     handle.cancel(); await rejected;
     const stopped = await readFile(heartbeat, 'utf8');
