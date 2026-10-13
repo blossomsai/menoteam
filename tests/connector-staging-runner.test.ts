@@ -2,7 +2,7 @@ import { withRecoveryState } from './helpers/connector-recovery.js';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ConnectorRunner } from '../src/connector/runner.js';
 import type { WorkbenchConnectorClient } from '../src/connector/client.js';
 import type { CodexAppServer } from '../src/connector/codex.js';
@@ -36,10 +36,12 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{advanceRecoveryClock?:boolean;stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
+  const actualNow=Date.now;let recoveryOffset=0,recoveryPolls=0;
+  const recoveryClock=options.advanceRecoveryClock?vi.spyOn(Date,'now').mockImplementation(()=>actualNow()+recoveryOffset):undefined;
   const receipts: StagingReceipt[] = [];
   const completions: Array<{ error?: string }> = [];
   const renewals:number[]=[];
@@ -47,7 +49,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
   const buildStatuses:string[]=[];
   const buildReceipts:StagingBuildReceipt[]=[];
   const client = {
-    claim: async () => { if (!claimed&&!options.recovery) { claimed = true; return claim; } await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
+    claim: async () => { if (!claimed&&!options.recovery) { claimed = true; return claim; } if(options.advanceRecoveryClock&&recoveryPolls++===0){expect(receipts.length+stoppedAcks.length).toBe(1);recoveryOffset+=30_000;return undefined;} await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
     renew: async (_id:string,generation:number) => { renewals.push(generation);await options.renew?.(renewals.length);if(options.pauseOnHeartbeat&&renewals.length>1){claim.run.status='paused';throw new Error('lease rejected after pause');}return claim.run; },
     authorizeStagingEffect: async (_id: string, generation: number, effect: 'discovery' | 'provenance' | 'transport' | 'status') => {
       expect(generation).toBe(claim.run.generation);
@@ -80,7 +82,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
     const spools=await Promise.all((await readdir(path.join(dataDir,'spool'))).map(file=>readJson<Record<string,unknown>>(path.join(dataDir,'spool',file))));
     return { receipts, completions, renewals, stoppedAcks, spools,buildStatuses,buildReceipts };
   }
-  finally { await rm(dataDir, { recursive: true, force: true }); }
+  finally { recoveryClock?.mockRestore();await rm(dataDir, { recursive: true, force: true }); }
 }
 
 describe('staging delivery Connector integration', () => {
@@ -94,7 +96,7 @@ describe('staging delivery Connector integration', () => {
       expect(request).toMatchObject({ action: 'status', operationId: runId, expectedCurrentDeploymentId: 'deploy_current' });
       expect(request.previousDeploymentId).toBeUndefined();
       return { operationId: runId, targetId: 'staging', phase: 'rolled_back', deploymentId: action === 'rollback' ? 'deploy_previous' : 'deploy_current', commitSha, imageDigest, activeCommitSha: action === 'rollback' ? commitSha : 'c'.repeat(40), activeImageDigest: action === 'rollback' ? imageDigest : `sha256:${'d'.repeat(64)}`, previousDeploymentId: action === 'rollback' ? 'deploy_current' : `deploy_${runId.slice(4)}`, previousImageDigest: action === 'rollback' ? `sha256:${'d'.repeat(64)}` : imageDigest, checkedAt: new Date().toISOString() };
-    }, { recovery: true, receiptAck: async (_receipt, attempt) => { if (attempt === 1) throw new Error('terminal receipt ACK response lost'); } });
+    }, { recovery: true, advanceRecoveryClock:true, receiptAck: async (_receipt, attempt) => { if (attempt === 1) throw new Error('terminal receipt ACK response lost'); } });
     expect(actions).toEqual(['status']); expect(effects.every(effect => effect === 'status')).toBe(true);
     expect(result.receipts).toHaveLength(2); expect(result.receipts[1]).toEqual(result.receipts[0]);
     expect(result.completions).toEqual([{}]); expect(result.spools).toEqual([]);
@@ -253,7 +255,7 @@ describe('staging delivery Connector integration', () => {
 
   it('retries a durably saved recovery acknowledgement after its first request fails',async()=>{
     const claim=stagingClaim('deploy_intent');claim.run.status='paused';const stops:unknown[]=[];
-    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,recoveryIdentity:true,stopProcess:async value=>{stops.push(value);return true;},stopAck:async(attempt,spool)=>{
+    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,advanceRecoveryClock:true,recoveryIdentity:true,stopProcess:async value=>{stops.push(value);return true;},stopAck:async(attempt,spool)=>{
       expect(spool).toMatchObject({generation:1,stopped:true,stagingTransportStopped:true,stagingIntent:{commitSha,imageDigest}});
       expect(spool?.stagingProcessIdentity).toBeUndefined();
       if(attempt===1)throw new Error('acknowledgement response lost');
@@ -265,7 +267,7 @@ describe('staging delivery Connector integration', () => {
 
   it('keeps failed recovery acknowledgements and unknown remote intent for a later Connector',async()=>{
     const claim=stagingClaim('deploy_intent');claim.run.status='interrupted';
-    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,recoveryIdentity:true,stopProcess:async()=>true,stopAck:async()=>{throw new Error('server unavailable');}});
+    const result=await execute(claim,async()=>{throw new Error('no status authorization');},async()=>{throw new Error('no transport');},{recovery:true,advanceRecoveryClock:true,recoveryIdentity:true,stopProcess:async()=>true,stopAck:async()=>{throw new Error('server unavailable');}});
     expect(result.stoppedAcks).toEqual([1,1]);expect(claim.run.stoppedAt).toBeUndefined();expect(claim.run.operation?.phase).toBe('deploy_intent');
     expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);
     expect(result.spools[0]).toMatchObject({stopped:true,stagingTransportStopped:true,stagingIntent:{commitSha,imageDigest}});
