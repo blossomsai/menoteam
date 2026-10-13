@@ -14,6 +14,7 @@ it('authorizes current reviewer pages using bounded Work metadata without scanni
   const records=new Map<string,{kind:string;data:any}>([[projectId,{kind:'project',data:{id:projectId,repositoryUrl:''}}],[workId,{kind:'work',data:{id:workId,projectId,profileId:''}}],[candidateId,{kind:'run',data:candidate}],[reviewerId,{kind:'run',data:reviewer}],[parent.id,{kind:'artifact',data:parent}],[chunk.id,{kind:'artifact',data:chunk}]]);
   for(let index=0;index<5000;index++)records.set(`other-chunk-${index}`,{kind:'artifact',data:{...chunk,id:`other-chunk-${index}`,data:{...chunk.data,path:`src/other-${index}`,contentBase64:'eA=='}}});
   const requests=new Map<string,unknown>(),queries:string[]=[],loadedChunks:string[]=[];let latest=parent;
+  let transactionDepth=0,onBatch:(()=>void)|undefined;
   const sql=(async(strings:TemplateStringsArray,...values:unknown[])=>{
     const query=strings.join('?');queries.push(query);
     if(query.includes('pg_advisory_xact_lock'))return [];
@@ -31,20 +32,21 @@ it('authorizes current reviewer pages using bounded Work metadata without scanni
       const matching=[...records.values()].find(row=>row.kind==='artifact'&&row.data.kind==='diff_file_chunk'&&row.data.projectId===values[0]&&row.data.data.parentArtifactId===values[1]&&row.data.data.path===values[2]&&String(row.data.data.chunkIndex)===values[3]);
       if(matching){loadedChunks.push(matching.data.id);return [{data:matching.data}];}return [];
     }
-    if(query.includes('count(DISTINCT')){return [{count:1,unique_count:1,byte_count:bytes.length,first_index:0,last_index:0}];}
+    if(query.includes('LIMIT 4')){expect(transactionDepth).toBe(0);expect(query).toContain('ORDER BY');if(onBatch)onBatch();return [{data:chunk}];}
     if(query.includes('LIMIT 200')){
       expect(query).toContain("data->>'kind'<>'diff_file_chunk'");return [{data:parent}];
     }
     if(query.includes('LIMIT 101')||values[0]==='setting')return [];
     throw new Error(`Unbounded or unexpected reviewer SQL: ${query}`);
-  }) as unknown as Sql;Object.assign(sql,{begin:async<T>(fn:(tx:Sql)=>Promise<T>)=>fn(sql),json:(value:unknown)=>value});
+  }) as unknown as Sql;Object.assign(sql,{begin:async<T>(fn:(tx:Sql)=>Promise<T>)=>{transactionDepth++;try{return await fn(sql);}finally{transactionDepth--;}},json:(value:unknown)=>value});
   const app=await createWorkbenchApp({sql});
   const tool=(action:string,input:Record<string,unknown>,requestId:string)=>app.inject({method:'POST',url:`/api/workbench/connector/runs/${reviewerId}/tools`,headers:{authorization:`Bearer ${connectorToken}`},payload:{generation:1,action,input,requestId}});
   try{
     const work=await tool('read_work',{workId},'read-work');expect(work.statusCode,work.body).toBe(200);expect(work.json().reviewAssignment.currentRequiredQaValidation.candidateCurrent).toBe(true);expect(loadedChunks).toHaveLength(0);
     const input={diffArtifactId:parent.id,revision,path:filePath};const page=await tool('read_diff_file',input,'same-page-request');expect(page.statusCode,page.body).toBe(200);expect(page.json().integrity).toBe('verified');expect(Buffer.from(page.json().contentBase64,'base64').equals(bytes)).toBe(true);expect(loadedChunks).toEqual(['bound-chunk']);
     expect((await tool('read_diff_file',{...input,path:'src/other-not-present'},'wrong-path')).statusCode).toBe(404);expect((await tool('read_diff_file',{...input,revision:'e'.repeat(64)},'wrong-assignment')).statusCode).toBe(403);
-    latest={...parent,id:'diff-newer',revision:'f'.repeat(64)};expect((await tool('read_diff_file',input,'same-page-request')).statusCode).toBe(409);expect(loadedChunks).toEqual(['bound-chunk']);
+    onBatch=()=>{reviewer.generation++;};expect((await tool('read_diff_file',input,'revoked-during-read')).statusCode).toBe(409);reviewer.generation--;onBatch=undefined;
+    latest={...parent,id:'diff-newer',revision:'f'.repeat(64)};expect((await tool('read_diff_file',input,'same-page-request')).statusCode).toBe(409);expect(loadedChunks).toEqual(['bound-chunk','bound-chunk']);
     expect(queries.some(query=>query.includes('WHERE kind=? AND project_id=? ORDER BY updated_at,id')&&query.includes('wb_records'))).toBe(false);
   }finally{await app.close();}
 });

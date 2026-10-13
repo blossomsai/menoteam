@@ -26,7 +26,7 @@ interface Spool {
   generation: number;
   events: ConnectorEvent[];
   artifacts: UploadArtifact[];
-  diffFileUpload?: { directory:string; parentArtifactId:string; revision:string; baseRevision:string; candidateRevision:string; projectId:string; workId:string; files:DiffFileChunkIndex[]; fileIndex:number; chunkIndex:number };
+  diffFileUpload?: { directory:string; requestIdVersion?:2; parentArtifactId:string; revision:string; baseRevision:string; candidateRevision:string; projectId:string; workId:string; files:DiffFileChunkIndex[]; fileIndex:number; chunkIndex:number };
   deliveryProgress?: {phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string};
   stagingIntent?: Omit<StagingRequest,'action'|'operationId'>;
   stagingReceipt?: StagingReceipt;
@@ -220,7 +220,8 @@ export class ConnectorRunner {
       const upload=spool.diffFileUpload,file=upload.files[upload.fileIndex];
       if(!file){spool.diffFileUpload=undefined;await this.save(spool);await rm(upload.directory,{recursive:true,force:true});break;}
       const chunk=await readFile(path.join(upload.directory,createHash('sha256').update(file.path).digest('hex'),String(upload.chunkIndex)));
-      const requestId=`diff-file:${upload.candidateRevision}:${createHash('sha256').update(file.path).digest('hex')}:${upload.chunkIndex}`;
+      // Existing durable outboxes keep their original namespace; only new captures use the parent hash.
+      const requestId=`diff-file:${upload.requestIdVersion===2?createHash('sha256').update(upload.parentArtifactId).digest('hex'):upload.candidateRevision}:${createHash('sha256').update(file.path).digest('hex')}:${upload.chunkIndex}`;
       const data={parentArtifactId:upload.parentArtifactId,projectId:upload.projectId,workId:upload.workId,runId:spool.runId,candidateRevision:upload.candidateRevision,baseRevision:upload.baseRevision,diffRevision:upload.revision,path:file.path,...(file.oldPath?{oldPath:file.oldPath}:{}),chunkIndex:upload.chunkIndex,chunkCount:file.chunks,fileSha256:file.sha256,fileByteLength:file.byteLength,chunkSha256:createHash('sha256').update(chunk).digest('hex'),contentBase64:chunk.toString('base64'),...(file.encodingUnsupported?{encodingUnsupported:true}:{})};
       await client.addArtifact(spool.runId,spool.generation,{kind:'diff_file_chunk',revision:upload.revision,requestId,data});
       if(++upload.chunkIndex>=file.chunks){upload.fileIndex++;upload.chunkIndex=0;}await this.save(spool);
@@ -494,7 +495,7 @@ export class ConnectorRunner {
         const saved = await readWorktreeMap(this.config.dataDir,claim.run.workId!);
         await persistWorktreeMap(this.config.dataDir,claim.run.workId!,{...saved!,artifactRevision:revision});
         spool.artifacts.push({kind:'diff',revision,data:diff,requestId:`diff:${claim.run.id}:${claim.run.generation}`});
-        spool.diffFileUpload={directory,parentArtifactId:`artifact:${claim.run.id}:diff:${claim.run.id}:${claim.run.generation}`,revision,baseRevision,candidateRevision:diff.candidateRevision,projectId:claim.run.projectId,workId:claim.run.workId!,files:fileChunks,fileIndex:0,chunkIndex:0};
+        spool.diffFileUpload={directory,requestIdVersion:2,parentArtifactId:`artifact:${claim.run.id}:diff:${claim.run.id}:${claim.run.generation}`,revision,baseRevision,candidateRevision:diff.candidateRevision,projectId:claim.run.projectId,workId:claim.run.workId!,files:fileChunks,fileIndex:0,chunkIndex:0};
         await this.save(spool);
         spool.qaExecution={directory:path.join(this.config.dataDir,'qa',randomUUID()),nonce:randomUUID(),phase:'stopped'};await bindQaExecutor(spool.qaExecution);spool.qaInFlight=true;await this.save(spool);
         const currentQaPolicy=savedQaPolicy(claim.settings,claim.run.projectId,claim.project.repositoryUrl);

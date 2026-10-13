@@ -1945,7 +1945,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(snap.json().projects.map((p:any)=>p.id).sort()).toEqual(before.projects.map((p:any)=>p.id).sort());
         expect(snap.json().messages.length).toBeGreaterThan(1);
     });
-    it('isolated PostgreSQL persists >1 MiB diff chunks through real Connector HTTP and owner paged reads',async()=>{
+    it('isolated PostgreSQL persists >1 MiB cross-generation chunks and verifies member/reviewer pages without fencing renewal',async()=>{
         const p=checkedJson(await user('POST','/projects',{name:'Large persisted diff fixture'}));
         const enrolled=await enrollProvider(`large-diff-${randomUUID()}`,[p.id]);
         const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Large file upload'}));
@@ -1958,18 +1958,28 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             if(dropAck&&artifact?.kind==='diff_file_chunk'&&artifact.data.chunkIndex===0&&response.ok){dropAck=false;throw new Error('Fixture ACK loss after PostgreSQL persisted the chunk');}
             return response;
         },['gpt-6-luna','gpt-6.1-sol']);
-        const claim=await client.claim(['implementation']);expect(claim?.run.id).toBe(queued.run.id);const run=claim!.run;
+        const claim=await client.claim(['implementation']);expect(claim?.run.id).toBe(queued.run.id);let run=claim!.run;
         const baseRevision='a'.repeat(40),candidateRevision='b'.repeat(40),revision=createHash('sha256').update(baseRevision).update('\0').update(candidateRevision).digest('hex'),filePath='src/雪 space\tline\n.ts';
         const unit='+quote " slash \\ tab\t 雪🙂\n',parts=Array.from({length:7},(_,index)=>Buffer.from((index===0?'@@ -0,0 +1,56000 @@\n':'')+unit.repeat(8000)));
         const fileBytes=parts.reduce((total,part)=>total+part.length,0),manifestHash=createHash('sha256');for(const part of parts){expect(part.length).toBeLessThanOrEqual(256*1024);manifestHash.update(part);}const fileSha256=manifestHash.digest('hex');expect(fileBytes).toBeGreaterThan(1048576);
-        const parent=await client.addArtifact(run.id,run.generation,{kind:'diff',revision,requestId:`diff:${run.id}:${run.generation}`,data:{baseRevision,candidateRevision,diffFileChunksVersion:1,totalFiles:1,additions:56000,deletions:0,truncated:true,patch:'bounded preview',files:[{path:filePath,status:'added',binary:false,additions:56000,deletions:0,chunkCount:parts.length,textBytes:fileBytes,fileSha256}]}});
-        const payload=(index:number)=>({kind:'diff_file_chunk' as const,revision,requestId:`diff-file:${candidateRevision}:${createHash('sha256').update(filePath).digest('hex')}:${index}`,data:{parentArtifactId:parent.id,projectId:p.id,workId:work.id,runId:run.id,baseRevision,candidateRevision,diffRevision:revision,path:filePath,chunkIndex:index,chunkCount:parts.length,fileByteLength:fileBytes,fileSha256,chunkSha256:createHash('sha256').update(parts[index]!).digest('hex'),contentBase64:parts[index]!.toString('base64')}});
+        let parent=await client.addArtifact(run.id,run.generation,{kind:'diff',revision,requestId:`diff:${run.id}:${run.generation}`,data:{baseRevision,candidateRevision,diffFileChunksVersion:1,totalFiles:1,additions:56000,deletions:0,truncated:true,patch:'bounded preview',files:[{path:filePath,status:'added',binary:false,additions:56000,deletions:0,chunkCount:parts.length,textBytes:fileBytes,fileSha256}]}});
+        let legacyIds=true;const payload=(index:number)=>({kind:'diff_file_chunk' as const,revision,requestId:`diff-file:${legacyIds?candidateRevision:createHash('sha256').update(parent.id).digest('hex')}:${createHash('sha256').update(filePath).digest('hex')}:${index}`,data:{parentArtifactId:parent.id,projectId:p.id,workId:work.id,runId:run.id,baseRevision,candidateRevision,diffRevision:revision,path:filePath,chunkIndex:index,chunkCount:parts.length,fileByteLength:fileBytes,fileSha256,chunkSha256:createHash('sha256').update(parts[index]!).digest('hex'),contentBase64:parts[index]!.toString('base64')}});
         const count=async()=>Number((await sql`SELECT count(*)::int AS count FROM wb_records WHERE kind='artifact' AND project_id=${p.id} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id}`)[0]!.count);
         await expect(client.addArtifact(run.id,run.generation,payload(0))).rejects.toThrow('Fixture ACK loss');expect(await count()).toBe(1);
         const retry=await client.addArtifact(run.id,run.generation,payload(0));expect(retry.id).toBe(`artifact:${run.id}:${payload(0).requestId}`);expect(await count()).toBe(1);
         expect((await client.addArtifact(run.id,run.generation,payload(0))).id).toBe(retry.id);expect(await count()).toBe(1);
         const changed=Buffer.from('different bytes\n');await expect(client.addArtifact(run.id,run.generation,{...payload(0),data:{...payload(0).data,contentBase64:changed.toString('base64'),chunkSha256:createHash('sha256').update(changed).digest('hex')}})).rejects.toMatchObject({status:409});expect(await count()).toBe(1);
         const query=new URLSearchParams({path:filePath,revision});const partial=await fetch(`${serverUrl}/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file?${query}`,{headers:{cookie}});expect(partial.status).toBe(200);expect(await partial.json()).toMatchObject({complete:false,incomplete:true});
+        const oldParent=parent,oldRequest=payload(0),oldGeneration=run.generation;
+        expect((await user('POST',`/runs/${run.id}/pause`,{})).statusCode).toBe(200);
+        await client.stopped(run.id,run.generation,'cross-generation-thread');
+        expect((await user('POST',`/runs/${run.id}/resume`,{})).statusCode).toBe(200);
+        run=(await client.claim(['implementation']))!.run;expect(run.generation).toBe(oldGeneration+1);
+        parent=await client.addArtifact(run.id,run.generation,{kind:'diff',revision,requestId:`diff:${run.id}:${run.generation}`,data:oldParent.data});
+        legacyIds=false;expect(parent.id).not.toBe(oldParent.id);expect(payload(0).requestId).not.toBe(oldRequest.requestId);
+        await client.addArtifact(run.id,run.generation,payload(0));expect(await count()).toBe(1);
+        expect((await client.addArtifact(run.id,run.generation,payload(0))).id).toBe(`artifact:${run.id}:${payload(0).requestId}`);expect(await count()).toBe(1);
+        expect((await sql`SELECT data FROM wb_records WHERE id=${retry.id}`)[0]!.data.data).toEqual(oldRequest.data);
         for(let index=1;index<parts.length;index++)await client.addArtifact(run.id,run.generation,payload(index));expect(await count()).toBe(parts.length);
         const artifactStore=new WorkbenchStore(sql);
         for(const artifacts of [await artifactStore.list<Artifact>('artifact',p.id),await artifactStore.list<Artifact>('artifact'),await artifactStore.transaction(p.id,tx=>artifactStore.list<Artifact>('artifact',p.id,tx))]){
@@ -1988,7 +1998,57 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             if(index<parts.length-1){expect(typeof page.nextCursor).toBe('string');expect(seen.has(page.nextCursor)).toBe(false);seen.add(page.nextCursor);cursor=page.nextCursor;}else expect(page.nextCursor).toBeNull();
         }
         expect(total).toBe(fileBytes);expect(reconstructed.digest('hex')).toBe(fileSha256);expect(postBytes.every(length=>length<1048576)).toBe(true);
-    });
+        // Gate a real PostgreSQL verification batch outside the mutation transaction.
+        // Renewal must finish before the gate is released, for both HTTP readers.
+        await app.close();let reached:()=>void=()=>{},release:()=>void=()=>{},barrier:Promise<void>|undefined;
+        let gate=false,batchQueries=0;const sqlProxy=new Proxy(sql,{apply(target,thisArg,args){
+            const query=(args[0] as TemplateStringsArray).join('?');
+            if(query.includes('LIMIT 4')&&query.includes('chunkIndex')){
+                batchQueries++;expect(query).not.toContain('decode(');
+                if(gate){gate=false;reached();return (async()=>{await barrier;return Reflect.apply(target,thisArg,args);})();}
+            }
+            expect(query.includes('sum(octet_length(decode(')).toBe(false);
+            return Reflect.apply(target,thisArg,args);
+        }});
+        app=await createWorkbenchApp({sql:sqlProxy,sourceFetcher:(...args)=>sourceFetch(...args)});
+        const send=(path:string,payload:unknown)=>app.inject({method:'POST',url:'/api/workbench/connector'+path,headers:{authorization:`Bearer ${enrolled.token}`},payload:connectorFixturePayload(path,payload) as never});
+        const otherWork=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Unrelated lease renewal'}));
+        checkedJson(await user('POST',`/projects/${p.id}/messages`,{workId:otherWork.id,text:'Unrelated control',requestId:randomUUID()}));
+        const otherRun=checkedJson(await send('/claim',{capabilities:{runKinds:['implementation']}})).run;
+        const finalCursor=Buffer.from(JSON.stringify([parent.id,revision,filePath,parts.length-1])).toString('base64url');
+        const memberRead=()=>app.inject({method:'GET',url:`/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file`,headers:{cookie},query:{path:filePath,revision,cursor:finalCursor}});
+        const whileReading=async(read:()=>ReturnType<typeof app.inject>,renewRun:Run,mutate?:()=>Promise<unknown>)=>{
+            const started=new Promise<void>(resolve=>{reached=resolve;});barrier=new Promise<void>(resolve=>{release=resolve;});gate=true;
+            const before=batchQueries;const response=read();
+            try{
+                await Promise.race([started,new Promise((_,reject)=>setTimeout(()=>reject(new Error('Verification batch was not reached')),2000))]);
+                const renewed=await Promise.race([send(`/runs/${renewRun.id}/renew`,{generation:renewRun.generation}),new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error('Renewal fenced by diff verification')),2000))]);
+                expect(renewed.statusCode,renewed.body).toBe(200);if(mutate)await mutate();
+            }finally{release();}
+            const result=await response;expect(batchQueries-before).toBe(Math.ceil(parts.length/4));return result;
+        };
+        const memberPage=await whileReading(memberRead,otherRun);expect(memberPage.statusCode,memberPage.body).toBe(200);expect(memberPage.json().integrity).toBe('verified');
+        const staleParent={...parent,id:parent.id+':newer',createdAt:new Date().toISOString()};
+        const staleMember=await whileReading(memberRead,otherRun,()=>new WorkbenchStore(sql).put('artifact',staleParent));expect(staleMember.statusCode).toBe(409);
+        await sql`DELETE FROM wb_records WHERE id=${staleParent.id}`;
+        checkedJson(await send(`/runs/${run.id}/artifacts`,{generation:run.generation,kind:'qa',revision,requestId:'fixture-review-evidence',data:{candidateFingerprint:'c'.repeat(64),checks:[],stale:false}}));
+        checkedJson(await send(`/runs/${run.id}/complete`,{generation:run.generation,threadId:'cross-generation-thread'}));
+        const master=checkedJson(await send('/claim',{})).run;
+        const review=checkedJson(await send(`/runs/${master.id}/tools`,{generation:master.generation,action:'dispatch',input:{workId:work.id,kind:'review',model:'gpt-6.1-sol',prompt:'Review immutable diff'},requestId:randomUUID()}));
+        checkedJson(await send(`/runs/${master.id}/complete`,{generation:master.generation,threadId:'master-thread'}));
+        const reviewer=checkedJson(await send('/claim',{capabilities:{runKinds:['review']}})).run;expect(reviewer.id).toBe(review.id);
+        const reviewerRead=()=>send(`/runs/${reviewer.id}/tools`,{generation:reviewer.generation,action:'read_diff_file',input:{diffArtifactId:parent.id,revision,path:filePath,cursor:finalCursor},requestId:randomUUID()});
+        const reviewPage=await whileReading(reviewerRead,otherRun);expect(reviewPage.statusCode,reviewPage.body).toBe(200);expect(reviewPage.json().integrity).toBe('verified');
+        const stale=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json('e'.repeat(40))}) WHERE id=${reviewer.id}`;});expect(stale.statusCode).toBe(409);
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json(candidateRevision)}) WHERE id=${reviewer.id}`;
+        const revoked=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{generation}',${sql.json(reviewer.generation+1)}) WHERE id=${reviewer.id}`;});expect(revoked.statusCode).toBe(409);
+        // Legacy IDs remain readable, but missing storage/metadata or hash corruption cannot verify.
+        await sql`DELETE FROM wb_records WHERE kind='artifact' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'chunkIndex'='1'`;
+        const incomplete=await memberRead();expect(incomplete.statusCode).toBe(200);expect(incomplete.json().integrity).toBe('incomplete');
+        await sql`UPDATE wb_records SET data=jsonb_set(data,'{data,chunkSha256}',${sql.json('0'.repeat(64))}) WHERE kind='artifact' AND data->'data'->>'parentArtifactId'=${parent.id}`;
+        expect((await memberRead()).json()).toMatchObject({complete:false,incomplete:true});
+        await sql`UPDATE wb_records SET data=data #- '{data,files,0,fileSha256}' WHERE id=${parent.id}`;expect((await memberRead()).json()).toMatchObject({complete:false,incomplete:true});
+    },20000);
 
 });
 
