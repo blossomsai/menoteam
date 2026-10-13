@@ -747,6 +747,13 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const createdSkill = createdSkillResponse.json(); if (createdSkill.id) recordIds.add(createdSkill.id);
             expect(createdSkillResponse.statusCode).toBe(200);
             expect(createdSkill.data.contentSha256).toBe(createHash('sha256').update('Created project skill body').digest('hex'));
+            const otherProject = await user('POST', '/projects', { name: 'Marketplace skill isolation' });
+            expect(otherProject.statusCode).toBe(200);
+            recordIds.add(otherProject.json().id);
+            const otherProjectSkillResponse = await user('POST', '/settings', { kind: 'skill', projectId: otherProject.json().id, name: 'Other project skill', data: { content: 'Must not enter this project run' } });
+            const otherProjectSkill = otherProjectSkillResponse.json();
+            recordIds.add(otherProjectSkill.id);
+            expect(otherProjectSkillResponse.statusCode).toBe(200);
             const legacyImportResponse = await user('POST', `/projects/${projectIdForCase}/skills/import`, { url: 'https://github.com/example/legacy/blob/main/SKILL.md' });
             const legacySkill = legacyImportResponse.json(); if (legacySkill.id) recordIds.add(legacySkill.id);
             expect(legacyImportResponse.statusCode).toBe(200);
@@ -759,6 +766,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(legacyCopyResponse.statusCode).toBe(200);
             expect(createdCopy.data.installed).toBe(false);
             expect(legacyCopy.data.installed).toBe(true);
+            const projectSkillIds = [imported[0]!.id, imported[1]!.id, createdSkill.id, legacySkill.id].sort();
+            const allWorkspaceCopyIds = [copied.id, resourceCopy.id, createdCopy.id, legacyCopy.id].sort();
+            const expectRunSkillIds = (skills: Array<{ id: string }>, workspaceCopyIds: string[]) => {
+                expect(skills.map(skill => skill.id).sort()).toEqual([...projectSkillIds, ...workspaceCopyIds].sort());
+                expect(skills.some(skill => skill.id === otherProjectSkill.id)).toBe(false);
+            };
             const createdEdit = await user('PATCH', `/settings/${createdCopy.id}`, { data: { content: 'Edited created skill' } });
             const legacyEdit = await user('PATCH', `/settings/${legacyCopy.id}`, { data: { content: 'Edited legacy GitHub skill' } });
             expect(createdEdit.statusCode).toBe(200);
@@ -839,7 +852,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(claimed1.run.id).toBe(run1.id);
             expect(claimed1.run.requestedBy).toBe(me.id);
             expect(claimed1.run.connectorId).toBe(connectorIdForCase);
-            expect(claimed1.execution.skills).toHaveLength(4);
+            expectRunSkillIds(claimed1.execution.skills, allWorkspaceCopyIds);
             expect(run1.execution.skills[0].bundle).toEqual(expectedFrozenBundle);
             expect(claimed1.execution.skills.find((skill:any)=>skill.id===resourceCopy.id).bundle).toEqual(imported[1]!.data.bundle);
             verifyBundle(claimed1.execution.skills.find((skill:any)=>skill.id===resourceCopy.id).bundle);
@@ -849,10 +862,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const disabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited after run one', enabled: false } });
             expect(disabled.statusCode).toBe(200);
             const run2 = await submitWork('Disabled next run', `marketplace-${randomUUID()}`);
-            expect(run2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
+            const remainingWorkspaceCopyIds = [resourceCopy.id, createdCopy.id, legacyCopy.id].sort();
+            expectRunSkillIds(run2.execution.skills, remainingWorkspaceCopyIds);
             const claimed2 = await claim();
             expect(claimed2.run.id).toBe(run2.id);
-            expect(claimed2.execution.skills.map((skill: any) => skill.id)).toEqual([resourceCopy.id, createdCopy.id, legacyCopy.id]);
+            expectRunSkillIds(claimed2.execution.skills, remainingWorkspaceCopyIds);
             const enabled = await user('PATCH', `/settings/${copied.id}`, { data: { content: 'Edited and re-enabled for a new run', enabled: true } });
             expect(enabled.statusCode).toBe(200);
             expect(enabled.json().data.contentSha256).toBe(createHash('sha256').update('Edited and re-enabled for a new run').digest('hex'));
@@ -860,6 +874,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(run3.execution.skills[0].content).toBe('Edited and re-enabled for a new run');
             const claimed3 = await claim();
             expect(claimed3.run.id).toBe(run3.id);
+            expectRunSkillIds(claimed3.execution.skills, allWorkspaceCopyIds);
             expect(claimed3.execution.skills[0]).toMatchObject({ id: copied.id, content: 'Edited and re-enabled for a new run', copiedFrom: copied.data.copiedFrom });
             const createdRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === createdCopy.id);
             const legacyRunSkill = claimed3.execution.skills.find((skill: any) => skill.id === legacyCopy.id);
@@ -870,6 +885,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const run4 = await submitWork('Copied source edits are frozen', `marketplace-${randomUUID()}`);
             const claimed4 = await claim();
             expect(claimed4.run.id).toBe(run4.id);
+            expectRunSkillIds(claimed4.execution.skills, allWorkspaceCopyIds);
             expect(claimed4.execution.skills.find((skill: any) => skill.id === createdCopy.id)).toMatchObject({ content: 'Create copy edited after run', contentSha256: createHash('sha256').update('Create copy edited after run').digest('hex') });
             expect(claimed4.execution.skills.find((skill: any) => skill.id === legacyCopy.id)).toMatchObject({ content: 'Legacy copy edited after run', contentSha256: createHash('sha256').update('Legacy copy edited after run').digest('hex') });
             const frozenCopiedRun = (await sql`SELECT data FROM wb_records WHERE id=${run3.id} AND kind='run'`)[0]!.data as Run;
@@ -1913,7 +1929,10 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const work=(await user('POST',`/projects/${project.id}/works`,{title:'Use the shared profile',profileId:profile.id})).json();
             const dispatched=await user('POST',`/projects/${project.id}/messages`,{workId:work.id,text:'Use reusable instructions',requestId:`shared-profile-${project.id}`});
             expect(dispatched.statusCode).toBe(200);
-            expect(dispatched.json().run.execution.skills).toEqual([{id:global.id,name:'Reusable instructions',content:'All authorized Projects',contentSha256:createHash('sha256').update('All authorized Projects').digest('hex')}]);
+            expect(dispatched.json().run.execution.skills).toEqual([
+                {id:global.id,name:'Reusable instructions',content:'All authorized Projects',contentSha256:createHash('sha256').update('All authorized Projects').digest('hex')},
+                ...(project.id===a.id?[{id:scoped.id,name:scoped.name,content:'Only project A',contentSha256:createHash('sha256').update('Only project A').digest('hex')}]:[])
+            ]);
         }
     });
     it("survives service restart", async () => {
