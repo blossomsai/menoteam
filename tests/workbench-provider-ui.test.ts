@@ -886,21 +886,32 @@ describe('lazy diff review regressions',()=>{
 
 describe('delivery action and narrow breadcrumb UI',()=>{
   it.each([
-    ['queued','queued','Queued',true],
-    ['running','running','In progress',true],
-    ['failed','failed','Retry Draft PR',false],
-    ['completed','pr_created','Draft PR created',true],
-  ] as const)('shows truthful draft delivery state for %s runs',async(status,phase,label,disabled)=>{
+    ['queued','queued','Queued',true,undefined],
+    ['running','running','In progress',true,undefined],
+    ['paused','queued','Paused',true,'2026-10-14T09:00:00.000Z'],
+    ['paused','running','Paused',true,undefined],
+    ['failed','failed','Retry Draft PR',false,undefined],
+    ['interrupted','interrupted','Retry Draft PR',false,undefined],
+    ['cancelled','cancelled','Retry Draft PR',false,undefined],
+    ['completed','pr_created','Draft PR created',true,undefined],
+    ['completed','unknown','Delivery status unavailable',true,undefined],
+  ] as const)('shows truthful draft delivery state for %s runs',async(status,phase,label,disabled,stoppedAt)=>{
     window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
     const work={id:'work-1',projectId:project.id,title:'Delivery status',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
     const candidate={id:'candidate-run',projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'};
-    const delivery={id:'delivery-run',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',operation:{action:'create_draft_pr',phase,pullRequestUrl:phase==='pr_created'?'https://github.com/blossomsai/menoteam/pull/4':undefined}} as Snapshot['runs'][number];
+    const delivery={id:'delivery-run',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',...(stoppedAt?{stoppedAt}:{}),operation:{action:'create_draft_pr',phase,pullRequestUrl:phase==='pr_created'?'https://github.com/blossomsai/menoteam/pull/4':undefined}} as Snapshot['runs'][number];
     const diff={id:'delivery-diff',projectId:project.id,workId:work.id,runId:candidate.id,kind:'diff' as const,revision:'delivery-revision',createdAt:'2026-10-06',data:{candidateRevision:'candidate-sha',baseRevision:'base-sha',files:[],totalFiles:0,truncated:false}};
     const current=snapshot();current.projects[0]={...project,repositoryUrl:'https://github.com/blossomsai/menoteam'};current.works=[work];current.runs=[candidate,delivery];current.artifacts=[diff];
     vi.spyOn(workbenchApi,'artifact').mockResolvedValue(diff);
+    const request=vi.spyOn(workbenchApi,'requestDraftPr');
     await mount(current);await flush();
     const action=button(label);expect(action.disabled).toBe(disabled);
     expect(action.closest('section')?.textContent).toContain(`Delivery ${status} · ${phase}`);
+    if(status==='paused'){
+      expect(delivery.stoppedAt).toBe(stoppedAt);
+      expect(action.textContent).toBe('Paused');
+      await flush(()=>action.click());expect(request).not.toHaveBeenCalled();
+    }
   });
 
   it('keeps long project and Work breadcrumb content inside shrinkable navigation with full accessible names',async()=>{
@@ -917,7 +928,8 @@ describe('delivery action and narrow breadcrumb UI',()=>{
     expect(links.map(link=>link.textContent)).toEqual([projectName,'Work']);
     expect(links[0]?.getAttribute('href')).toContain(`project=${project.id}`);
     expect(links[0]?.getAttribute('aria-label')).toBe(projectName);expect(links[0]?.title).toBe(projectName);
-    expect(links[0]?.className).toContain('truncate');expect(links[0]?.className).toContain('min-w-0');expect(links[0]?.className).not.toContain('shrink-0');
-    const currentLabel=nav.querySelector('strong')!;expect(currentLabel.textContent).toBe(workTitle);expect(currentLabel.title).toBe(workTitle);expect(currentLabel.className).toContain('min-w-0');expect(currentLabel.className).toContain('truncate');
+    expect(links[0]?.className).toContain('truncate');expect(links[0]?.className).toContain('basis-[38%]');expect(links[0]?.className).toContain('shrink-0');expect(links[0]?.className).toContain('sm:basis-auto');
+    const workLink=links[1]!;expect(workLink.textContent).toBe('Work');expect(workLink.getAttribute('href')).toContain(`view=work&project=${project.id}`);
+    const currentLabel=nav.querySelector('strong')!;expect(currentLabel.textContent).toBe(workTitle);expect(currentLabel.title).toBe(workTitle);expect(currentLabel.className).toContain('min-w-16');expect(currentLabel.className).toContain('flex-1');expect(currentLabel.className).toContain('truncate');
   });
 });
