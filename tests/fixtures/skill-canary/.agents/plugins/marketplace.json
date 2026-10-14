@@ -1,0 +1,18 @@
+{
+  "name": "Menoteam skill canary fixtures",
+  "plugins": [
+    {
+      "name": "resource-canary",
+      "category": "Testing",
+      "description": "A harmless local fixture for validating skill resource materialization.",
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "source": {
+        "source": "local",
+        "path": "./tests/fixtures/skill-canary/plugins/resource-canary"
+      }
+    }
+  ]
+}

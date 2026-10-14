@@ -1,0 +1,40 @@
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?must pin PostgreSQL image by digest}
+    environment:
+      POSTGRES_DB: menoteam_workbench_stage
+      POSTGRES_USER: menoteam_stage
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?staging-only database password required}
+    volumes:
+      - stage_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U menoteam_stage -d menoteam_workbench_stage"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  app:
+    image: ${MENOTEAM_STAGING_IMAGE:?helper must supply immutable GHCR digest}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://menoteam_stage:${POSTGRES_PASSWORD:?required}@db:5432/menoteam_workbench_stage
+      WORKBENCH_BOOTSTRAP_EMAIL: ${WORKBENCH_BOOTSTRAP_EMAIL:?staging-only bootstrap account required}
+      WORKBENCH_BOOTSTRAP_PASSWORD: ${WORKBENCH_BOOTSTRAP_PASSWORD:?staging-only bootstrap password required}
+      WORKBENCH_ORIGIN: ${WORKBENCH_ORIGIN:?staging HTTPS origin required}
+      WORKBENCH_SECURE_COOKIES: "true"
+      PORT: 3000
+      HOST: 0.0.0.0
+    ports:
+      - 127.0.0.1:3200:3000
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+volumes:
+  stage_pgdata:

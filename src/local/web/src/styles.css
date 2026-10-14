@@ -1,0 +1,63 @@
+@import "tailwindcss";
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color-scheme: light;
+  --background: #eceee7;
+  --foreground: #243c33;
+  --card: #f0f1eb;
+  --card-foreground: #243c33;
+  --popover: #f0f1eb;
+  --popover-foreground: #243c33;
+  --primary: #28513f;
+  --primary-foreground: #ffffff;
+  --secondary: #e2e6df;
+  --secondary-foreground: #243c33;
+  --muted: #e5e9e2;
+  --muted-foreground: #40574a;
+  --accent: #dfe5dc;
+  --accent-foreground: #243c33;
+  --destructive: #873831;
+  --border: #c4cdc2;
+  --input: #bcc7bc;
+  --ring: #34724d;
+}
+
+@layer base {
+  * { @apply box-border border-border; }
+  html { min-width: 320px; background: var(--background); }
+  body { min-width: 320px; min-height: 100vh; margin: 0; background: var(--background); color: var(--foreground); }
+  button, input, textarea, select { font: inherit; }
+  button, summary, select, input[type="radio"], input[type="checkbox"] { -webkit-tap-highlight-color: transparent; }
+  ::selection { background: #b9cbbb; color: #20392f; }
+  :focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }
+  input::placeholder, textarea::placeholder { color: #526258; opacity: 1; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .app-enter { animation: settle-in 280ms cubic-bezier(.16, 1, .3, 1) both; }
+  @keyframes settle-in { from { opacity: .75; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+}
