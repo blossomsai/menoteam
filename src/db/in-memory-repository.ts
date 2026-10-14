@@ -22,6 +22,17 @@ export class InMemoryWorkMapRepository implements WorkMapRepository {
   private readonly teammates = new Map<string, Teammate>();
   private readonly history = new Map<string, RevisionSnapshot[]>();
 
+  exportSnapshot(): { works: Work[]; teammates: Teammate[]; history: RevisionSnapshot[] } {
+    return clone({ works: [...this.works.values()], teammates: [...this.teammates.values()], history: [...this.history.values()].flat() });
+  }
+
+  restoreSnapshot(snapshot: { works: Work[]; teammates: Teammate[]; history: RevisionSnapshot[] }): void {
+    this.works.clear(); this.teammates.clear(); this.history.clear();
+    for (const work of snapshot.works) this.works.set(work.ref, clone(work));
+    for (const teammate of snapshot.teammates) this.teammates.set(teammate.ref, clone(teammate));
+    for (const item of snapshot.history) this.history.set(item.entity_ref, [...(this.history.get(item.entity_ref) ?? []), clone(item)]);
+  }
+
   async list(kind: 'work', filters: WorkFilters, cursor: string | undefined, limit: number): Promise<ListPage<WorkSummary>>;
   async list(kind: 'teammate', filters: Record<string, never>, cursor: string | undefined, limit: number): Promise<ListPage<TeammateSummary>>;
   async list(kind: 'work' | 'teammate', filters: WorkFilters | Record<string, never>, cursor: string | undefined, limit: number): Promise<ListPage<WorkSummary | TeammateSummary>> {

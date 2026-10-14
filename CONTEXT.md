@@ -1,5 +1,7 @@
 # Menoteam Work Map
 
+> Scope: existing V1 implementation contract, not the current workbench product/UI specification. See [current product direction](PRODUCT.md). Preserve these API/runtime semantics until an explicit implementation migration; do not restore V1 UI or domain restrictions into V3 from this document.
+
 Menoteam Work Map is a shared team context that lets humans and their existing agents understand, route, and maintain durable work without replacing their communication channels or agent harnesses.
 
 ## Language
