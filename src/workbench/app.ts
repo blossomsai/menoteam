@@ -973,6 +973,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 r.status = "cancelled";
                 r.updatedAt = now();
                 await store.put("run", r, tx);
+            } else if (['master', 'implementation', 'review'].includes(r.kind) && ['paused', 'interrupted'].includes(r.status)) {
+                r.status = 'cancelled';
+                r.updatedAt = now();
+                await store.put('run', r, tx);
             }
             return r;
         });

@@ -371,6 +371,27 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('Provider connection'); expect(host.textContent).toContain('Team Codex'); expect(host.textContent).toContain(runtime.connectorId); expect(host.textContent).toContain('This model is not reported by the Work’s bound provider connection.');
   });
 
+  it.each([
+    ['paused', undefined, 'End', 'paused'],
+    ['interrupted', undefined, 'End', 'interrupted'],
+    ['cancelled', undefined, undefined, 'Cancelling'],
+    ['cancelled', '2026-10-14T09:00:00.000Z', undefined, 'Cancelled'],
+  ] as const)('shows Work cancellation state for %s', async (status, stoppedAt, action, label) => {
+    const work = { id: 'cancel-work', projectId: project.id, title: 'Cancel Work', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const run = { id: `cancel-${status}`, projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Continue', model: 'gpt-6.1-sol', reasoning: 'medium', status, generation: 1, createdAt: '', updatedAt: '', ...(stoppedAt ? { stoppedAt } : {}) } as Snapshot['runs'][number];
+    const current = snapshot(); current.works = [work]; current.runs = [run];
+    window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    const cancel = vi.spyOn(workbenchApi, 'cancelRun').mockResolvedValue(run);
+    await mount(current);
+    expect(host.textContent).toContain(label);
+    if (status === 'cancelled' && !stoppedAt) expect(host.textContent).toContain('Waiting for the Connector');
+    if (status === 'cancelled' && stoppedAt) expect([...host.querySelectorAll('[role="status"]')].some(node => node.textContent?.includes('Cancelled'))).toBe(true);
+    if (action) {
+      await flush(() => button(action).click());
+      expect(cancel).toHaveBeenCalledWith(run.id);
+    }
+  });
+
   it.each(['empty stored draft','existing draft'])('New work opens Master preset without automatic creation or sending: %s',async scenario=>{
     const projectB={...project,id:'project-b',name:'Project B'};
     const current=snapshot(owner,[]);current.projects=[project,projectB];
