@@ -392,6 +392,20 @@ describe('mounted provider connection settings', () => {
     }
   });
 
+  it('does not offer cancel or end for an effectful interrupted delivery', async () => {
+    const work = { id: 'delivery-cancel-work', projectId: project.id, title: 'Published delivery', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const delivery = { id: 'effectful-interrupted-delivery', projectId: project.id, workId: work.id, targetRunId: 'candidate', kind: 'delivery' as const, prompt: '', model: 'internal', reasoning: 'none', status: 'interrupted' as const, generation: 2, createdAt: '', updatedAt: '', operation: { action: 'create_draft_pr', actorId: owner.id, candidateRunId: 'candidate', candidateRevision: 'candidate-revision', artifactRevision: 'candidate-revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/blossomsai/menoteam', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/candidate', workTitle: work.title, changeSummary: 'published', qaStatus: 'current', phase: 'pr_created', effectIntentGeneration: 2, external: { pullRequestNumber: 42, pullRequestUrl: 'https://github.com/blossomsai/menoteam/pull/42' } } } as Snapshot['runs'][number];
+    const current = snapshot(); current.works = [work]; current.runs = [delivery];
+    window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    const cancel = vi.spyOn(workbenchApi, 'cancelRun');
+    await mount(current);
+    expect(host.textContent).toContain('interrupted');
+    expect(delivery.operation?.phase).toBe('pr_created');
+    expect([...host.querySelectorAll('button')].map(item => item.textContent?.trim())).not.toContain('End');
+    expect([...host.querySelectorAll('button')].map(item => item.textContent?.trim())).not.toContain('Cancel');
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
   it.each(['empty stored draft','existing draft'])('New work opens Master preset without automatic creation or sending: %s',async scenario=>{
     const projectB={...project,id:'project-b',name:'Project B'};
     const current=snapshot(owner,[]);current.projects=[project,projectB];
