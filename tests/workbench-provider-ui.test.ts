@@ -883,3 +883,41 @@ describe('lazy diff review regressions',()=>{
   });
 
 });
+
+describe('delivery action and narrow breadcrumb UI',()=>{
+  it.each([
+    ['queued','queued','Queued',true],
+    ['running','running','In progress',true],
+    ['failed','failed','Retry Draft PR',false],
+    ['completed','pr_created','Draft PR created',true],
+  ] as const)('shows truthful draft delivery state for %s runs',async(status,phase,label,disabled)=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Delivery status',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const candidate={id:'candidate-run',projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'};
+    const delivery={id:'delivery-run',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',operation:{action:'create_draft_pr',phase,pullRequestUrl:phase==='pr_created'?'https://github.com/blossomsai/menoteam/pull/4':undefined}} as Snapshot['runs'][number];
+    const diff={id:'delivery-diff',projectId:project.id,workId:work.id,runId:candidate.id,kind:'diff' as const,revision:'delivery-revision',createdAt:'2026-10-06',data:{candidateRevision:'candidate-sha',baseRevision:'base-sha',files:[],totalFiles:0,truncated:false}};
+    const current=snapshot();current.projects[0]={...project,repositoryUrl:'https://github.com/blossomsai/menoteam'};current.works=[work];current.runs=[candidate,delivery];current.artifacts=[diff];
+    vi.spyOn(workbenchApi,'artifact').mockResolvedValue(diff);
+    await mount(current);await flush();
+    const action=button(label);expect(action.disabled).toBe(disabled);
+    expect(action.closest('section')?.textContent).toContain(`Delivery ${status} · ${phase}`);
+  });
+
+  it('keeps long project and Work breadcrumb content inside shrinkable navigation with full accessible names',async()=>{
+    const projectName='The extremely long integration project name that must not force a mobile viewport wider';
+    const workTitle='A long Work title that should truncate while remaining fully available to assistive technology';
+    const longProject={...project,name:projectName};
+    const work={id:'work-1',projectId:project.id,title:workTitle,overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const current=snapshot();current.projects[0]=longProject;current.works=[work];
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    await mount(current);
+    const header=host.querySelector('header')!,nav=host.querySelector('nav[aria-label="Breadcrumb"]')!;
+    expect(header.className).toContain('min-w-0');expect(nav.className).toContain('min-w-0');expect(nav.className).toContain('flex-1');
+    const links=[...nav.querySelectorAll('a')];
+    expect(links.map(link=>link.textContent)).toEqual([projectName,'Work']);
+    expect(links[0]?.getAttribute('href')).toContain(`project=${project.id}`);
+    expect(links[0]?.getAttribute('aria-label')).toBe(projectName);expect(links[0]?.title).toBe(projectName);
+    expect(links[0]?.className).toContain('truncate');expect(links[0]?.className).toContain('min-w-0');expect(links[0]?.className).not.toContain('shrink-0');
+    const currentLabel=nav.querySelector('strong')!;expect(currentLabel.textContent).toBe(workTitle);expect(currentLabel.title).toBe(workTitle);expect(currentLabel.className).toContain('min-w-0');expect(currentLabel.className).toContain('truncate');
+  });
+});
