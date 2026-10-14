@@ -7,17 +7,20 @@ import { CodexAppServer } from '../src/connector/codex.js';
 import type { ClaimedRun } from '../src/connector/types.js';
 import type { Run } from '../src/workbench/types.js';
 
-async function generatedThreadConfig(run:Partial<Run>){
+async function generatedThreadBoundary(run:Partial<Run>,threadId?:string){
  const native=new CodexAppServer();let boundary:any;
  const internals=native as unknown as {child:unknown;events:EventEmitter;request:(method:string,params:any)=>Promise<any>};
  internals.child={};native.models=['gpt-6.1-sol'];
  internals.request=async(method,params)=>{
-  if(method==='thread/start'){boundary=params;return{thread:{id:'configured-thread'}};}
+  if(method==='thread/start'||method==='thread/resume'){boundary={method,params};return{thread:{id:threadId??'configured-thread'}};}
   if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{turn:{id:'configured-turn',status:'completed'}}}),0);return{turn:{id:'configured-turn'}};}
   throw new Error('Unexpected RPC');
  };
- await native.run({run:{model:'gpt-6.1-sol',reasoning:'medium',...run}} as ClaimedRun,'/isolated-config','bounded request',undefined,()=>{},'/private-context.json');
- return boundary.config?.mcp_servers.menoteam;
+ await native.run({run:{model:'gpt-6.1-sol',reasoning:'medium',...run}} as ClaimedRun,'/isolated-config','bounded request',threadId,()=>{},'/private-context.json');
+ return boundary;
+}
+async function generatedThreadConfig(run:Partial<Run>){
+ return (await generatedThreadBoundary(run)).params.config?.mcp_servers.menoteam;
 }
 
 it('enables the three registered staging tools in the generated Project Master config',async()=>{
@@ -36,8 +39,25 @@ it('limits generated Master config to its explicit allowedActions and keeps feed
 
 it.each(['review','implementation','delivery'] as const)('does not expose staging tools to a %s native run',async kind=>{
  const config=await generatedThreadConfig({kind});
- if(kind==='review')expect(config.enabled_tools).toEqual(['read_work','read_run','submit_review_result']);
+ if(kind==='review')expect(config.enabled_tools).toEqual(['read_work','read_run','read_diff_file','submit_review_result']);
  else expect(config).toBeUndefined();
+});
+
+it.each([['start',undefined],['resume','review-native-thread']] as const)('keeps review bridge read-only and scoped on native thread %s',async(_mode,threadId)=>{
+ const boundary=await generatedThreadBoundary({kind:'review'},threadId);
+ expect(boundary.method).toBe(threadId?'thread/resume':'thread/start');
+ expect(boundary.params).toMatchObject({sandbox:'read-only',approvalPolicy:'never'});
+ const config=boundary.params.config.mcp_servers.menoteam;
+ expect(config.enabled_tools).toEqual(['read_work','read_run','read_diff_file','submit_review_result']);
+ expect(Object.keys(config.tools).sort()).toEqual(['read_diff_file','read_run','read_work','submit_review_result'].sort());
+ expect(config.tools.read_diff_file).toEqual({approval_mode:'approve'});
+ expect(config.enabled_tools).not.toContain('read_context');
+ expect(config.enabled_tools).not.toContain('create_work');
+ expect(config.enabled_tools).not.toContain('request_delivery');
+ expect(config.enabled_tools).not.toContain('request_merge');
+ expect(config.enabled_tools).not.toContain('post_message');
+ expect(config.enabled_tools).not.toContain('update_settings');
+ expect(config.enabled_tools).not.toContain('create_skill');
 });
 
 it('resumes the same persisted native thread without hydrating its growing history response',async()=>{

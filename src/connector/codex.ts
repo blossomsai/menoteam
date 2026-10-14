@@ -14,7 +14,7 @@ type ToolHandler = (name: string, input: Record<string, unknown>, requestId: str
 
 const STAGING_BRIDGE_TOOLS = ['request_staging_deploy','request_staging_rollback','retire_staging_deploy'];
 const MASTER_BRIDGE_TOOLS = ['read_context','read_work','read_run','create_work','update_work','dispatch','request_delivery','request_merge',...STAGING_BRIDGE_TOOLS,'post_message','update_settings','create_skill'];
-const REVIEW_BRIDGE_TOOLS = ['read_work','read_run','submit_review_result'];
+const REVIEW_BRIDGE_TOOLS = ['read_work','read_run','read_diff_file','submit_review_result'];
 
 function scopedBridgeConfig(contextFile: string, tools: string[]) {
   const compiledPath = fileURLToPath(new URL('./mcp-bridge.js', import.meta.url));
