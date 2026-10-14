@@ -1,5 +1,7 @@
 # Worldview Manifesto v0.1
 
+> Historical research/proposal, retained for provenance. Not current UI requirements. The 2026-10-06 [product direction](../PRODUCT.md) and its linked requirements supersede conflicting navigation, workflows and feature claims here.
+
 We are exploring a new human-agent collaboration framework.
 
 As agents become more capable and more able to act independently, the central question becomes: how can humans and agents form judgment together, discover worthwhile goals, move work forward, evaluate outcomes, and grow through continued interaction?

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Fixed, allowlisted staging helper. Install root-owned; never pass shell commands in requests."""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+CONFIG = Path('/etc/menoteam/workbench-stage.json')
+STATE = Path('/var/lib/menoteam-workbench-stage/state.json')
+LOCK = Path('/var/lib/menoteam-workbench-stage/state.lock')
+COMPOSE = Path('/opt/menoteam/workbench-stage/compose.yml')
+ENV_FILE = Path('/etc/menoteam/workbench-stage.env')
+PROJECT = 'menoteam-workbench-stage'
+HEALTH_URL = 'http://127.0.0.1:3200/healthz'
+MAX_REQUEST = 4096
+SHA = re.compile(r'^[a-f0-9]{40}$')
+DIGEST = re.compile(r'^sha256:[a-f0-9]{64}$')
+OPERATION = re.compile(r'^run_[a-f0-9-]{36}$')
+DEPLOYMENT = re.compile(r'^deploy_[A-Za-z0-9_-]{1,100}$')
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
+
+
+def load_config():
+    info = CONFIG.stat()
+    if info.st_uid != 0 or info.st_mode & 0o077:
+        fail('staging config must be root-owned mode 0600')
+    config = json.loads(CONFIG.read_text())
+    if set(config) != {'targetId', 'imageRepository'}:
+        fail('staging config schema is invalid')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', config['targetId']):
+        fail('target id is invalid')
+    if config['imageRepository'] != 'ghcr.io/blossomsai/menoteam-work-map':
+        fail('image repository is invalid')
+    for path in (COMPOSE, ENV_FILE):
+        info = path.stat()
+        if info.st_uid != 0 or (info.st_mode & 0o077 if path == ENV_FILE else info.st_mode & 0o022):
+            fail('staging compose and environment files must be root-owned and not group/world writable')
+    return config
+
+
+def parse_request():
+    raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
+    if len(raw) > MAX_REQUEST:
+        fail('request exceeds the size limit')
+    request = json.loads(raw)
+    allowed = {'action', 'operationId', 'targetId', 'commitSha', 'imageDigest', 'previousDeploymentId', 'expectedCurrentDeploymentId'}
+    if not isinstance(request, dict) or set(request) - allowed:
+        fail('request schema is invalid')
+    if request.get('action') not in {'deploy', 'verify', 'rollback', 'status'}:
+        fail('action is not supported')
+    if not OPERATION.fullmatch(str(request.get('operationId', ''))):
+        fail('operation id is invalid')
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', str(request.get('targetId', ''))):
+        fail('target id is invalid')
+    if not SHA.fullmatch(str(request.get('commitSha', ''))) or not DIGEST.fullmatch(str(request.get('imageDigest', ''))):
+        fail('source revision or image digest is invalid')
+    if request.get('previousDeploymentId') is not None and not DEPLOYMENT.fullmatch(str(request['previousDeploymentId'])):
+        fail('previous deployment id is invalid')
+    if request.get('expectedCurrentDeploymentId') is not None and not DEPLOYMENT.fullmatch(str(request['expectedCurrentDeploymentId'])):
+        fail('expected current deployment id is invalid')
+    if request['action'] == 'rollback' and not request.get('previousDeploymentId'):
+        fail('rollback requires a saved deployment id')
+    if request['action'] != 'rollback' and request.get('previousDeploymentId') is not None:
+        fail('previous deployment id is only valid for rollback')
+    return request
+
+
+def atomic_write(value):
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE.parent, 0o700)
+    fd, temp = tempfile.mkstemp(prefix='.state-', dir=STATE.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'w') as output:
+            json.dump(value, output, separators=(',', ':'), sort_keys=True)
+            output.write('\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, STATE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def run_compose(action, image=None, source=None):
+    if not image or not source:
+        fail('compose actions require an immutable image and source revision')
+    env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}
+    env['MENOTEAM_STAGING_IMAGE'] = image
+    env['MENOTEAM_STAGING_SOURCE_SHA'] = source
+    command = ['docker', 'compose', '--project-name', PROJECT, '--file', str(COMPOSE), '--env-file', str(ENV_FILE)] + action
+    subprocess.run(command, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=180)
+
+
+def container_ids(service):
+    if service not in {'app', 'db'}:
+        fail('staging service is not allowed')
+    result = subprocess.run(['docker', 'ps', '--filter', f'label=com.docker.compose.project={PROJECT}', '--filter', f'label=com.docker.compose.service={service}', '--format', '{{.ID}}'], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}, timeout=15, text=True)
+    ids = [value for value in result.stdout.splitlines() if re.fullmatch(r'[a-f0-9]{12,64}', value)]
+    if len(ids) > 1:
+        fail(f'staging {service} container identity is ambiguous')
+    return ids
+
+
+def running_image_identity():
+    container_id = staging_container_id()
+    if not re.fullmatch(r'[a-f0-9]{12,64}', container_id):
+        return None
+    template = '{{.Config.Image}}|{{index .Config.Labels "org.opencontainers.image.revision"}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}'
+    try:
+        details = subprocess.run(['docker', 'inspect', '--format', template, container_id], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}, timeout=15, text=True).stdout.strip()
+        image, revision, running, status = details.split('|', 3)
+        return {'image': image, 'commitSha': revision, 'running': running == 'true', 'health': status}
+    except Exception:
+        return None
+
+
+def staging_container_id():
+    ids = container_ids('app')
+    return ids[0] if ids else ''
+
+
+def healthy(expected_image, expected_commit):
+    identity = running_image_identity()
+    if not identity or not identity['running'] or identity['health'] != 'healthy' or identity['image'] != expected_image or identity['commitSha'] != expected_commit:
+        return False
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=2) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def wait_health(expected_image, expected_commit, seconds=60):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if healthy(expected_image, expected_commit):
+            return True
+        time.sleep(2)
+    return False
+
+
+def image_schema_max(image):
+    template = '{{index .Config.Labels "org.menoteam.workbench-schema-max"}}'
+    value = subprocess.run(['docker', 'image', 'inspect', '--format', template, image], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}, timeout=15, text=True).stdout.strip()
+    if not re.fullmatch(r'\d{3}_.+\.sql', value):
+        fail('image does not declare its supported Workbench migration boundary')
+    return value
+
+
+def database_schema_latest():
+    ids = container_ids('db')
+    if not ids:
+        fail('staging database container is unavailable')
+    result = subprocess.run(['docker', 'exec', ids[0], 'psql', '-U', 'menoteam_stage', '-d', 'menoteam_workbench_stage', '-Atc', 'SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1'], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}, timeout=15, text=True)
+    return result.stdout.strip()
+
+
+def schema_version_number(value):
+    match = re.match(r'^(\d+)_', str(value))
+    if not match:
+        fail('database schema boundary is unavailable')
+    return int(match.group(1))
+
+
+def receipt(request, phase, deployment=None, previous=None):
+    return {key: value for key, value in {
+        'operationId': request['operationId'], 'targetId': request['targetId'], 'phase': phase,
+        'deploymentId': deployment['id'] if deployment else None,
+        'commitSha': request['commitSha'], 'imageDigest': request['imageDigest'],
+        'activeCommitSha': deployment['commitSha'] if deployment else None,
+        'activeImageDigest': deployment['imageDigest'] if deployment else None,
+        'previousDeploymentId': previous['id'] if previous else None,
+        'previousImageDigest': previous['imageDigest'] if previous else None,
+        'checkedAt': utc_now(),
+    }.items() if value is not None}
+
+
+def operate(config, request, state):
+    if request['targetId'] != config['targetId']:
+        fail('target is not configured')
+    if not request['imageDigest'].startswith('sha256:'):
+        fail('image digest must be immutable')
+    prior = state.get('operations', {}).get(request['operationId'])
+    request_hash = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    deployments = state.setdefault('deployments', {})
+    if request['action'] == 'status':
+        image = f"{config['imageRepository']}@{request['imageDigest']}"
+        if prior:
+            saved_request = prior.get('request')
+            if saved_request:
+                expected = {key: value for key, value in saved_request.items() if key not in {'action', 'previousDeploymentId'}}
+                actual = {key: value for key, value in request.items() if key not in {'action', 'previousDeploymentId'}}
+                saved_hash = hashlib.sha256(json.dumps(saved_request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                matches = saved_hash == prior.get('requestHash') and actual == expected and (request.get('previousDeploymentId') is None or request['previousDeploymentId'] == saved_request.get('previousDeploymentId'))
+            else:
+                # Older completed records saved only the mutation hash and receipt.
+                # Reconstruct the original mutation, including its expected-current identity.
+                terminal = prior.get('receipt', {})
+                original = {key: value for key, value in request.items() if key != 'previousDeploymentId'}
+                candidates = [{**original, 'action': 'deploy'}]
+                if terminal.get('phase') == 'rolled_back' and terminal.get('deploymentId'):
+                    candidates.append({**original, 'action': 'rollback', 'previousDeploymentId': terminal['deploymentId']})
+                matches = any((request.get('previousDeploymentId') is None or request['previousDeploymentId'] == candidate.get('previousDeploymentId')) and hashlib.sha256(json.dumps(candidate, sort_keys=True, separators=(',', ':')).encode()).hexdigest() == prior.get('requestHash') for candidate in candidates)
+            if not matches:
+                fail('status query does not match the immutable operation identity')
+            if prior.get('receipt'):
+                terminal = prior['receipt']
+                if any(terminal.get(key) != request[key] for key in ('operationId', 'targetId', 'commitSha', 'imageDigest')):
+                    fail('saved receipt does not match the immutable operation identity')
+                return terminal
+        if prior and prior.get('pending'):
+            pending_request = prior.get('request', {})
+            if healthy(image, request['commitSha']):
+                if pending_request.get('action') == 'rollback':
+                    deployment = deployments.get(pending_request.get('previousDeploymentId'))
+                    if not deployment or deployment.get('commitSha') != request['commitSha'] or deployment.get('imageDigest') != request['imageDigest'] or not deployment.get('healthPassed'):
+                        return receipt(request, 'unknown')
+                    previous = state.get('current')
+                    phase = 'rolled_back'
+                else:
+                    deployment = {'id': 'deploy_' + request['operationId'][4:], 'commitSha': request['commitSha'], 'imageDigest': request['imageDigest'], 'healthPassed': True, 'schemaMax': image_schema_max(image)}
+                    previous = state.get('current')
+                    phase = 'health_passed'
+                deployments[deployment['id']] = deployment
+                state['current'] = deployment
+                result = receipt(request, phase, deployment, previous)
+                state['operations'][request['operationId']] = {'requestHash': prior['requestHash'], 'request': pending_request, 'receipt': result}
+                return result
+            # A previous helper may have exited while Docker/Compose is still changing
+            # container state. Neither the prior version being healthy nor no running
+            # app container proves that the in-flight operation has ended.
+            return receipt(request, 'unknown')
+        return receipt(request, 'unknown')
+    if prior:
+        if prior['requestHash'] != request_hash:
+            fail('operation id was already used for a different mutation')
+        if prior.get('pending'):
+            return receipt(request, 'unknown')
+        return prior['receipt']
+    if request['action'] == 'verify':
+        current = state.get('current')
+        if not current or current['commitSha'] != request['commitSha'] or current['imageDigest'] != request['imageDigest']:
+            return receipt(request, 'unknown')
+        image = f"{config['imageRepository']}@{request['imageDigest']}"
+        return receipt(request, 'health_passed' if healthy(image, request['commitSha']) else 'unknown', current)
+    if any(operation.get('pending') for operation in state.get('operations', {}).values()):
+        fail('another remote operation is unknown; reconcile it before a new mutation')
+    current = state.get('current')
+    if request.get('expectedCurrentDeploymentId') != (current['id'] if current else None):
+        fail('current deployment changed; refresh before mutating staging')
+    if request['action'] == 'rollback':
+        previous = deployments.get(request['previousDeploymentId'])
+        if not previous or not previous.get('healthPassed'):
+            fail('rollback target has no health-passed deployment receipt')
+        if previous['imageDigest'] != request['imageDigest'] or previous['commitSha'] != request['commitSha']:
+            fail('rollback target does not match the requested immutable image and source')
+        old = state.get('current')
+        state.setdefault('operations', {})[request['operationId']] = {'requestHash': request_hash, 'pending': True, 'request': request}
+        atomic_write(state)
+        image = f"{config['imageRepository']}@{request['imageDigest']}"
+        run_compose(['pull', 'app'], image, request['commitSha'])
+        schema_max = image_schema_max(image)
+        if schema_version_number(database_schema_latest()) > schema_version_number(schema_max):
+            run_compose(['stop', 'app'], image, request['commitSha'])
+            state['current'] = None
+            return receipt(request, 'target_offline', None, old)
+        run_compose(['up', '-d', '--no-deps', 'app'], image, request['commitSha'])
+        if wait_health(image, request['commitSha']):
+            state['current'] = previous
+            return receipt(request, 'rolled_back', previous, old)
+        run_compose(['stop', 'app'], image, request['commitSha'])
+        state['current'] = None
+        return receipt(request, 'target_offline', None, old)
+    if request['action'] == 'deploy':
+        current = state.get('current')
+        deployment = {'id': 'deploy_' + request['operationId'][4:], 'commitSha': request['commitSha'], 'imageDigest': request['imageDigest'], 'healthPassed': False}
+        state.setdefault('operations', {})[request['operationId']] = {'requestHash': request_hash, 'pending': True, 'request': request}
+        atomic_write(state)
+        image = f"{config['imageRepository']}@{request['imageDigest']}"
+        run_compose(['pull', 'app'], image, request['commitSha'])
+        deployment['schemaMax'] = image_schema_max(image)
+        run_compose(['up', '-d', '--no-deps', 'app'], image, request['commitSha'])
+        if wait_health(image, request['commitSha']):
+            deployment['healthPassed'] = True
+            deployments[deployment['id']] = deployment
+            state['current'] = deployment
+            return receipt(request, 'health_passed', deployment, current)
+        if current and current.get('healthPassed'):
+            old_image = f"{config['imageRepository']}@{current['imageDigest']}"
+            run_compose(['pull', 'app'], old_image, current['commitSha'])
+            if schema_version_number(database_schema_latest()) > schema_version_number(current['schemaMax']):
+                run_compose(['stop', 'app'], image, request['commitSha'])
+                state['current'] = None
+                return receipt(request, 'target_offline', None, deployment)
+            run_compose(['up', '-d', '--no-deps', 'app'], old_image, current['commitSha'])
+            if wait_health(old_image, current['commitSha']):
+                state['current'] = current
+                return receipt(request, 'rolled_back', current, deployment)
+        run_compose(['stop', 'app'], image, request['commitSha'])
+        state['current'] = None
+        return receipt(request, 'target_offline', None, current)
+    fail('unsupported action')
+
+
+def main():
+    config = load_config()
+    request = parse_request()
+    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE.parent, 0o700)
+    with LOCK.open('a+') as lock:
+        os.chmod(LOCK, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            text = STATE.read_text() if STATE.exists() else ''
+            state = json.loads(text) if text.strip() else {'deployments': {}, 'operations': {}}
+            result = operate(config, request, state)
+            if request['action'] not in {'status', 'verify'}:
+                digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                state.setdefault('operations', {})[request['operationId']] = {'requestHash': digest, 'request': request, 'receipt': result}
+                atomic_write(state)
+            elif request['action'] == 'status':
+                atomic_write(state)
+            print(json.dumps(result, separators=(',', ':'), sort_keys=True))
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({'error': type(error).__name__, 'message': str(error)[:300]}, separators=(',', ':')), file=sys.stderr)
+        sys.exit(1)
