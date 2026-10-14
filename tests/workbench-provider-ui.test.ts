@@ -933,3 +933,69 @@ describe('delivery action and narrow breadcrumb UI',()=>{
     const currentLabel=nav.querySelector('strong')!;expect(currentLabel.textContent).toBe(workTitle);expect(currentLabel.title).toBe(workTitle);expect(currentLabel.className).toContain('min-w-16');expect(currentLabel.className).toContain('flex-1');expect(currentLabel.className).toContain('truncate');
   });
 });
+
+function reviewOverviewFixture(options:{member?:typeof owner;workId?:string;qaId?:string;qaRevision?:string;candidateRunId?:string;commitSha?:string;diffRevision?:string}={}){
+  const currentMember=options.member??owner,workId=options.workId??'work-1',qaId=options.qaId??'review-qa',qaRevision=options.qaRevision??'qa-revision',candidateRunId=options.candidateRunId??'candidate-run',commitSha=options.commitSha??'candidate-commit',diffRevision=options.diffRevision??'diff-revision';
+  const work={id:workId,projectId:project.id,title:`Overview ${workId}`,overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+  const diff={id:`diff-${workId}`,projectId:project.id,workId,runId:candidateRunId,kind:'diff' as const,revision:diffRevision,createdAt:'2026-10-06T10:00:00.000Z',data:{candidateRevision:commitSha,files:[],totalFiles:0,truncated:false}};
+  const fingerprint='a'.repeat(64),reviewRunId=`review-run-${workId}`;
+  const binding={candidateRunId,commitSha,candidateFingerprint:fingerprint,diffArtifactId:diff.id,diffRevision,qaArtifactIds:[qaId]};
+  const candidate={id:candidateRunId,projectId:project.id,workId,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'} as Snapshot['runs'][number];
+  const review={id:reviewRunId,projectId:project.id,workId,kind:'review' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',reviewBinding:binding} as Snapshot['runs'][number];
+  const delivery={id:`delivery-${workId}`,projectId:project.id,workId,targetRunId:candidateRunId,kind:'delivery' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',operation:{action:'create_draft_pr',phase:'pr_created',candidateRunId,commitSha,candidateFingerprint:'a'.repeat(64),artifactRevision:diffRevision}} as Snapshot['runs'][number];
+  const metadata={id:qaId,projectId:project.id,workId,runId:reviewRunId,kind:'qa' as const,revision:qaRevision,createdAt:'2026-10-06T11:00:00.000Z'};
+  const qa={...metadata,data:{verification:'current',typedReview:{...binding,reviewerRunId:reviewRunId,disposition:'approved',findings:[]}}};
+  const current=snapshot(currentMember);current.works=[work];current.runs=[candidate,review,delivery];current.artifacts=[diff,metadata];
+  return {snapshot:current,qa,work,metadata};
+}
+function freshClone<T>(value:T):T{return JSON.parse(JSON.stringify(value)) as T;}
+async function advanceSnapshotPoll(){await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});await flush();}
+
+describe('overview typed-review polling identity',()=>{
+  const openOverview=(workId='work-1')=>window.history.replaceState(null,'',`/workbench/?view=work-detail&project=project&work=${workId}`);
+  const reviewButton=()=>[...host.querySelectorAll('strong')].find(item=>item.textContent==='Merge reviewed pull request')?.closest('section')??null;
+
+  it('does not refetch completed reviewer evidence when each two-second snapshot clones the same identities',async()=>{
+    openOverview();const fixture=reviewOverviewFixture();
+    const evidence=vi.spyOn(workbenchApi,'artifact').mockResolvedValue(fixture.qa as never);
+    await mount(fixture.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);
+    const snapshotRequest=vi.mocked(workbenchApi.snapshot);snapshotRequest.mockClear().mockImplementation(async()=>freshClone(fixture.snapshot));
+    await advanceSnapshotPoll();await advanceSnapshotPoll();
+    expect(snapshotRequest).toHaveBeenCalledTimes(2);expect(evidence).toHaveBeenCalledTimes(1);expect(reviewButton()).not.toBeNull();
+  });
+
+  it('refreshes evidence when candidate binding and eligible artifact identity/revision change',async()=>{
+    openOverview();const first=reviewOverviewFixture();let current=first.snapshot;
+    const second=reviewOverviewFixture({qaId:'review-qa-new',qaRevision:'qa-revision-new',candidateRunId:'candidate-run-new',commitSha:'candidate-commit-new',diffRevision:'diff-revision-new'});
+    const pending=deferred<Awaited<ReturnType<typeof workbenchApi.artifact>>>();
+    const evidence=vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id==='review-qa'?first.qa as never:pending.promise);
+    await mount(first.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);expect(reviewButton()).not.toBeNull();
+    current=second.snapshot;const snapshotRequest=vi.mocked(workbenchApi.snapshot);snapshotRequest.mockImplementation(async()=>freshClone(current));
+    await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(evidence.mock.calls[1]?.[0]).toBe('review-qa-new');expect(reviewButton()).toBeNull();
+    pending.resolve(second.qa as never);await flush();expect(reviewButton()).not.toBeNull();
+  });
+
+  it('separates session scopes and ignores a late approval from the previous session',async()=>{
+    openOverview();const fixture=reviewOverviewFixture();const oldResult=deferred<Awaited<ReturnType<typeof workbenchApi.artifact>>>();const newResult=deferred<Awaited<ReturnType<typeof workbenchApi.artifact>>>();
+    const evidence=vi.spyOn(workbenchApi,'artifact').mockImplementation(()=>evidence.mock.calls.length===1?oldResult.promise:newResult.promise);
+    await mount(fixture.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);
+    const changedSession=freshClone(fixture.snapshot);changedSession.member=member;let current=changedSession;
+    vi.mocked(workbenchApi.snapshot).mockImplementation(async()=>freshClone(current));
+    await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(reviewButton()).toBeNull();
+    oldResult.resolve(fixture.qa as never);await flush();expect(reviewButton()).toBeNull();
+    newResult.resolve(fixture.qa as never);await flush();expect(reviewButton()).not.toBeNull();
+  });
+
+  it('cancels prior Work evidence reads when the selected Work changes',async()=>{
+    openOverview('work-1');const first=reviewOverviewFixture();const second=reviewOverviewFixture({workId:'work-2',qaId:'review-qa-work-2'});
+    const oldResult=deferred<Awaited<ReturnType<typeof workbenchApi.artifact>>>();const newResult=deferred<Awaited<ReturnType<typeof workbenchApi.artifact>>>();
+    const evidence=vi.spyOn(workbenchApi,'artifact').mockImplementation(id=>id==='review-qa'?oldResult.promise:newResult.promise);
+    await mount(first.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);
+    const next=freshClone(first.snapshot);next.works=[first.work,second.work];next.runs=[...next.runs,...second.snapshot.runs];next.artifacts=[...next.artifacts,...second.snapshot.artifacts];
+    vi.mocked(workbenchApi.snapshot).mockImplementation(async()=>freshClone(next));
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=project&work=work-2`);
+    await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(evidence.mock.calls[1]?.[0]).toBe('review-qa-work-2');expect(reviewButton()).toBeNull();
+    oldResult.resolve(first.qa as never);await flush();expect(reviewButton()).toBeNull();
+    newResult.resolve(second.qa as never);await flush();expect(reviewButton()).not.toBeNull();
+  });
+});
