@@ -5,7 +5,7 @@ preserving the existing Work Map V1 and Agent Gateway until compatibility and
 cutover are proven. It is a deployment plan, not evidence that the V3 app is
 already hosted or production-ready.
 
-## Current server baseline
+## Historical server baseline — inspected 2026-10-06
 
 Read-only SSH inspection on 2026-10-06 found a Debian 12 host with 1 vCPU,
 1.8 GiB RAM, 2 GiB swap, and 52 GiB free disk. Three healthy containers are
@@ -15,18 +15,53 @@ Gateway on `127.0.0.1:3100`. Caddy serves
 is in `menoteam_menoteam-postgres`; Gateway pairing state is in
 `menoteam_menoteam-gateway:/data`. Both apps return 200 from `/healthz`.
 
-The deployed Work Map database has `001_initial.sql` and
-`002_owner_provenance.sql` applied; those were the original V1 migrations at inspection. The additive workbench candidate now includes `003_workbench.sql`, `004_workbench_constraints.sql`, and `005_workbench_bridge_tokens.sql`; they are validated locally but are not yet claimed applied on the remote service. The self-hosting contract says
+At that inspection, the deployed Work Map database had `001_initial.sql` and
+`002_owner_provenance.sql` applied; those were the original V1 migrations at
+inspection. The then-current additive workbench candidate included
+`003_workbench.sql`, `004_workbench_constraints.sql`, and
+`005_workbench_bridge_tokens.sql`. These statements describe the 2026-10-06
+checkpoint, not the current local source or a later remote database query. The
+self-hosting contract says
 the dashboard is read-only with one shared password, and V1 MCP access uses one
 trusted-team key; there are no user accounts or actor-level permissions. The
-current host is therefore a useful additive deployment target, but it does not
-yet satisfy the V3 team app's identity, invitation, or project-isolation needs.
+current host was therefore a useful additive deployment target, but it did not
+satisfy the V3 team app's identity, invitation, or project-isolation needs.
 
-The local Menoteam checkout currently contains uncommitted and untracked product
-work. It must not be reset, stashed, or mapped as a project execution baseline.
-The Connector creates isolated worktrees from explicit committed revisions, so
-dogfooding waits until the intended baseline is preserved as a reviewable commit.
-No dirty checkout files are copied into agent worktrees implicitly.
+## Current delivery status — evidence through 2026-10-14
+
+The latest read-only remote preflight found the existing V1 app, PostgreSQL and
+Agent Gateway containers healthy, with the existing V1 volumes and Caddy routes
+unchanged. It found no workbench staging container or volume, staging directory,
+port-3200 listener or workbench hostname. The inspection did not query or export
+the remote database. This is remote inventory evidence, not a deployment or
+schema inspection: [2026-10-14 preflight](../.local/acceptance/a15-remote-preflight-20261014-safe.json).
+
+Local source and runtime have advanced beyond the historical `003`–`005`
+checkpoint. The local committed source includes migrations `006` and `007`; the
+local full-app gate for source **`5251ca9b4abda4aaea04fd2512467ca3b93f79a4`**
+passed **758/758 tests and 59/59 PostgreSQL tests**, with no skips. Its matched
+local rollout is recorded in the [acceptance ledger](full-app-acceptance-ledger.md#latest-evidence-index--2026-10-14-combined-source-and-same-run-recovery).
+Migration `007_workbench_latest_diff.sql` was applied to the local runtime
+database, and its partial latest-diff index was observed valid and ready. The
+supporting local receipts are [rollout](../.local/acceptance/combined-5251ca9-20261014/rollout-safe.json),
+[migration 007](../.local/acceptance/combined-5251ca9-20261014/migration007-runtime-safe.json),
+and [fixed gate](../.local/acceptance/combined-5251ca9-20261014/summary-safe.json).
+Later native candidates have separately bound QA/review evidence in the ledger;
+the 758/59 gate above is not a claim about the latest candidate. This local
+evidence does not show migrations `006` or `007` applied remotely.
+
+The repository baseline should be selected by an explicit committed revision
+and recorded with its tree and required evidence at the time of each run. Never
+use uncommitted checkout state as an implicit execution baseline or assume that
+an isolated worktree contains uncommitted files. The earlier dirty-checkout
+warning was a historical checkpoint, not a claim about the current checkout.
+
+No V3 cloud deployment, remote schema change, production database export,
+backup/isolated restore, authenticated staging user-flow or route/image rollback
+has been proven. The 2026-10-14 preflight retained the existing export
+restriction; production export remains unauthorized and was not attempted.
+These facts do not relax the identity, isolation, backup/restore, V1
+compatibility, staging, acceptance or rollback gates below.
 
 ## Delivery sequence
 
