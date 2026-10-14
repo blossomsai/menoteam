@@ -999,3 +999,40 @@ describe('overview typed-review polling identity',()=>{
     newResult.resolve(second.qa as never);await flush();expect(reviewButton()).not.toBeNull();
   });
 });
+
+describe('long evidence text wrapping',()=>{
+  it('wraps the complete Overview fingerprint without clipping or changing its text',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1');
+    const fixture=reviewOverviewFixture();const fingerprint='f'.repeat(64);const overview=`Candidate fingerprint ${fingerprint}`;
+    fixture.work.overview=overview;
+    await mount(fixture.snapshot);
+    const section=[...host.querySelectorAll('section')].find(item=>item.querySelector('h2')?.textContent==='Current overview')!;
+    const paragraph=section.querySelector('p')!;
+    expect(paragraph.textContent).toBe(overview);expect(paragraph.textContent).toContain(fingerprint);
+    expect(section.className).toContain('min-w-0');expect(paragraph.className).toContain('min-w-0');expect(paragraph.className).toContain('wrap-anywhere');
+    expect(paragraph.className).not.toMatch(/line-clamp|truncate/u);
+  });
+
+  it('wraps complete QA reviewer IDs, hashes, and finding text while preserving the evidence strings',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const work={id:'work-1',projectId:project.id,title:'Long QA evidence',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const candidateId=`candidate-${'a'.repeat(64)}`,reviewRunId=`reviewer-${'b'.repeat(64)}`,commitSha='c'.repeat(64),candidateFingerprint='d'.repeat(64),diffRevision='e'.repeat(64),diffArtifactId=`artifact-diff-${'f'.repeat(64)}`,qaId=`artifact-review-${'9'.repeat(64)}`;
+    const binding={candidateRunId:candidateId,commitSha,candidateFingerprint,diffArtifactId,diffRevision,qaArtifactIds:[qaId]};
+    const diff={id:diffArtifactId,projectId:project.id,workId:work.id,runId:candidateId,kind:'diff' as const,revision:diffRevision,createdAt:'2026-10-06',data:{candidateRevision:commitSha,files:[],totalFiles:0,truncated:false}};
+    const candidate={id:candidateId,projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'} as Snapshot['runs'][number];
+    const reviewRun={id:reviewRunId,projectId:project.id,workId:work.id,kind:'review' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',reviewBinding:binding} as Snapshot['runs'][number];
+    const finding=`Artifact ${qaId} binds candidate ${candidateId}, commit ${commitSha}, diff ${diffArtifactId}, and SHA-256 ${candidateFingerprint}; preserve this full-reference-code-${'0123456789abcdef'.repeat(4)} text.`;
+    const qa={id:qaId,projectId:project.id,workId:work.id,runId:reviewRunId,kind:'qa' as const,revision:diffRevision,createdAt:'2026-10-06',data:{typedReview:{...binding,reviewerRunId:reviewRunId,disposition:'approved',findings:[{id:'long-finding',blocking:true,summary:finding}]}}};
+    const qaMetadata={id:qa.id,projectId:qa.projectId,workId:qa.workId,runId:qa.runId,kind:qa.kind,revision:qa.revision,createdAt:qa.createdAt};
+    const current=snapshot();current.works=[work];current.runs=[candidate,reviewRun];current.artifacts=[{id:diff.id,projectId:diff.projectId,workId:diff.workId,runId:diff.runId,kind:diff.kind,revision:diff.revision,createdAt:diff.createdAt},qaMetadata];
+    vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id===diff.id?diff:qa);
+    await mount(current);await flush();
+    const panel=[...host.querySelectorAll('section')].find(item=>item.querySelector('h3')?.textContent==='Typed review')!;
+    expect(panel.textContent).toContain(reviewRunId);expect(panel.textContent).toContain(commitSha);expect(panel.textContent).toContain(candidateFingerprint);expect(panel.textContent).toContain(finding);
+    expect(panel.className).toContain('min-w-0');
+    const evidence=[...panel.querySelectorAll('p')].find(item=>item.textContent===`Blocking · ${finding}`)!;
+    expect(evidence.textContent).toBe(`Blocking · ${finding}`);expect(evidence.className).toContain('min-w-0');expect(evidence.className).toContain('wrap-anywhere');
+    expect(evidence.className).not.toMatch(/line-clamp|truncate/u);
+    expect([...host.querySelectorAll('section.min-w-0.space-y-4')].some(item=>item.querySelector('h2')?.textContent==='QA')).toBe(true);
+  });
+});
