@@ -93,9 +93,13 @@ import importlib.util,importlib.machinery,json,sys,tempfile,pathlib,os,types,io,
 spec=importlib.util.spec_from_loader('stage',importlib.machinery.SourceFileLoader('stage',sys.argv[1]));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 root=pathlib.Path(tempfile.mkdtemp());os.chmod(root,0o700);m.RUNTIME_DIR=root;m.REGISTRY_CONFIG_DIR=root/'menoteam-workbench-stage-registry';m.REGISTRY_CONFIG_DIR.mkdir(mode=0o700);os.chmod(m.REGISTRY_CONFIG_DIR,0o700);config=m.REGISTRY_CONFIG_DIR/'config.json';config.write_text(json.dumps({'auths':{'ghcr.io':{'registrytoken':'fake-root-token'}}}));os.chmod(config,0o600)
 original_lstat=os.lstat
-def fake_lstat(path):
- info=original_lstat(path)
- if pathlib.Path(path) in (root,m.REGISTRY_CONFIG_DIR,config):return types.SimpleNamespace(st_uid=0,st_mode=info.st_mode)
+class RootOwnedStat:
+ def __init__(self,info):self.info=info
+ st_uid=0
+ def __getattr__(self,name):return getattr(self.info,name)
+def fake_lstat(path,*args,**kwargs):
+ info=original_lstat(path,*args,**kwargs)
+ if not args and not kwargs and pathlib.Path(path) in (root,m.REGISTRY_CONFIG_DIR,config):return RootOwnedStat(info)
  return info
 m.os.lstat=fake_lstat;ambient=root/'ambient-docker';ambient.mkdir(mode=0o700);(ambient/'config.json').write_text('{"credsStore":"sentinel-helper"}');os.environ['DOCKER_CONFIG']=str(ambient);calls=[];fail_run=False
 def fake_docker(command,**kwargs):
