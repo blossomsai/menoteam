@@ -1604,6 +1604,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const p=checkedJson(await user('POST','/projects',{name:'Staging authorization proof',repositoryUrl:'https://github.com/example/staging-proof'})) as Project;
         const enrolled=await enrollProvider('staging-proof-connector',[p.id]);
         const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Exact staging candidate'})) as Work;
+        const rollbackWork=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Rollback from another Work'})) as Work;
         const caps={runKinds:[],git:true,githubWrite:true,deliveryActions:['deploy_staging','rollback_staging'],deploymentTargets:['staging']};
         expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps}}})).statusCode).toBe(204);
         const policy=checkedJson(await user('POST','/settings',{projectId:p.id,kind:'connection',name:'Staging delivery policy',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',baseBranch:'main',allowDraftPr:true,allowStagingDeploy:true,stagingTargets:['staging'],configuredBy:(await user('GET','/me')).json().id}}));
@@ -1674,10 +1675,20 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const previousAt=new Date(Date.now()-60_000).toISOString(),currentAt=new Date().toISOString();
         const previousRun=verifiedDeployment(previousId,previousDigest,previousAt,{deploymentId:'deploy_previous'});
         const currentRun=verifiedDeployment(currentId,currentDigest,currentAt,{deploymentId:'deploy_current',previousDeploymentId:'deploy_previous',previousImageDigest:previousDigest});
+        currentRun.workId=rollbackWork.id;
         await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${previousRun.id},'run',${p.id},${sql.json(previousRun as never)}),(${currentRun.id},'run',${p.id},${sql.json(currentRun as never)})`;
         // Restore mutation capabilities via normal discovery after the read-only reconciliation proof.
         expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps,runKinds:[]}}})).statusCode).toBe(204);
-        const rollbackRequest=(requestId:string)=>user('POST',`/works/${work.id}/staging/rollback`,{deploymentRunId:currentRun.id,targetId:'staging',requestId});
+        const otherProject=checkedJson(await user('POST','/projects',{name:'Other staging project',repositoryUrl:'https://github.com/example/other-staging-proof'})) as Project;
+        const otherProjectWork=checkedJson(await user('POST',`/projects/${otherProject.id}/works`,{title:'Foreign staging Work'})) as Work;
+        const otherProjectReceipt={...previousRun,id:randomUUID(),projectId:otherProject.id,workId:otherProjectWork.id,operation:{...previousRun.operation!,stagingReceipt:{...previousRun.operation!.stagingReceipt!,deploymentId:'deploy_other_project'}}};
+        const otherTargetReceipt={...previousRun,id:randomUUID(),operation:{...previousRun.operation!,targetId:'other-stage',stagingReceipt:{...previousRun.operation!.stagingReceipt!,targetId:'other-stage',deploymentId:'deploy_other_target'}}};
+        const foreignProjectCurrent={...currentRun,id:randomUUID(),operation:{...currentRun.operation!,stagingReceipt:{...currentRun.operation!.stagingReceipt!,deploymentId:'deploy_current_foreign_project',previousDeploymentId:'deploy_other_project'}}};
+        const foreignTargetCurrent={...currentRun,id:randomUUID(),operation:{...currentRun.operation!,stagingReceipt:{...currentRun.operation!.stagingReceipt!,deploymentId:'deploy_current_foreign_target',previousDeploymentId:'deploy_other_target'}}};
+        await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${otherProjectReceipt.id},'run',${otherProject.id},${sql.json(otherProjectReceipt as never)}),(${otherTargetReceipt.id},'run',${p.id},${sql.json(otherTargetReceipt as never)}),(${foreignProjectCurrent.id},'run',${p.id},${sql.json(foreignProjectCurrent as never)}),(${foreignTargetCurrent.id},'run',${p.id},${sql.json(foreignTargetCurrent as never)})`;
+        const rollbackRequest=(requestId:string,deploymentRunId=currentRun.id)=>user('POST',`/works/${rollbackWork.id}/staging/rollback`,{deploymentRunId,targetId:'staging',requestId});
+        expect((await rollbackRequest('reject-other-project',foreignProjectCurrent.id)).statusCode).toBe(409);
+        expect((await rollbackRequest('reject-other-target',foreignTargetCurrent.id)).statusCode).toBe(409);
         const rollbackQueued=checkedJson(await rollbackRequest('rollback-first')) as {run:Run};
         expect(rollbackQueued.run.operation).toMatchObject({action:'rollback_staging',phase:'queued',previousDeploymentRunId:previousRun.id,previousDeploymentId:'deploy_previous',rollbackToImageDigest:previousDigest});
         const rollbackClaim=checkedJson(await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps,runKinds:['delivery']}}})).run as Run;
@@ -1700,6 +1711,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(changed.data.enabled).toBe(false);
         await sql`DELETE FROM wb_records WHERE project_id=${p.id}`;
         await sql`DELETE FROM wb_requests WHERE scope LIKE ${`%${p.id}%`} OR result->>'runId'=${claimed.id}`;
+        await sql`DELETE FROM wb_records WHERE project_id=${otherProject.id}`;
+        await sql`DELETE FROM wb_requests WHERE scope LIKE ${`%${otherProject.id}%`}`;
     });
     it('reviewer bridge reads exact candidate evidence and denies wider reads or mutations',async()=>{
         const p=(await user('POST','/projects',{name:'Scoped review proof'})).json();
