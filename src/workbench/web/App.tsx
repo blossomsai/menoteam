@@ -91,7 +91,7 @@ function App() {
     const sessionGeneration = sessionGenerationRef.current;
     let active = false;
     const timer = window.setInterval(() => {
-      if (active || sessionGeneration !== sessionGenerationRef.current) return;
+      if (document.hidden || active || sessionGeneration !== sessionGenerationRef.current) return;
       active = true;
       void requestSnapshot().catch(() => undefined).finally(() => { active = false; });
     }, 2_000);
@@ -284,8 +284,17 @@ function canBootstrapMaster(snapshot: Snapshot, projectId: string, messages: Mes
 }
 
 function ProjectCard({ project, snapshot, setError, refresh }: { project: Project; snapshot: Snapshot; setError: (value: string) => void; refresh: () => Promise<void> }) {
-  const { messages, loadOlder, hasOlder, loadingOlder } = useMessageHistory(project.id);
-  const visibleMessages = messages.length ? messages : snapshot.messages.filter(message => message.projectId === project.id && !message.workId).sort(messageOrder);
+  const { messages, loadOlder, hasOlder, loadingOlder } = useMessageHistory(project.id, undefined, false);
+  const [observedMessages, setObservedMessages] = useState<Message[]>([]);
+  useEffect(() => {
+    const incoming = snapshot.messages.filter(message => message.projectId === project.id && !message.workId);
+    if (!incoming.length) return;
+    // Keep snapshot updates for this mounted card even after global snapshot eviction.
+    setObservedMessages(current => [...new Map([...current, ...incoming].map(message => [message.id, message])).values()]);
+  }, [snapshot.messages, project.id]);
+  const byId = new Map(messages.map(message => [message.id, message]));
+  observedMessages.forEach(message => byId.set(message.id, message));
+  const visibleMessages = [...byId.values()].sort(messageOrder);
   return <section className="flex h-[min(70vh,46rem)] min-h-[26rem] min-w-0 flex-col rounded-xl border bg-background p-4 md:p-5">
     <header className="mb-3 flex items-center justify-between gap-3"><div className="flex min-w-0 items-center gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-lg bg-accent font-semibold text-accent-foreground">{project.name.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><h2 className="truncate font-semibold">{project.name}</h2><a className="text-xs text-muted-foreground no-underline hover:underline" href={href('master', project.id)}>Open Master</a></div></div><Badge variant="outline">Project</Badge></header>
     <div className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1" aria-label={`${project.name} conversation`} aria-live="polite">
@@ -321,9 +330,10 @@ function ConversationPage({ title, messages, project, snapshot, work, refresh, s
   </div>;
 }
 
-function useMessageHistory(projectId: string, workId?: string) {
+function useMessageHistory(projectId: string, workId?: string, poll = true) {
   const [messages, setMessages] = useState<Message[]>([]);
   const messagesRef = useRef<Message[]>([]);
+  const generationRef = useRef(0);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const query = workId ? { workId } : {};
@@ -336,21 +346,25 @@ function useMessageHistory(projectId: string, workId?: string) {
   }), []);
   useEffect(() => {
     let active = true;
-    messagesRef.current = []; setMessages([]); setNextBefore(null);
-    void workbenchApi.projectMessages(projectId, query).then(result => { if (active) { merge(result.messages); setNextBefore(result.nextBefore); } }).catch(() => undefined);
-    const timer = window.setInterval(() => {
-      if (!active) return;
+    let pending = true;
+    ++generationRef.current;
+    messagesRef.current = []; setMessages([]); setNextBefore(null); setLoadingOlder(false);
+    void workbenchApi.projectMessages(projectId, query).then(result => { if (active) { merge(result.messages); setNextBefore(result.nextBefore); } }).catch(() => undefined).finally(() => { pending = false; });
+    const timer = poll ? window.setInterval(() => {
+      if (!active || pending || document.hidden) return;
+      pending = true;
       const last = messagesRef.current.at(-1)?.createdAt;
       const after = last ? new Date(new Date(last).getTime() - 2_000).toISOString() : undefined;
-      void workbenchApi.projectMessages(projectId, { ...query, ...(after ? { after } : {}) }).then(result => { if (active && result.messages.length) merge(result.messages); }).catch(() => undefined);
-    }, 2_000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [projectId, workId, merge]);
+      void workbenchApi.projectMessages(projectId, { ...query, ...(after ? { after } : {}) }).then(result => { if (active && result.messages.length) merge(result.messages); }).catch(() => undefined).finally(() => { pending = false; });
+    }, 2_000) : undefined;
+    return () => { active = false; ++generationRef.current; window.clearInterval(timer); };
+  }, [projectId, workId, merge, poll]);
   const loadOlder = useCallback(async () => {
     if (!nextBefore || loadingOlder) return;
+    const generation = generationRef.current;
     setLoadingOlder(true);
-    try { const result = await workbenchApi.projectMessages(projectId, { ...query, before: nextBefore }); merge(result.messages); setNextBefore(result.nextBefore); }
-    finally { setLoadingOlder(false); }
+    try { const result = await workbenchApi.projectMessages(projectId, { ...query, before: nextBefore }); if (generation === generationRef.current) { merge(result.messages); setNextBefore(result.nextBefore); } }
+    finally { if (generation === generationRef.current) setLoadingOlder(false); }
   }, [loadingOlder, merge, nextBefore, projectId, workId]);
   return { messages, loadOlder, hasOlder: Boolean(nextBefore), loadingOlder };
 }
