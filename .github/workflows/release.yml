@@ -10,10 +10,27 @@ permissions:
 
 jobs:
   verify:
+    name: Release verification
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: docker.io/library/postgres:16-alpine@sha256:1a66d744c1b459e13b05a8fca341da84cb63383e99ce262210efee5a319d4551
+        env:
+          POSTGRES_DB: menoteam_workbench_test
+          POSTGRES_USER: menoteam
+          POSTGRES_PASSWORD: ci-postgres-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U menoteam -d menoteam_workbench_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up pnpm
         uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
@@ -41,7 +58,14 @@ jobs:
         run: pnpm typecheck
 
       - name: Test
-        run: pnpm test
+        env:
+          WORK_MAP_TEST_DATABASE_URL: postgres://menoteam:ci-postgres-password@127.0.0.1:5432/menoteam_workbench_test
+          MENOTEAM_PROVIDER_TEST_DATABASE_URL: postgres://menoteam:ci-postgres-password@127.0.0.1:5432/menoteam_provider_test
+          MENOTEAM_PROVIDER_TEST_SERIAL_AUTHORIZED: "1"
+        run: |
+          node --input-type=module -e 'import postgres from "postgres"; const sql=postgres(process.env.WORK_MAP_TEST_DATABASE_URL); await sql.unsafe("CREATE DATABASE menoteam_provider_test"); await sql.end();'
+          pnpm test --fileParallelism=false --reporter=dot --reporter=json --outputFile.json=/tmp/menoteam-vitest-results.json
+          node scripts/assert-ci-test-results.mjs /tmp/menoteam-vitest-results.json
 
       - name: Build
         run: pnpm build
