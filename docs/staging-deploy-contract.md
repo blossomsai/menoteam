@@ -9,10 +9,12 @@ production records.
 ## Configuration and authorization
 
 Keep the staging target in the existing owner-only Connector configuration.
-The configured entry binds one stable `targetId` to an SSH alias, pinned
-`known_hosts` file/host-key fingerprint, identity-file path, fixed deployment
-root, and fixed health/version URL. The configured deployment root contains
-the operator-installed Menoteam deployment helper. The Workbench delivery
+The configured entry binds one stable `targetId` to an SSH host/user, pinned
+`known_hosts` file/host-key fingerprint, identity-file path and fixed image
+repository. Deployment paths and the health URL are constants in the
+operator-installed Menoteam helper; target settings do not accept arbitrary
+paths or URLs. Version identity is the actual running immutable image digest
+and OCI source label checked by that helper, not an app `/version` endpoint. The Workbench delivery
 connection may allow a list of target IDs; only project owners/admins may set
 that policy. A delivery request is unavailable unless the project policy and
 the claiming Connector both advertise the same configured ID. Do not add a
@@ -73,8 +75,8 @@ deployment ID, timestamps, and bounded result. A lost response remains
 `deploy_unknown` until a read-only status query resolves it.
 
 `deployed` requires the target helper to report the exact commit and digest.
-`health_passed` additionally requires the fixed health/version endpoint to
-return that same identity. This is deployment health only; it is not proof
+`health_passed` additionally requires the helper to verify the running image
+and OCI source identity, healthy container and fixed health endpoint. This is deployment health only; it is not proof
 that a user flow works and must not set Work to Verified. User-flow verification
 is separate QA evidence bound to the same target, commit, and digest.
 

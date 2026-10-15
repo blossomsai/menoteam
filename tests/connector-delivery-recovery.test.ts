@@ -14,6 +14,17 @@ import { draftFixture } from './helpers/draft-pr-fixture.js';
 const wait=async(check:()=>Promise<boolean>)=>{const end=Date.now()+10000;while(Date.now()<end){if(await check())return;await new Promise(r=>setTimeout(r,20));}throw new Error('Timed out waiting for crash fixture');};
 const native={start:async()=>[],stop:async()=>{}} as unknown as CodexAppServer;
 
+// These recovery cases stop before touching any Git checkout. Keep only the
+// scoped config, typed delivery claim, and secure spool they actually exercise.
+function minimalDeliveryRecoveryFixture(temp:string){
+  const dataDir=path.join(temp,'connector-data');
+  const commitSha='a'.repeat(40);
+  const claim={run:{id:'delivery-1',projectId:'project',workId:'work',kind:'delivery',status:'running',generation:1,
+    operation:{action:'create_draft_pr',phase:'queued'}}} as unknown as import('../src/connector/types.js').ClaimedRun;
+  const config:import('../src/connector/types.js').ConnectorConfig={serverUrl:'http://localhost:4313',token:'x'.repeat(32),connectorId:'connector',dataDir,projects:{project:temp}};
+  return {claim,config,commitSha};
+}
+
 describe('durable Draft PR Connector recovery',()=>{
   // Fault only process inspection; durable state and Runner recovery remain real.
   for (const fault of ['missing child identity', 'unverifiable child identity', 'executor EPERM', 'reused executor PID'] as const) {
@@ -30,7 +41,7 @@ describe('durable Draft PR Connector recovery',()=>{
       const waitGroup = vi.spyOn(processInspection, 'waitProcessGroup').mockResolvedValue(false);
       const verifyGroup = vi.spyOn(processInspection, 'terminateVerifiedGitProcessGroup').mockResolvedValue(false);
       try {
-        const f = await draftFixture(temp);
+        const f = minimalDeliveryRecoveryFixture(temp);
         f.config.pollIntervalMs = 10;
         const spoolPath = path.join(f.config.dataDir, 'spool', `${stateKey(f.claim.run.id, '1')}.json`);
         await writeSecureJson(spoolPath, {

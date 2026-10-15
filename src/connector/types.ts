@@ -42,6 +42,20 @@ export interface ConnectorEvent {
   threadId?: string;
 }
 
+/** A synchronous provider final, frozen only after its exact native turn completed. */
+export interface CanonicalFinal {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  text: string;
+}
+
+export interface RunCompletion {
+  threadId?: string;
+  error?: string;
+  canonicalFinal?: CanonicalFinal;
+}
+
 export interface DiffLine {
   type: 'context' | 'add' | 'remove';
   oldLine?: number;

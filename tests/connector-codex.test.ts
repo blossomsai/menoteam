@@ -13,7 +13,7 @@ async function generatedThreadBoundary(run:Partial<Run>,threadId?:string){
  internals.child={};native.models=['gpt-6.1-sol'];
  internals.request=async(method,params)=>{
   if(method==='thread/start'||method==='thread/resume'){boundary={method,params};return{thread:{id:threadId??'configured-thread'}};}
-  if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{turn:{id:'configured-turn',status:'completed'}}}),0);return{turn:{id:'configured-turn'}};}
+  if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{threadId:threadId??'configured-thread',turn:{id:'configured-turn',status:'completed'}}}),0);return{turn:{id:'configured-turn'}};}
   throw new Error('Unexpected RPC');
  };
  await native.run({run:{model:'gpt-6.1-sol',reasoning:'medium',...run}} as ClaimedRun,'/isolated-config','bounded request',threadId,()=>{},'/private-context.json');
@@ -69,7 +69,7 @@ it('resumes the same persisted native thread without hydrating its growing histo
   calls.push({method,params});
   if(method==='thread/resume')return {thread:{id:params.threadId,turns:[]}};
   if(method==='turn/start'){
-   setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{turn:{id:'turn-one',status:'completed'}}}),0);
+   setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{threadId:'durable-native-thread',turn:{id:'turn-one',status:'completed'}}}),0);
    return {turn:{id:'turn-one'}};
   }
   throw Error('Unexpected RPC');
@@ -90,7 +90,7 @@ it('applies an explicit handoff model to the resumed thread and its advertised e
  const native=new CodexAppServer();const calls:{method:string;params:any}[]=[];
  const internals=native as unknown as {child:unknown;events:EventEmitter;request:(method:string,params:any)=>Promise<any>};
  internals.child={};native.models=['target-model'];native.modelReasoningEfforts={'target-model':['advertised-effort']};
- internals.request=async(method,params)=>{calls.push({method,params});if(method==='thread/resume')return{thread:{id:params.threadId}};if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{turn:{id:'handoff-turn',status:'completed'}}}),0);return{turn:{id:'handoff-turn'}};}throw Error('Unexpected RPC');};
+ internals.request=async(method,params)=>{calls.push({method,params});if(method==='thread/resume')return{thread:{id:params.threadId}};if(method==='turn/start'){setTimeout(()=>internals.events.emit('message',{method:'turn/completed',params:{threadId:'same-native-thread',turn:{id:'handoff-turn',status:'completed'}}}),0);return{turn:{id:'handoff-turn'}};}throw Error('Unexpected RPC');};
  const claim={run:{kind:'implementation',model:'target-model',reasoning:'advertised-effort',handoffFromRunId:'source-run'}} as ClaimedRun;
  const result=await native.run(claim,'/same-work-checkout','Continue with the explicit handoff','same-native-thread',()=>undefined);
  expect(calls[0]?.method).toBe('thread/resume');expect(calls[0]?.params).toMatchObject({threadId:'same-native-thread',model:'target-model'});
@@ -106,11 +106,74 @@ it('rejects an unadvertised handoff effort before resuming a native thread',asyn
  expect(methods).toEqual([]);
 });
 
+// These notification shapes match the generated Codex 0.160.1 v2 protocol:
+// ItemCompletedNotification includes threadId + turnId; TurnCompletedNotification
+// includes threadId + turn.id/status, and turn.items is not a complete transcript.
+async function protocolTurn(notifications: Array<{method:string;params:any}>, beforeStartResponse = false) {
+ const native = new CodexAppServer();
+ const events: Array<{type:string;text:string}> = [];
+ const internals = native as unknown as {child:unknown;events:EventEmitter;request:(method:string,params:any)=>Promise<any>};
+ internals.child = {}; native.models = ['fixture-model'];
+ internals.request = async method => {
+  if (method === 'thread/start') return {thread:{id:'native-thread'}};
+  if (method === 'turn/start') {
+   const emit = () => notifications.forEach(message => internals.events.emit('message', message));
+   if (beforeStartResponse) emit(); else setTimeout(emit, 0);
+   return {turn:{id:'native-turn'}};
+  }
+  throw new Error('Unexpected RPC');
+ };
+ const result = await native.run({run:{kind:'master',model:'fixture-model',reasoning:'medium'}} as ClaimedRun,
+  '/isolated-master','bounded prompt',undefined,event => events.push(event),'/private-scoped-context');
+ return {result,events};
+}
+function agentNotification(id:string,text:string,phase: 'final_answer'|'commentary'|null,delivery:'async'|null = null,threadId='native-thread',turnId='native-turn') {
+ return {method:'item/completed',params:{threadId,turnId,completedAtMs:1,item:{type:'agentMessage',id,text,phase,delivery,memoryCitation:null,questions:null}}};
+}
+function turnNotification(status='completed',threadId='native-thread',turnId='native-turn',items:unknown[] = []) {
+ return {method:'turn/completed',params:{threadId,turn:{id:turnId,status,items,error:null}}};
+}
+
+it.each([false,true])('freezes only the exact completed synchronous provider final (events before start response: %s)',async early=>{
+ const {result,events} = await protocolTurn([
+  agentNotification('other-thread','unrelated','final_answer',null,'another-thread'),
+  agentNotification('old-turn','previous final','final_answer',null,'native-thread','old-turn'),
+  turnNotification('completed','native-thread','old-turn'),
+  turnNotification('completed','another-thread'),
+  agentNotification('final','canonical answer','final_answer'),
+  agentNotification('commentary','later commentary','commentary'),
+  agentNotification('unknown','unknown phase',null),
+  agentNotification('async','asynchronous answer','final_answer','async'),
+  turnNotification(),
+  agentNotification('late','late final after completed','final_answer'),
+ ],early);
+ expect(result.canonicalFinal).toEqual({threadId:'native-thread',turnId:'native-turn',itemId:'final',text:'canonical answer'});
+ expect(result.text).toBe('canonical answer');
+ expect(events.filter(event=>event.type==='agent_message').map(event=>event.text)).toEqual([
+  'previous final','canonical answer','later commentary','unknown phase','asynchronous answer','late final after completed',
+ ]);
+});
+
+it('does not infer a final from commentary, unknown phase, async delivery or partial turn.items',async()=>{
+ const {result} = await protocolTurn([
+  agentNotification('commentary','progress','commentary'),
+  agentNotification('unknown','legacy answer',null),
+  agentNotification('async','background answer','final_answer','async'),
+  turnNotification('completed','native-thread','native-turn',[{type:'agentMessage',id:'snapshot',text:'partial snapshot final',phase:'final_answer',delivery:null}]),
+ ]);
+ expect(result.canonicalFinal).toBeUndefined();
+ expect(result.text).toBe('');
+});
+
+it.each(['failed','interrupted','inProgress','unknown'])('never accepts provider final for noncompleted turn status %s',async status=>{
+ await expect(protocolTurn([agentNotification('final','answer','final_answer'),turnNotification(status)],true)).rejects.toThrow(`Codex turn ${status}`);
+});
+
 it.skipIf(process.platform === 'win32')('keeps Connector delivery credentials out of the real Codex app-server child environment', async () => {
  const directory = await mkdtemp(path.join(os.tmpdir(), 'menoteam-codex-env-'));
  const executable = path.join(directory, 'fake-codex-app-server.mjs');
  const capture = path.join(directory, 'child-env.json');
- const previous = new Map(['MENOTEAM_GITHUB_TOKEN', 'MENOTEAM_CONNECTOR_CONFIG', 'OPENAI_API_KEY', 'MENOTEAM_TEST_CAPTURE'].map(name => [name, process.env[name]]));
+ const previous = new Map(['MENOTEAM_GITHUB_TOKEN', 'MENOTEAM_CONNECTOR_CONFIG', 'WORKBENCH_SLACK_BOT_TOKEN', 'WORKBENCH_SLACK_SIGNING_SECRET', 'OPENAI_API_KEY', 'MENOTEAM_TEST_CAPTURE'].map(name => [name, process.env[name]]));
  const restore = () => {
   for (const [name, value] of previous) {
    if (value === undefined) delete process.env[name];
@@ -120,7 +183,7 @@ it.skipIf(process.platform === 'win32')('keeps Connector delivery credentials ou
  const source = `#!/usr/bin/env node
 import { createInterface } from 'node:readline';
 import { writeFile } from 'node:fs/promises';
-await writeFile(process.env.MENOTEAM_TEST_CAPTURE, JSON.stringify({ githubToken: process.env.MENOTEAM_GITHUB_TOKEN, connectorConfig: process.env.MENOTEAM_CONNECTOR_CONFIG, openAiAuth: process.env.OPENAI_API_KEY }), { mode: 0o600 });
+await writeFile(process.env.MENOTEAM_TEST_CAPTURE, JSON.stringify({ githubToken: process.env.MENOTEAM_GITHUB_TOKEN, connectorConfig: process.env.MENOTEAM_CONNECTOR_CONFIG, slackBotToken: process.env.WORKBENCH_SLACK_BOT_TOKEN, slackSigningSecret: process.env.WORKBENCH_SLACK_SIGNING_SECRET, openAiAuth: process.env.OPENAI_API_KEY }), { mode: 0o600 });
 for await (const line of createInterface({ input: process.stdin })) {
   const message = JSON.parse(line);
   if (message.id !== undefined) {
@@ -133,6 +196,8 @@ for await (const line of createInterface({ input: process.stdin })) {
  try {
   process.env.MENOTEAM_GITHUB_TOKEN = 'synthetic-delivery-token-for-test';
   process.env.MENOTEAM_CONNECTOR_CONFIG = '/private/connector-config-with-credential.json';
+  process.env.WORKBENCH_SLACK_BOT_TOKEN = 'synthetic-slack-bot-token-for-test';
+  process.env.WORKBENCH_SLACK_SIGNING_SECRET = 'synthetic-slack-signing-secret-for-test';
   process.env.OPENAI_API_KEY = 'synthetic-codex-auth-for-test';
   process.env.MENOTEAM_TEST_CAPTURE = capture;
   await writeFile(executable, source, { mode: 0o700 });
@@ -144,6 +209,8 @@ for await (const line of createInterface({ input: process.stdin })) {
   const childEnvironment = JSON.parse(await readFile(capture, 'utf8')) as Record<string, string | undefined>;
   expect(childEnvironment.githubToken).toBeUndefined();
   expect(childEnvironment.connectorConfig).toBeUndefined();
+  expect(childEnvironment.slackBotToken).toBeUndefined();
+  expect(childEnvironment.slackSigningSecret).toBeUndefined();
   expect(childEnvironment.openAiAuth).toBe('synthetic-codex-auth-for-test');
   expect(process.env.MENOTEAM_GITHUB_TOKEN).toBe('synthetic-delivery-token-for-test');
  } finally {

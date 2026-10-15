@@ -3,7 +3,7 @@ import { readFile as readFileCb } from 'node:fs/promises';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import type { ClaimedRun, ConnectorEvent, QaCheck } from './types.js';
+import type { CanonicalFinal, ClaimedRun, ConnectorEvent, QaCheck } from './types.js';
 import { fingerprint, type GitOptions } from './git.js';
 import { promisify } from 'node:util';
 
@@ -34,7 +34,7 @@ function scopedBridgeConfig(contextFile: string, tools: string[]) {
 }
 
 export function modelChildEnvironment():NodeJS.ProcessEnv {
-  const env={...process.env};for(const key of ['MENOTEAM_GITHUB_TOKEN','WORKBENCH_GITHUB_TOKEN','GITHUB_TOKEN','GH_TOKEN','MENOTEAM_CONNECTOR_CONFIG'])delete env[key];return env;
+  const env={...process.env};for(const key of ['MENOTEAM_GITHUB_TOKEN','WORKBENCH_GITHUB_TOKEN','GITHUB_TOKEN','GH_TOKEN','MENOTEAM_CONNECTOR_CONFIG','WORKBENCH_SLACK_BOT_TOKEN','WORKBENCH_SLACK_SIGNING_SECRET'])delete env[key];return env;
 }
 
 export class CodexAppServer {
@@ -85,7 +85,7 @@ export class CodexAppServer {
 
   async run(claim: ClaimedRun, cwd: string, prompt: string, threadId: string | undefined,
     onEvent: (event: Omit<ConnectorEvent, 'id'>) => void,
-    bridgeContextFile?: string, gitOptions?: GitOptions): Promise<{ threadId: string; text: string; checks: QaCheck[] }> {
+    bridgeContextFile?: string, gitOptions?: GitOptions): Promise<{ threadId: string; text: string; checks: QaCheck[]; canonicalFinal?: CanonicalFinal }> {
     if (!this.child) await this.start(cwd);
     if (!this.models.includes(claim.run.model)) throw Object.assign(new Error(`Requested model is unavailable on this connector: ${claim.run.model}`), {nativeStage:'model-validation',nativeCategory:'unavailable-model'});
     if (claim.run.handoffFromRunId && !this.modelReasoningEfforts[claim.run.model]?.includes(claim.run.reasoning)) throw Object.assign(new Error(`Requested reasoning effort is unavailable for this model on this connector: ${claim.run.reasoning}`), {nativeStage:'model-validation',nativeCategory:'unavailable-reasoning-effort'});
@@ -109,12 +109,34 @@ export class CodexAppServer {
     const checks: QaCheck[] = [];
     const pendingChecks = new Set<Promise<void>>();
     const commandStarts = new Map<string, Promise<string | null>>();
-    let finalText = '';
+    let canonicalFinal: CanonicalFinal | undefined;
+    let frozen = false;
     let turnId: string | undefined;
+    // Native notifications may arrive before the turn/start RPC response.
+    const earlyNotifications: RpcMessage[] = [];
     let finish!: (result: any) => void;
     let fail!: (error: Error) => void;
     const done = new Promise<any>((resolve, reject) => { finish = resolve; fail = reject; });
+    // A native exit can reject while turn/start is still pending.
+    void done.catch(() => undefined);
     this.activeRejectors.add(fail);
+    const collectFinal = (message: RpcMessage) => {
+      const p = message.params ?? {};
+      if (p.threadId !== id || frozen) return;
+      if (!turnId) { earlyNotifications.push(message); return; }
+      if (message.method === 'item/completed' && p.turnId === turnId) {
+        const item = p.item;
+        if (item?.type === 'agentMessage' && item.phase === 'final_answer' && item.delivery === null &&
+          typeof item.id === 'string' && item.id.length > 0 && typeof item.text === 'string' && item.text.trim()) {
+          canonicalFinal = {threadId:id,turnId,itemId:item.id,text:item.text};
+        }
+      }
+      if (message.method === 'turn/completed' && p.turn?.id === turnId) {
+        frozen = true;
+        if (p.turn.status !== 'completed') { canonicalFinal = undefined; fail(new Error(`Codex turn ${String(p.turn.status)}`)); }
+        else void Promise.all([...pendingChecks]).then(() => finish(p.turn), fail);
+      }
+    };
     const listener = async (message: RpcMessage) => {
       if (message.method && message.id !== undefined) {
         try {
@@ -130,7 +152,6 @@ export class CodexAppServer {
         commandStarts.set(item.id, fingerprint(cwd,gitOptions).catch(() => null));
       }
       if (message.method === 'item/completed' && item?.type === 'agentMessage' && typeof item.text === 'string') {
-        finalText = item.text;
         onEvent({ type: 'agent_message', text: item.text, threadId: id });
       }
       if (message.method === 'item/completed' && item?.type === 'commandExecution') {
@@ -149,18 +170,16 @@ export class CodexAppServer {
           void evidence.finally(() => pendingChecks.delete(evidence));
         }
       }
-      if (message.method === 'turn/completed' && (!turnId || p.turn?.id === turnId)) {
-        if (p.turn?.status === 'failed' || p.turn?.status === 'interrupted') fail(new Error(`Codex turn ${p.turn.status}`));
-        else void Promise.all([...pendingChecks]).then(() => finish(p.turn), fail);
-      }
+      if (message.method === 'item/completed' || message.method === 'turn/completed') collectFinal(message);
     };
     this.events.on('message', listener);
     try {
       const started = await this.request('turn/start', { threadId: id, input: [{ type: 'text', text: prompt }], model: claim.run.model, effort: claim.run.reasoning, cwd, approvalPolicy: 'never' });
       turnId = started?.turn?.id;
-      if (!turnId) throw new Error('Codex app-server did not start a turn');
+      if (typeof turnId !== 'string' || !turnId) throw new Error('Codex app-server did not start a turn');
+      for (const message of earlyNotifications) collectFinal(message);
       await done;
-      return { threadId: id, text: finalText, checks };
+      return { threadId: id, text: canonicalFinal?.text ?? '', checks, ...(canonicalFinal ? {canonicalFinal} : {}) };
     } finally { this.events.off('message', listener); this.activeRejectors.delete(fail); }
   }
 

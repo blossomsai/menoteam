@@ -1,10 +1,10 @@
 # Team Workbench V3 · Current design prototype
 
-Updated 2026-10-06. Current review surface: http://127.0.0.1:4313/. Ten example-data views, with English product text. See [product direction](../../../../PRODUCT.md), [requirements](../../../personal-workspace-requirements.md), [navigation](../../../personal-workspace-mvp-screens.md), and [design](DESIGN.md).
+Updated 2026-10-15. This is the static design gallery at http://127.0.0.1:4313/, with ten example-data views and English product text. It documents the prototype, not the current full-app implementation status. See [product direction](../../../../PRODUCT.md), [requirements](../../../personal-workspace-requirements.md), [navigation](../../../personal-workspace-mvp-screens.md), and [design](DESIGN.md). Full-app implementation and delivery evidence are tracked separately in the [full-app delivery plan](../../../full-app-delivery-plan.md) and [acceptance ledger](../../../full-app-acceptance-ledger.md).
 
 ## Scope
 
-Static React gallery with local sample interactions, not a connected product. All projects contains scrollable conversation cards; Project Master is one focused conversation; Work detail has Overview / Changes / QA on the left and the participants' conversation on the right.
+Static React design gallery with local sample interactions, not the connected full app. All projects contains scrollable conversation cards; Project Master is one focused conversation; Work detail has Overview / Changes / QA on the left and the participants' conversation on the right.
 
 Project settings: Instructions, Skills, Members, Connections. Workspace settings: Agent profiles and Model providers. Instructions are free text with optional starting points. Skills and providers have local add/create examples. File/image and microphone controls are icons only. No real upload, recording, authentication, GitHub import, marketplace install, external polling, autonomous execution, or deployment is performed.
 

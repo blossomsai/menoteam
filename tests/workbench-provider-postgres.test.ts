@@ -90,7 +90,7 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
 
     await migrate(scopedUrl);
     const upgradedLedger = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
-    expect(upgradedLedger.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql', '007_workbench_latest_diff.sql']);
+    expect(upgradedLedger.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql', '007_workbench_latest_diff.sql', '008_workbench_slack_connections.sql']);
     const indexesAfterSuccess = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
       WHERE schemaname=${schema} AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})
@@ -102,7 +102,7 @@ async function verifyProviderMigrationBoundary(databaseUrl: string): Promise<voi
       SELECT id FROM wb_records WHERE id=${fixtureIds[0]} OR id=${fixtureIds[1]} ORDER BY id`;
     expect(preservedAfterOldMigrator.map(row => row.id)).toEqual([...fixtureIds].sort());
     const ledgerAfterOldMigrator = await sql<{ version: string }[]>`SELECT version FROM schema_migrations ORDER BY version`;
-    expect(ledgerAfterOldMigrator.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql', '007_workbench_latest_diff.sql']);
+    expect(ledgerAfterOldMigrator.map(row => row.version)).toEqual([...legacyMigrationFiles, '006_workbench_provider_connections.sql', '007_workbench_latest_diff.sql', '008_workbench_slack_connections.sql']);
     const indexesAfterOldMigrator = await sql<{ indexname: string }[]>`
       SELECT indexname FROM pg_indexes
       WHERE schemaname=${schema} AND (indexname=${providerIndexes[0]} OR indexname=${providerIndexes[1]})

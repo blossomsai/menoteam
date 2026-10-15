@@ -14,7 +14,8 @@ import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
 import { WorkbenchStore } from "../src/workbench/store.js";
 import { WorkbenchConnectorClient } from "../src/connector/client.js";
-import type { Artifact, Project, Run, Work } from "../src/workbench/types.js";
+import type { Artifact, Project, Run, Setting, Work } from "../src/workbench/types.js";
+import { enqueueSlackReply, processSlackReplies, type SlackTransport } from '../src/workbench/slack-replies.js';
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
 describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     let sql: ReturnType<typeof postgres>;
@@ -484,20 +485,21 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             name: "Slack",
             data: {
                 provider: "slack",
-                url: "https://app.slack.com/client/TEAM/CHANNEL"
+                appId: "APP", teamId: "TEAM", channelId: "CHANNEL", enabled: true
             }
         });
         const timestamp = String(Math.floor(Date.now() / 1000));
         const body = JSON.stringify({
             type: "event_callback",
             event_id: "slack-e1",
+            api_app_id: "APP",
             team_id: "TEAM",
             event: {
                 type: "app_mention",
                 channel: "CHANNEL",
                 text: "Please inspect this feedback",
                 user: "USER",
-                ts: "123"
+                ts: "1760000000.000001"
             }
         });
         const signature = "v0=" + createHmac("sha256", "test-slack-signing-secret").update(`v0:${timestamp}:${body}`).digest("hex");
@@ -547,7 +549,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const snap = (await user("GET", "/snapshot")).json();
         expect(snap.messages.filter((m: {
             projectId: string;
-        }) => m.projectId === p.id)).toHaveLength(2);
+        }) => m.projectId === p.id)).toHaveLength(1);
         expect(snap.runs.filter((r: {
             projectId: string;
         }) => r.projectId === p.id)).toHaveLength(0);
@@ -2287,4 +2289,274 @@ describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
   const key=rateLimitKey(sql);
   expect(await key({ip:'127.0.0.23',routeOptions:{url:'/*'},headers:{cookie}} as FastifyRequest)).toBe('ip:127.0.0.23');
  });
+});
+
+describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
+    const databaseUrl = url;
+    const schema = `slack_intake_${randomUUID().replaceAll('-', '')}`;
+    const secret = 'fake-slack-ingest-signing-secret';
+    const connectorToken = 'fake-slack-connector-token';
+    const capabilities = {codexAppServer:true,localWorktrees:true,models:['gpt-6-luna','gpt-6.1-sol'],modelReasoningEfforts:{'gpt-6-luna':['medium'],'gpt-6.1-sol':['medium']}};
+    let admin: ReturnType<typeof postgres>, sql: ReturnType<typeof postgres>, store: WorkbenchStore;
+    let app: Awaited<ReturnType<typeof createWorkbenchApp>>, address: string;
+    let ownsSchema = false;
+    const previousSecret = process.env.WORKBENCH_SLACK_SIGNING_SECRET;
+    const project: Project = { id:'slack-project', name:'Slack', instructions:'', repositoryUrl:'https://github.com/example/fixture', deliveryAuthorization:'', createdAt:new Date().toISOString(), feedbackIntake:{enabled:true,allowExecution:false,actorId:'source-actor'} };
+    const mapping: Setting = { id:'slack-mapping', kind:'connection', projectId:project.id, name:'Slack', data:{provider:'slack',enabled:true,appId:'A123',teamId:'T123',channelId:'C123'},updatedAt:new Date().toISOString() };
+    beforeAll(async () => {
+        const location = new URL(databaseUrl!);
+        if (!['localhost','127.0.0.1','::1'].includes(location.hostname) || !location.pathname.endsWith('_test')) throw new Error('Slack tests require loopback *_test database');
+        admin = postgres(databaseUrl!, {max:1});
+        await admin`CREATE SCHEMA ${admin(schema)}`; ownsSchema = true;
+        location.searchParams.set('search_path',schema);
+        await migrate(location.toString());
+        sql = postgres(location.toString(), {max:4}); store = new WorkbenchStore(sql);
+        await sql`INSERT INTO wb_users(id,email,name,password_hash,role) VALUES ('source-actor','slack@fixture.example','Source','unused','member')`;
+        await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ('source-actor',${project.id},'admin')`;
+        await store.put('project',project); await store.put('setting',mapping);
+        await sql`INSERT INTO wb_connectors(id,digest,project_ids,capabilities,last_seen) VALUES ('slack-connector',${digest(connectorToken)},${sql.json([project.id])},${sql.json(capabilities)},now())`;
+        await store.put('setting',{id:'slack-provider',kind:'provider',name:'Fake provider',data:{provider:'openai',method:'codex-host',connectorId:'slack-connector',enabled:true,default:true},updatedAt:new Date().toISOString()} as Setting);
+        process.env.WORKBENCH_SLACK_SIGNING_SECRET = secret;
+        app = await createWorkbenchApp({sql});
+        address = await app.listen({host:'127.0.0.1',port:0});
+    });
+    afterAll(async () => {
+        await app?.close(); await sql?.end();
+        if (ownsSchema) await admin`DROP SCHEMA ${admin(schema)} CASCADE`;
+        await admin?.end();
+        if (previousSecret === undefined) delete process.env.WORKBENCH_SLACK_SIGNING_SECRET;
+        else process.env.WORKBENCH_SLACK_SIGNING_SECRET = previousSecret;
+    });
+    const event = (id:string) => ({type:'event_callback',api_app_id:'A123',team_id:'T123',event_id:id,event:{type:'app_mention',channel:'C123',user:'U123',text:'Please clarify this feedback',ts:'1760000000.000001',thread_ts:'1759999999.000001'}});
+    async function send(body:unknown, valid=true) {
+        const raw=JSON.stringify(body), timestamp=String(Math.floor(Date.now()/1000));
+        const signature='v0='+createHmac('sha256',secret).update(`v0:${timestamp}:${raw}`).digest('hex');
+        return fetch(address+'/api/workbench/sources/slack/events',{method:'POST',headers:{'content-type':'application/json','x-slack-request-timestamp':timestamp,'x-slack-signature':valid?signature:'v0=bad'},body:raw});
+    }
+    it('deduplicates signed mentions into one source and one server-origin Master Run', async () => {
+        expect((await send(event('Ev123'))).status).toBe(200);
+        expect((await send(event('Ev123'))).status).toBe(200);
+        const messages=await store.list('message',project.id), runs=await store.list<Run>('run',project.id);
+        expect(messages).toHaveLength(1); expect(runs).toHaveLength(1);
+        expect(runs[0]?.kind).toBe('master');
+        expect(runs[0]?.origin).toEqual({provider:'slack',connectionId:mapping.id,appId:'A123',teamId:'T123',channelId:'C123',threadTs:'1759999999.000001',eventId:'Ev123',sourceId:'slack:Ev123'});
+    });
+    it('rejects invalid signature, event shape, identity and revoked or missing actor without effects', async () => {
+        expect((await send(event('bad-signature'),false)).status).toBe(401);
+        const variants=[{...event('wrong-app'),api_app_id:'A999'}, {...event('wrong-team'),team_id:'T999'}, {...event('wrong-channel'),event:{...event('x').event,channel:'C999'}}, {...event('message'),event:{...event('x').event,type:'message'}}, {...event('bot'),event:{...event('x').event,bot_id:'B123'}}, {...event('subtype'),event:{...event('x').event,subtype:'changed'}}, {...event('bad-ts'),event:{...event('x').event,ts:'123'}}, {...event('missing-user'),event:{...event('x').event,user:undefined}}];
+        for (const value of variants) expect((await send(value)).status).toBe(200);
+        await sql`DELETE FROM wb_memberships WHERE user_id='source-actor'`;
+        expect((await send(event('revoked'))).status).toBe(200);
+        await store.put('project',{...project,feedbackIntake:{...project.feedbackIntake!,actorId:'missing-actor'}});
+        expect((await send(event('missing-actor'))).status).toBe(200);
+        await store.put('project',{...project,feedbackIntake:{...project.feedbackIntake!,enabled:false}});
+        expect((await send(event('disabled-intake'))).status).toBe(200);
+        expect(await store.list('message',project.id)).toHaveLength(1); expect(await store.list('run',project.id)).toHaveLength(1);
+    });
+    it('enforces a global active triple, while allowing disabled mappings', async () => {
+        await expect(store.put('setting',{...mapping,id:'duplicate-mapping'})).rejects.toMatchObject({code:'23505'});
+        await store.put('setting',{...mapping,id:'delivery-mapping',data:{...mapping.data,purpose:'delivery'}});
+        await store.put('project',project);
+        await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ('source-actor',${project.id},'admin')`;
+        const index=(await sql`SELECT indexdef FROM pg_indexes WHERE schemaname=${schema} AND indexname='wb_slack_active_source_identity'`)[0]!.indexdef as string;
+        await sql`DROP INDEX wb_slack_active_source_identity`;
+        await store.put('setting',{...mapping,id:'ambiguous-mapping'});
+        expect((await send(event('ambiguous-mapping'))).status).toBe(200);
+        expect(await store.list('message',project.id)).toHaveLength(1);
+        await sql`DELETE FROM wb_records WHERE id='ambiguous-mapping'`;
+        await sql.unsafe(index);
+        await store.put('setting',{...mapping,id:'disabled-mapping',data:{...mapping.data,enabled:false}});
+        await store.put('setting',{...mapping,data:{...mapping.data,enabled:false}});
+        expect((await send(event('disabled-mapping'))).status).toBe(200);
+        expect(await store.list('message',project.id)).toHaveLength(1);
+    });
+    it('carries origin through dispatch, completion wake and continuation; fences final outbox and failed wake', async () => {
+        await store.put('project',{...project,feedbackIntake:{...project.feedbackIntake!,enabled:false}});
+        const chainProject:Project={...project,id:'slack-chain-project',feedbackIntake:{enabled:true,allowExecution:true,actorId:'source-actor'}};
+        await store.put('project',chainProject);
+        await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ('source-actor',${chainProject.id},'admin')`;
+        await sql`UPDATE wb_connectors SET project_ids=${sql.json([project.id,chainProject.id])},capabilities=${sql.json(capabilities)},last_seen=now() WHERE id='slack-connector'`;
+        await store.put('setting',{...mapping,id:'chain-mapping',projectId:chainProject.id,data:{...mapping.data,channelId:'C456'}});
+        expect((await send({...event('chain-event'),event:{...event('x').event,channel:'C456'}})).status).toBe(200);
+        async function connector(path:string,payload:unknown) {
+            return fetch(address+'/api/workbench/connector'+path,{method:'POST',headers:{'content-type':'application/json',authorization:`Bearer ${connectorToken}`},body:JSON.stringify(payload)});
+        }
+        async function claim(kind:string):Promise<Run> {
+            const response=await connector('/claim',{capabilities:{...capabilities,runKinds:[kind]}});
+            expect(response.status).toBe(200); return (await response.json() as {run:Run}).run;
+        }
+        async function tool(run:Run,action:string,input:unknown,requestId:string) {
+            const response=await connector(`/runs/${run.id}/tools`,{generation:run.generation,action,input,requestId});
+            expect(response.status).toBe(200); return response.json();
+        }
+        async function complete(run:Run,body:Record<string,unknown>={}) {
+            const response=await connector(`/runs/${run.id}/complete`,{generation:run.generation,...body});
+            expect(response.status).toBe(200); return response.json() as Promise<Run>;
+        }
+        const master=await claim('master'); expect(master.projectId).toBe(chainProject.id);
+        const work=await tool(master,'create_work',{title:'Scoped feedback'},'create-work') as {id:string};
+        const implementation=await tool(master,'dispatch',{workId:work.id,prompt:'Inspect feedback',kind:'implementation',model:'gpt-6-luna',reasoning:'medium'},'dispatch') as Run;
+        expect(implementation.origin).toEqual(master.origin); expect(implementation.causedByRunId).toBe(master.id);
+        await tool(master,'post_message',{text:'Commentary persisted in conversation'},'commentary');
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`slack-reply:${chainProject.id}`}`).toHaveLength(0);
+        const finalBody={threadId:'source-thread',canonicalFinal:{threadId:'source-thread',turnId:'source-turn',itemId:'source-final',text:'I will inspect this feedback.'}};
+        await complete(master,finalBody); await complete(master,finalBody);
+        expect((await connector(`/runs/${master.id}/complete`,{generation:master.generation-1,...finalBody})).status).toBe(403);
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`slack-reply:${chainProject.id}`}`).toHaveLength(1);
+        const runningImplementation=await claim('implementation'); expect(runningImplementation.id).toBe(implementation.id);
+        await complete(runningImplementation,{threadId:'implementation-thread'});
+        const wake=await claim('master'); expect(wake.origin).toEqual(master.origin); expect(wake.causedByRunId).toBe(implementation.id);
+        const continuation=await tool(wake,'dispatch',{workId:work.id,prompt:'Continue inspection',kind:'implementation',model:'gpt-6-luna',reasoning:'medium'},'continue') as Run;
+        expect(continuation.origin).toEqual(master.origin); expect(continuation.causedByRunId).toBe(wake.id);
+        await complete(wake,{threadId:'source-thread',canonicalFinal:{threadId:'source-thread',turnId:'wake-turn',itemId:'wake-final',text:'Inspection is continuing.'}});
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`slack-reply:${chainProject.id}`}`).toHaveLength(2);
+        const runningContinuation=await claim('implementation'); expect(runningContinuation.id).toBe(continuation.id);
+        const provider=await store.get<Setting>('setting','slack-provider');
+        await store.put('setting',{...provider!,data:{...provider!.data,enabled:false}});
+        await complete(runningContinuation,{error:'Inspection failed'});
+        const wakes=(await store.list<Run>('run',chainProject.id)).filter(run=>run.causedByRunId===continuation.id);
+        expect(wakes).toHaveLength(1); expect(wakes[0]?.status).toBe('failed'); expect(wakes[0]?.origin).toEqual(master.origin);
+        expect(wakes[0]?.error).toContain('Master wake was not dispatched');
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`slack-reply:${chainProject.id}`}`).toHaveLength(2);
+        await store.put('setting',provider!);
+        expect((await send({...event('clarification-event'),event:{...event('x').event,channel:'C456'}})).status).toBe(200);
+        const clarification=await claim('master');
+        await tool(clarification,'post_message',{text:'Only commentary; no provider final'},'commentary-only');
+        const blocked=await complete(clarification,{threadId:'source-thread'});
+        expect(blocked.slackReply?.state).toBe('blocked'); expect(blocked.slackReply?.cause).toContain('provider final');
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`slack-reply:${chainProject.id}`}`).toHaveLength(2);
+    });
+
+
+    it('revokes Slack-origin authority after admin downgrade while ordinary member Work remains available', async () => {
+        const authProject:Project={...project,id:'slack-auth-project',feedbackIntake:{enabled:true,allowExecution:true,actorId:'source-actor'}};
+        await store.put('project',authProject);
+        await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ('source-actor',${authProject.id},'admin')`;
+        await sql`UPDATE wb_connectors SET project_ids=${sql.json([authProject.id])},capabilities=${sql.json(capabilities)},last_seen=now() WHERE id='slack-connector'`;
+        await store.put('setting',{...mapping,id:'auth-mapping',projectId:authProject.id,data:{...mapping.data,channelId:'C789'}});
+        expect((await send({...event('auth-event'),event:{...event('x').event,channel:'C789'}})).status).toBe(200);
+        const connector=(path:string,payload?:unknown,method='POST')=>fetch(address+'/api/workbench/connector'+path,{method,headers:{'content-type':'application/json',authorization:`Bearer ${connectorToken}`},...(payload===undefined?{}:{body:JSON.stringify(payload)})});
+        const claimed=await connector('/claim',{capabilities:{...capabilities,runKinds:['master']}});
+        expect(claimed.status).toBe(200);
+        const master=(await claimed.json() as {run:Run}).run;
+        expect(master.projectId).toBe(authProject.id);
+        const tool=(action:string,input:unknown,requestId:string)=>connector(`/runs/${master.id}/tools`,{generation:master.generation,action,input,requestId});
+        const created=await tool('create_work',{title:'Created while actor was admin'},'auth-create');
+        expect(created.status).toBe(200); const work=await created.json() as Work;
+        const queuedWorkResponse=await tool('create_work',{title:'Queued before revoke'},'auth-queued-work');
+        expect(queuedWorkResponse.status).toBe(200); const queuedWork=await queuedWorkResponse.json() as Work;
+        const dispatch={prompt:'Bounded source work',kind:'implementation',model:'gpt-6-luna',reasoning:'medium'};
+        const queuedResponse=await tool('dispatch',{...dispatch,workId:queuedWork.id},'auth-before-revoke');
+        expect(queuedResponse.status).toBe(200); const queued=await queuedResponse.json() as Run;
+        expect(queued.origin).toEqual(master.origin);
+        await sql`UPDATE wb_memberships SET role='member' WHERE user_id='source-actor' AND project_id=${authProject.id}`;
+        expect((await tool('dispatch',{...dispatch,workId:work.id},'auth-after-revoke')).status).toBe(403);
+        expect((await store.list<Run>('run',authProject.id)).filter(run=>run.workId===work.id)).toHaveLength(0);
+        expect((await connector(`/runs/${master.id}`,undefined,'GET')).status).toBe(403);
+        expect((await connector(`/runs/${master.id}/renew`,{generation:master.generation})).status).toBe(403);
+        expect((await tool('read_context',{},'auth-read-after-revoke')).status).toBe(403);
+        expect((await connector('/claim',{capabilities:{...capabilities,runKinds:['implementation']}})).status).toBe(204);
+        const revoked=await store.get<Run>('run',queued.id);
+        expect(revoked?.status).toBe('cancelled'); expect(revoked?.generation).toBe(0); expect(revoked?.connectorId).toBeUndefined();
+        expect(revoked?.error).toContain('authorization revoked');
+        const memberSession='synthetic-slack-downgraded-member-session';
+        await sql`INSERT INTO wb_sessions(digest,user_id,expires_at) VALUES (${digest(memberSession)},'source-actor',now()+interval '1 day')`;
+        const memberPost=(path:string,payload:unknown)=>fetch(address+'/api/workbench'+path,{method:'POST',headers:{'content-type':'application/json',cookie:`menoteam_session=${memberSession}`},body:JSON.stringify(payload)});
+        const ordinaryWorkResponse=await memberPost(`/projects/${authProject.id}/works`,{title:'Ordinary member request'});
+        expect(ordinaryWorkResponse.status).toBe(200); const ordinaryWork=await ordinaryWorkResponse.json() as Work;
+        const ordinaryResponse=await memberPost(`/projects/${authProject.id}/messages`,{workId:ordinaryWork.id,text:'Ordinary member task',requestId:'ordinary-member-task'});
+        expect(ordinaryResponse.status).toBe(200); const ordinary=(await ordinaryResponse.json() as {run:Run}).run;
+        expect(ordinary.origin).toBeUndefined(); expect(ordinary.sourceIds).toBeUndefined();
+        const ordinaryClaimResponse=await connector('/claim',{capabilities:{...capabilities,runKinds:['implementation']}});
+        expect(ordinaryClaimResponse.status).toBe(200); const ordinaryClaim=(await ordinaryClaimResponse.json() as {run:Run}).run;
+        expect(ordinaryClaim.id).toBe(ordinary.id);
+        expect((await connector(`/runs/${ordinary.id}`,undefined,'GET')).status).toBe(200);
+        expect((await connector(`/runs/${ordinary.id}/renew`,{generation:ordinaryClaim.generation})).status).toBe(200);
+    });
+    it('keeps a concurrent signed event bound to P1 after its disabled Slack triple moves to P2', async () => {
+        const p1:Project={...project,id:'slack-retry-p1'};
+        const p2:Project={...project,id:'slack-retry-p2'};
+        await store.put('project',p1); await store.put('project',p2);
+        for(const p of [p1,p2])await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ('source-actor',${p.id},'admin')`;
+        await sql`UPDATE wb_connectors SET project_ids=${sql.json([p1.id,p2.id])},capabilities=${sql.json(capabilities)},last_seen=now() WHERE id='slack-connector'`;
+        const firstMapping:Setting={...mapping,id:'retry-p1-mapping',projectId:p1.id,data:{...mapping.data,channelId:'C999'}};
+        await store.put('setting',firstMapping);
+        const signedEvent={...event('stable-event'),event:{...event('x').event,channel:'C999'}};
+        const responses=await Promise.all([send(signedEvent),send(signedEvent)]);
+        expect(responses.map(response=>response.status)).toEqual([200,200]);
+        const originalRuns=await store.list<Run>('run',p1.id);
+        expect(await store.list('message',p1.id)).toHaveLength(1); expect(originalRuns).toHaveLength(1);
+        expect(originalRuns[0]?.origin).toMatchObject({connectionId:firstMapping.id,eventId:'stable-event',sourceId:'slack:stable-event'});
+        await store.put('setting',{...firstMapping,data:{...firstMapping.data,enabled:false}});
+        await store.put('setting',{...firstMapping,id:'retry-p2-mapping',projectId:p2.id});
+        expect((await send(signedEvent)).status).toBe(200);
+        expect(await store.list('message',p1.id)).toHaveLength(1);
+        expect((await store.list<Run>('run',p1.id)).map(run=>run.id)).toEqual(originalRuns.map(run=>run.id));
+        expect(await store.list('message',p2.id)).toHaveLength(0); expect(await store.list('run',p2.id)).toHaveLength(0);
+        expect(await sql`SELECT request_id FROM wb_requests WHERE scope=${`source:${p2.id}`} AND request_id='slack:stable-event'`).toHaveLength(0);
+        // Older accepted events have authoritative Run.origin but no global receipt.
+        // Their first retry must recover the original binding before consulting P2.
+        await sql`DELETE FROM wb_requests WHERE scope='slack-source:A123:T123' AND request_id='stable-event'`;
+        expect((await send(signedEvent)).status).toBe(200);
+        expect(await store.list('message',p1.id)).toHaveLength(1);
+        expect((await store.list<Run>('run',p1.id)).map(run=>run.id)).toEqual(originalRuns.map(run=>run.id));
+        expect(await store.list('message',p2.id)).toHaveLength(0); expect(await store.list('run',p2.id)).toHaveLength(0);
+        const recovered=await sql`SELECT result FROM wb_requests WHERE scope='slack-source:A123:T123' AND request_id='stable-event'`;
+        expect(recovered).toHaveLength(1); expect(recovered[0]?.result).toMatchObject({projectId:p1.id,origin:originalRuns[0]!.origin});
+    });
+
+});
+
+describe.skipIf(!url)('Slack durable reply PostgreSQL',()=>{
+    let sql:ReturnType<typeof postgres>,admin:ReturnType<typeof postgres>,store:WorkbenchStore,schema:string;
+    let run:Run;
+    let ownsSchema=false;
+    beforeAll(async()=>{
+        const location=new URL(url!);
+        if(!['127.0.0.1','localhost'].includes(location.hostname)||!location.pathname.endsWith('_test'))throw new Error('Slack tests require loopback *_test database');
+        schema=`slack_reply_${randomUUID().replaceAll('-','')}`;admin=postgres(url!,{max:1});await admin`CREATE SCHEMA ${admin(schema)}`;ownsSchema=true;
+        location.searchParams.set('search_path',schema);await migrate(location.toString());sql=postgres(location.toString(),{max:4});store=new WorkbenchStore(sql);
+    });
+    afterAll(async()=>{await sql?.end();if(ownsSchema)await admin`DROP SCHEMA ${admin(schema)} CASCADE`;await admin?.end();});
+    beforeEach(async()=>{
+        await sql`TRUNCATE wb_records,wb_requests,wb_users CASCADE`;
+        await sql`INSERT INTO wb_users(id,email,name,password_hash,role) VALUES ('actor','slack@test.example','Actor','unused','owner')`;
+        await store.put('project',{id:'project',name:'Slack',instructions:'',repositoryUrl:'',deliveryAuthorization:'',createdAt:new Date().toISOString(),feedbackIntake:{enabled:true,allowExecution:true,actorId:'actor'}} satisfies Project);
+        await store.put('setting',{id:'slack',kind:'connection',projectId:'project',name:'Slack',updatedAt:new Date().toISOString(),data:{provider:'slack',enabled:true,appId:'A123',teamId:'T123',channelId:'C123'}} satisfies Setting);
+        run={id:'run',projectId:'project',kind:'master',prompt:'source',requestedBy:'actor',sourceIds:['slack:event'],origin:{provider:'slack',connectionId:'slack',appId:'A123',teamId:'T123',channelId:'C123',threadTs:'1234567890.123456',eventId:'event',sourceId:'slack:event'},model:'gpt-6.1-sol',reasoning:'medium',status:'completed',generation:1,threadId:'thread',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};
+        await store.put('run',run);await sql`INSERT INTO wb_requests(scope,request_id,result) VALUES ('source:project','slack:event','{}'::jsonb)`;
+        await store.transaction('enqueue',tx=>enqueueSlackReply(tx,run,{threadId:'thread',turnId:'turn',itemId:'item',text:'Canonical final'}));
+    });
+    const state=async()=>String((await sql`SELECT result->>'state' AS state FROM wb_requests WHERE scope='slack-reply:project'`)[0]?.state);
+    it('serializes two workers before HTTP and freezes immutable body on completion replay',async()=>{
+        await store.transaction('replay',tx=>enqueueSlackReply(tx,run,{threadId:'thread',turnId:'turn',itemId:'different',text:'Replacement'}));
+        let calls=0;
+        const transport:SlackTransport=async request=>{calls++;expect(request).toMatchObject({channel:'C123',thread_ts:run.origin!.threadTs,text:'Canonical final'});expect(await state()).toBe('ambiguous');return {status:200,body:{ok:true,channel:'C123',ts:'1234567891.123456'}};};
+        await Promise.all([processSlackReplies(store,{token:'fake',transport}),processSlackReplies(store,{token:'fake',transport})]);
+        expect(calls).toBe(1);expect(await state()).toBe('sent');
+    });
+    it('retains lost ACK across worker restart with no retry',async()=>{
+        let calls=0;const transport:SlackTransport=async()=>{calls++;throw new Error('lost ack');};
+        await processSlackReplies(store,{token:'fake',transport});
+        await processSlackReplies(new WorkbenchStore(sql),{token:'fake',transport});
+        expect(calls).toBe(1);expect(await state()).toBe('ambiguous');
+    });
+    it.each([{status:503,body:{ok:false}},{status:200,body:{ok:true,channel:'WRONG',ts:'1234567891.123456'}},{status:200,body:'invalid'}])('keeps uncertain acknowledgment ambiguous: %j',async response=>{
+        await processSlackReplies(store,{token:'fake',transport:async()=>response});expect(await state()).toBe('ambiguous');
+    });
+    it('records definite rejection without replay',async()=>{
+        await processSlackReplies(store,{token:'fake',transport:async()=>({status:200,body:{ok:false,error:'not_in_channel'}})});expect(await state()).toBe('failed');
+    });
+    it.each(['mapping','actor','generation','membership','source'])('rechecks revoked %s before any HTTP',async revoked=>{
+        if(revoked==='mapping')await sql`UPDATE wb_records SET data=jsonb_set(data,'{data,enabled}','false') WHERE id='slack'`;
+        if(revoked==='actor')await sql`DELETE FROM wb_users WHERE id='actor'`;
+        if(revoked==='membership'){
+            await sql`UPDATE wb_users SET role='member' WHERE id='actor'`;
+            await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ('actor','project','admin')`;
+            await sql`UPDATE wb_memberships SET role='member' WHERE user_id='actor' AND project_id='project'`;
+        }
+        if(revoked==='source')await sql`DELETE FROM wb_requests WHERE scope='source:project' AND request_id='slack:event'`;
+        if(revoked==='generation'){run.generation++;await store.put('run',run);}
+        let calls=0;await processSlackReplies(store,{token:'fake',transport:async()=>{calls++;return {status:200,body:{ok:true}};}});expect(calls).toBe(0);expect(await state()).toBe('blocked');
+    });
 });

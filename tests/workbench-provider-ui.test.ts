@@ -65,6 +65,22 @@ beforeEach(() => {
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
 });
 
+it('shows the blocked Slack reply cause for a completed Master turn without exposing another conversation', async () => {
+  const current = snapshot();
+  const cause = 'Native turn completed without a reliable synchronous provider final';
+  const completed = { id: 'slack-master', projectId: project.id, kind: 'master' as const, prompt: '', model: 'gpt-6.1-sol', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', slackReply: { state: 'blocked' as const, cause } };
+  current.runs = [completed, {...completed, id: 'other-project', projectId: 'other-project', slackReply: {state: 'blocked', cause: 'Private other project cause'}}, {...completed, id: 'other-work', workId: 'other-work', slackReply: {state: 'blocked', cause: 'Private other work cause'}}];
+  window.history.replaceState(null, '', '/workbench/?view=master&project=project');
+  await mount(current);
+
+  const notice = [...host.querySelectorAll('[role="status"]')].find(element => element.textContent?.includes('Slack reply blocked'));
+  expect(notice?.textContent).toContain(`Slack reply blocked · ${cause}`);
+  expect(notice?.querySelector('strong')?.textContent).toBe('completed');
+  expect(notice?.querySelector('button')).toBeNull();
+  expect(host.textContent).not.toContain('Private other project cause');
+  expect(host.textContent).not.toContain('Private other work cause');
+});
+
 it('shows a saved Agent profile name in the Work composer without exposing its setting ID', async () => {
   const profileId = 'setting_263d-profile';
   const work = { id: 'work', projectId: project.id, title: 'Current Work', overview: '', status: 'in_progress' as const, revision: 1, profileId, connectionId: 'provider-1', sources: [], createdAt: '', updatedAt: '' };

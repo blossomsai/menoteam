@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { verifyExecutionSkills, verifyBundle, type SkillBundle } from '../workbench/skill-bundle.js';
 import type { Artifact, Run, RunRecoveryState } from '../workbench/types.js';
 import { qaResource } from '../workbench/local-qa.js';
-import type { ClaimedRun, ConnectorEvent, ConnectorConfig, UploadArtifact } from './types.js';
+import type { ClaimedRun, ConnectorEvent, ConnectorConfig, UploadArtifact, RunCompletion } from './types.js';
 import { z } from 'zod';
 
 export class ConnectorHttpError extends Error {
@@ -120,7 +120,7 @@ export class WorkbenchConnectorClient {
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/bridge-token`, { method: 'POST', body: { generation } });
   }
 
-  complete(runId: string, generation: number, details: { threadId?: string; error?: string }): Promise<Run> {
+  complete(runId: string, generation: number, details: RunCompletion): Promise<Run> {
     return this.request(`/api/workbench/connector/runs/${encodeURIComponent(runId)}/complete`, {
       method: 'POST', body: { generation, ...details },
     });
