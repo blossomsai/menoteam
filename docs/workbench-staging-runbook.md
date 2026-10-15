@@ -2,9 +2,15 @@
 
 This runbook describes an additive, isolated staging deployment beside V1. It
 does not itself authorize a server change, a V1 change, or a user-facing cutover.
-The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-15).
-The target is already provisioned as described there. This document records
+The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-16).
+This document records
 future operator instructions; this documentation update executed no operation.
+
+## Current prepared deployment state (2026-10-16)
+
+Owner reports prepared deployment A remains b4db, from successful main workflow 38741896205 attempt 1, image `ghcr.io/blossomsai/menoteam-work-map@sha256:c08455dda297edeb53dfa2a0241e48b161c53b648fa524c8bcbb3511733ab80b` and includes the UI rate fix. Earlier `4c022` and `c647` image digests are historical. Workflow success does not prove OCI provenance, registry pull, or deployment. GitHub `read:packages` scope was approved, but correct Chrome GitHub login and actual credential authorization are still incomplete; do not treat general delivery authority as registry access. Opaque registry tokens are valid protocol and need not be JWTs. Client credential cleanup does not revoke server-side credentials.
+
+Owner reports the isolated stage at `217.160.151.9` currently has only its isolated DB installed/healthy and the reviewed auth-aware fixed helper upgraded. No App container, Caddy route, HTTPS stage validation, Slack callback change, or live roundtrip is established. V1 container IDs and health are unchanged at the last verified preflight observation. Preserve physical volume `menoteam-workbench-stage_stage_pgdata` (Compose key `stage_pgdata`); do not reprovision blindly. Backup plus isolated restore is complete, so no additional export is required. The prepared image still needs provenance validation and an authorized registry pull before deployment; this documentation task grants no execution authority.
 
 ## Completed backup prerequisite — verified 2026-10-14
 
@@ -109,7 +115,7 @@ build. Record the digest and matching source revision in the deployment record.
    configuration, capabilities, network, physical volume and DB health. Do not
    require `:3200` to be unused, expect staging resources to be absent, or rerun
    initial-create/bootstrap steps. The App is not yet started.
-2. After registry-read authorization, validate OCI provenance for the approved
+2. After correct GitHub registry authentication is available, validate OCI provenance for the approved
    immutable digest. Main workflow success by itself is not provenance validation.
    Pull the approved candidate by exact digest. Review the dedicated Compose
    file and render its configuration with secrets redacted. Confirm its
