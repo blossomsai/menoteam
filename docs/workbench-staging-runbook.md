@@ -6,12 +6,6 @@ The sole current status is in the [acceptance ledger authority](full-app-accepta
 This document records
 future operator instructions; this documentation update executed no operation.
 
-## Current prepared deployment state (2026-10-16)
-
-Owner reports prepared deployment A remains b4db, from successful main workflow 38741896205 attempt 1, image `ghcr.io/blossomsai/menoteam-work-map@sha256:c08455dda297edeb53dfa2a0241e48b161c53b648fa524c8bcbb3511733ab80b` and includes the UI rate fix. Earlier `4c022` and `c647` image digests are historical. Workflow success does not prove OCI provenance, registry pull, or deployment. GitHub `read:packages` scope was approved, but correct Chrome GitHub login and actual credential authorization are still incomplete; do not treat general delivery authority as registry access. Opaque registry tokens are valid protocol and need not be JWTs. Client credential cleanup does not revoke server-side credentials.
-
-Owner reports the isolated stage at `217.160.151.9` currently has only its isolated DB installed/healthy and the reviewed auth-aware fixed helper upgraded. No App container, Caddy route, HTTPS stage validation, Slack callback change, or live roundtrip is established. V1 container IDs and health are unchanged at the last verified preflight observation. Preserve physical volume `menoteam-workbench-stage_stage_pgdata` (Compose key `stage_pgdata`); do not reprovision blindly. Backup plus isolated restore is complete, so no additional export is required. The prepared image still needs provenance validation and an authorized registry pull before deployment; this documentation task grants no execution authority.
-
 ## Completed backup prerequisite — verified 2026-10-14
 
 The user granted specific production-data encrypted off-host backup and isolated
