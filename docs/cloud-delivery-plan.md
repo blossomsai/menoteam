@@ -38,16 +38,20 @@ schema inspection: [2026-10-14 preflight](../.local/acceptance/a15-remote-prefli
 
 Local source and runtime have advanced beyond the historical `003`–`005`
 checkpoint. The local committed source includes migrations `006` and `007`; the
-local full-app gate for source **`5251ca9b4abda4aaea04fd2512467ca3b93f79a4`**
+historical local full-app gate for source **`5251ca9b4abda4aaea04fd2512467ca3b93f79a4`**
 passed **758/758 tests and 59/59 PostgreSQL tests**, with no skips. Its matched
-local rollout is recorded in the [acceptance ledger](full-app-acceptance-ledger.md#latest-evidence-index--2026-10-14-combined-source-and-same-run-recovery).
+local rollout is recorded in the [acceptance ledger](full-app-acceptance-ledger.md).
 Migration `007_workbench_latest_diff.sql` was applied to the local runtime
 database, and its partial latest-diff index was observed valid and ready. The
 supporting local receipts are [rollout](../.local/acceptance/combined-5251ca9-20261014/rollout-safe.json),
 [migration 007](../.local/acceptance/combined-5251ca9-20261014/migration007-runtime-safe.json),
 and [fixed gate](../.local/acceptance/combined-5251ca9-20261014/summary-safe.json).
-Later native candidates have separately bound QA/review evidence in the ledger;
-the 758/59 gate above is not a claim about the latest candidate. This local
+The latest local matched runtime source85ce has the same tracked tree as
+reviewed native8e; both separately passed783/783 plus60/60 PostgreSQL, zero
+skips, typechecks/builds exit0. Native typed approval and bounded real UI
+Pause/End/reload proof are linked in the ledger. Subsequent documentation-only
+commits are not another runtime or gate. The historical758/59 result above is
+not a claim about the latest candidate. This local
 evidence does not show migrations `006` or `007` applied remotely.
 
 The repository baseline should be selected by an explicit committed revision
@@ -56,12 +60,32 @@ use uncommitted checkout state as an implicit execution baseline or assume that
 an isolated worktree contains uncommitted files. The earlier dirty-checkout
 warning was a historical checkpoint, not a claim about the current checkout.
 
-No V3 cloud deployment, remote schema change, production database export,
-backup/isolated restore, authenticated staging user-flow or route/image rollback
-has been proven. The 2026-10-14 preflight retained the existing export
-restriction; production export remains unauthorized and was not attempted.
+No V3 cloud deployment, remote schema change, authenticated staging user-flow
+or route/image rollback has been proven. The earlier read-only preflight retained
+the historical export restriction. Later on2026-10-14 the user gave specific
+private-data export/destination/isolated-restore authorization: one encrypted
+production backup and authenticated tmpfs-only PostgreSQL16.15 restore passed,
+with matching migration/schema/count observations and unchanged V1 inventory.
+Ciphertext and separate recipient key are retained outside Git; restore resources
+were removed. This completes the backup prerequisite only; do not repeat the
+backup automatically or infer a remote deployment from it. Actual safe evidence
+is linked in the [acceptance ledger](full-app-acceptance-ledger.md).
 These facts do not relax the identity, isolation, backup/restore, V1
 compatibility, staging, acceptance or rollback gates below.
+
+Local preparation now includes an exact8e synthetic staging-Compose image smoke:
+dummy rendering, isolated app/DB health, Workbench/login/owner routes and real
+migration001–007 passed without published ports or V1 resources. All owned
+containers/network/volume/image tag were removed; existing container identities
+remained unchanged. The local image has no OCI revision label or release
+attestation, and no version endpoint was checked. This is not production restore,
+remote HTTPS staging, cloud persistence or rollback proof. See the
+[smoke receipt](../.local/acceptance/staging-compose-local-8e4409-20261014/smoke-safe.json).
+Normal product [draft PR7](https://github.com/blossomsai/menoteam/pull/7) has exact8e
+head and successful push/PR CI; it remains unmerged. Project merge policy remains
+false. Registry publication from an actual authorized main merge and every remote
+gate below are still pending; do not deploy this local smoke tag as a release.
+
 
 ## Delivery sequence
 
@@ -85,10 +109,13 @@ compatibility, staging, acceptance or rollback gates below.
    leases. Keep V1 tables and API behavior intact during the transition. Do not
    assume that V1's graph, ownership, or revision records can be mechanically
    translated into V3 Works; define and validate any import mapping separately.
-4. **Stage additively.** Build the image and test against an isolated database
-   with production-shaped but non-sensitive fixtures. Reuse the existing
-   PostgreSQL server for a separate staging database, and add one staging app
-   bound only to loopback port 3200 after measuring resource headroom. The host
+4. **Stage additively.** After the production backup/export authorization and
+   isolated restore proof required by the [staging runbook](workbench-staging-runbook.md),
+   test an immutable candidate image against a dedicated staging PostgreSQL
+   service with its own Compose project, volume, staging-only credentials and
+   non-sensitive fixtures. Do not reuse the V1 PostgreSQL service, network or
+   credentials, even under a separate database name. Add one staging app bound
+   only to loopback port3200 after measuring resource headroom. The host
    has 1 vCPU and currently runs three services; do not launch competing build,
    browser, or agent workloads there. Add
    `workbench.217-160-151-9.sslip.io` as a separate Caddy site when the staging

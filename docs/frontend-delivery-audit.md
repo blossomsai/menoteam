@@ -1,6 +1,10 @@
 # Workbench frontend delivery audit
 
-Date: 2026-10-06
+Original audit: 2026-10-06 (historical observations below).
+
+Current evidence, 2026-10-14: the provider connection list/Add/default and pinned catalog skill import are implemented and have bounded real UI/API/native proof. Saved profile selection affected actual native execution; matched85ce ordinary paused-run End/reload was verified. Desktop/mobile route and scoped QA/Changes observations are recorded in the [acceptance ledger](full-app-acceptance-ledger.md), which supersedes the old pending statements below. Only the supported Codex-host adapter and skill components are established; arbitrary vendor authentication, unsupported apps/MCP/hooks, fresh-account browser onboarding and cloud delivery are not claimed. Local source85ce and documentation updates are distinct.
+
+## Historical 2026-10-06 audit
 
 The `/workbench/` React app is a real-data shell over the authenticated Workbench API. It does not include gallery/example content or synthesize success evidence. It uses React, Tailwind CSS v4, and the repository's shadcn/ui components; the stylesheet contains Tailwind theme tokens and imports only, with no authored component selectors.
 

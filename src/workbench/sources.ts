@@ -6,7 +6,7 @@ import { z } from "zod";
 import { WorkbenchStore } from "./store.js";
 import { collectSkillBundle, skillMarkdown, bytesHash, gitBlobHash, SKILL_BOUNDS } from "./skill-bundle.js";
 import type { SkillTreeEntry } from "./skill-bundle-types.js";
-import type { Project, Message, Setting } from "./types.js";
+import type { Project, Message, Setting, RunOrigin } from "./types.js";
 import { verifySlackRequest } from "../gateway/slack-events.js";
 interface SourceOptions {
     githubToken?: string;
@@ -14,7 +14,8 @@ interface SourceOptions {
     slackSigningSecret?: string;
     authorize(req: FastifyRequest, projectId?: string, edit?:boolean): Promise<void>;
     fetcher?: typeof fetch;
-    onIntake?(projectId:string,sourceId:string,tx:Sql):Promise<void>;
+    authorizeIntake?(projectId:string,actorId:string,tx:Sql):Promise<boolean>;
+    onIntake?(projectId:string,sourceId:string,tx:Sql,origin?:RunOrigin):Promise<void>;
 }
 function fail(statusCode: number, message: string): never {
     throw Object.assign(new Error(message), {
@@ -308,8 +309,8 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
             return { installed };
         });
     });
-    async function ingest(projectId: string, sourceId: string, speaker: string, body: string, url: string, reauthorize?: () => Promise<void>) {
-        return store.transaction("source", async (tx) => {
+    async function ingest(projectId: string, sourceId: string, speaker: string, body: string, url: string, reauthorize?: () => Promise<void>, transaction?:Sql, origin?:RunOrigin) {
+        const persist = async (tx:Sql) => {
             await reauthorize?.();
             const scope = `source:${projectId}`;
             const existing = await tx `SELECT result FROM wb_requests WHERE scope=${scope} AND request_id=${sourceId}`;
@@ -325,9 +326,10 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
             };
             await store.put("message", message, tx);
             await tx `INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${sourceId},${tx.json(message as never)})`;
-            await options.onIntake?.(projectId,sourceId,tx);
+            await options.onIntake?.(projectId,sourceId,tx,origin);
             return message;
-        });
+        };
+        return transaction ? persist(transaction) : store.transaction("source", persist);
     }
     app.post("/api/workbench/projects/:id/sources/github", async (req) => {
         const pid = (req.params as {
@@ -400,40 +402,57 @@ export async function registerSourceRoutes(app: FastifyInstance, store: Workbenc
             const raw = req.body as Buffer;
             if (!Buffer.isBuffer(raw) || !verifySlackRequest(raw, req.headers, options.slackSigningSecret!, Date.now()))
                 fail(401, "Invalid Slack signature");
-            const payload = JSON.parse(raw.toString()) as {
-                type?: string;
-                challenge?: string;
-                event_id?: string;
-                team_id?: string;
-                event?: {
-                    type?: string;
-                    subtype?: string;
-                    bot_id?: string;
-                    channel?: string;
-                    user?: string;
-                    text?: string;
-                    ts?: string;
-                };
-            };
-            if (payload.type === "url_verification")
-                return {
-                    challenge: payload.challenge
-                };
-            const event = payload.event;
-            if (payload.type !== "event_callback" || !payload.event_id || !event?.channel || !event.text || event.bot_id || event.subtype)
-                return {
-                    ok: true
-                };
-            const settings = await store.list<Setting>("setting");
-            const connections = settings.filter(s => s.kind === "connection" && s.projectId && s.data.provider === "slack" && s.data.enabled !== false);
-            for (const c of connections) {
-                const connectionUrl = String(c.data.url);
-                const url = new URL(connectionUrl);
-                const path = url.pathname.split("/").filter(Boolean);
-                if (url.hostname !== "app.slack.com" || path[0] !== "client" || path[1] !== payload.team_id || path[2] !== event.channel)
-                    continue;
-                await ingest(c.projectId!, `slack:${payload.event_id}`, `Slack source · ${event.user ?? "unknown"}`, event.text, `https://app.slack.com/client/${payload.team_id}/${event.channel}/thread/${event.ts ?? ""}`);
-            }
+            let payload: unknown;
+            try { payload = JSON.parse(raw.toString()); } catch { fail(400, "Invalid Slack JSON"); }
+            const envelope = z.object({ type:z.literal('url_verification'), challenge:z.string().min(1).max(4000) }).safeParse(payload);
+            if (envelope.success) return { challenge:envelope.data.challenge };
+            const identifier = (prefix:string) => z.string().regex(new RegExp(`^[${prefix}][A-Z0-9]{1,100}$`, 'u'));
+            const timestamp = z.string().regex(/^[0-9]{10}\.[0-9]{6}$/u);
+            const parsed = z.object({
+                type:z.literal('event_callback'), api_app_id:identifier('A'), team_id:identifier('T'),
+                event_id:z.string().min(1).max(200),
+                event:z.object({ type:z.literal('app_mention'), channel:identifier('C'), user:identifier('UW'),
+                    text:z.string().trim().min(1).max(16000), ts:timestamp, thread_ts:timestamp.optional(),
+                    bot_id:z.never().optional(), subtype:z.never().optional() })
+            }).safeParse(payload);
+            if (!parsed.success) return { ok:true };
+            const { api_app_id:appId, team_id:teamId, event_id:eventId, event } = parsed.data;
+            // Resolve and authorize inside the same serialized transaction as dedupe and Run creation.
+            await store.transaction('source', async tx => {
+                const receiptScope = `slack-source:${appId}:${teamId}`;
+                const accepted = await tx`SELECT result FROM wb_requests WHERE scope=${receiptScope} AND request_id=${eventId}`;
+                if (accepted[0]) return;
+                // Old accepted events may predate the global receipt. Only server-owned Run origin
+                // can identify their original route; never resolve a historical event using today's mapping.
+                const historical = await tx`SELECT DISTINCT project_id, data->'origin' AS origin FROM wb_records
+                    WHERE kind='run' AND data->'origin'->>'provider'='slack'
+                    AND data->'origin'->>'appId'=${appId} AND data->'origin'->>'teamId'=${teamId}
+                    AND data->'origin'->>'eventId'=${eventId} LIMIT 2`;
+                if (historical.length) {
+                    if (historical.length === 1) await tx`INSERT INTO wb_requests(scope,request_id,result)
+                        VALUES (${receiptScope},${eventId},${tx.json({projectId:historical[0]!.project_id,origin:historical[0]!.origin} as never)})`;
+                    return;
+                }
+                const sourceId = `slack:${eventId}`;
+                const legacy = await tx`SELECT 1 FROM wb_requests WHERE scope LIKE 'source:%' AND request_id=${sourceId} LIMIT 1`;
+                if (legacy[0]) return; // A legacy receipt without authoritative origin fails closed.
+                const settings = await store.list<Setting>('setting', undefined, tx);
+                const connections = settings.filter(c => c.kind === 'connection' && c.projectId &&
+                    c.data.provider === 'slack' && c.data.enabled !== false && (c.data.purpose === undefined || c.data.purpose === 'source') &&
+                    c.data.appId === appId && c.data.teamId === teamId && c.data.channelId === event.channel);
+                if (connections.length !== 1) return;
+                const connection = connections[0]!;
+                const projectId = connection.projectId!;
+                const project = await store.get<Project>('project', projectId, tx);
+                const policy = project?.feedbackIntake;
+                if (!policy?.enabled || !policy.actorId || !await options.authorizeIntake?.(projectId, policy.actorId, tx)) return;
+                const threadTs = event.thread_ts ?? event.ts;
+                const origin:RunOrigin = { provider:'slack', connectionId:connection.id, appId, teamId,
+                    channelId:event.channel, threadTs, eventId, sourceId };
+                await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${receiptScope},${eventId},${tx.json({projectId,origin} as never)})`;
+                await ingest(projectId, sourceId, `Slack source · ${event.user}`, event.text,
+                    `https://app.slack.com/client/${teamId}/${event.channel}/thread/${threadTs}`, undefined, tx, origin);
+            });
             return reply.send({
                 ok: true
             });

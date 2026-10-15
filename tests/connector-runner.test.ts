@@ -339,6 +339,7 @@ describe('Integrated connector lifecycle',()=>{
   });
   it('retries durable IDs across real socket loss without executing the native turn twice',async()=>{
     const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-transport-'));
+    const canonicalFinal={threadId:'persistent-thread',turnId:'successful-turn',itemId:'provider-final',text:'Persist this once'};
     let claimed=false;let completed=false;let lostEvent=false;let executions=0;const ids=new Set<string>();let runner:ConnectorRunner;
     const server=createServer(async(req,res)=>{
       const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
@@ -347,7 +348,13 @@ describe('Integrated connector lifecycle',()=>{
       if(req.url?.endsWith('/claim')){if(!claimed){claimed=true;send(claim());}else{res.statusCode=204;res.end();}return;}
       if(req.url?.endsWith('/bridge-token')){send({token:'scoped-token-long-enough-for-validation-123',expiresAt:'later'});return;}
       if(req.url?.endsWith('/events')){for(const event of body.events)ids.add(event.id);if(!lostEvent){lostEvent=true;res.destroy();}else send({accepted:true});return;}
-      if(req.url?.endsWith('/complete')){completed=true;res.destroy();return;}
+      if(req.url?.endsWith('/complete')){
+        expect(body).toEqual({generation:1,threadId:'persistent-thread',canonicalFinal});
+        const files=await readdir(path.join(dataDir,'spool'));
+        expect(files).toHaveLength(1);
+        expect(JSON.parse(await readFile(path.join(dataDir,'spool',files[0]!),'utf8')).completion).toEqual({threadId:'persistent-thread',canonicalFinal});
+        completed=true;res.destroy();return;
+      }
       if(req.method==='POST'&&req.url?.endsWith('/recovery-state')){
         expect(body).toEqual({generation:claim().run.generation});
         send({id:claim().run.id,generation:claim().run.generation,status:completed?'completed':'running',preEffectStaging:false,stagingRetired:false,merged:false});
@@ -359,7 +366,7 @@ describe('Integrated connector lifecycle',()=>{
     await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
     const address=server.address() as {port:number};
     const cfg:ConnectorConfig={serverUrl:`http://127.0.0.1:${address.port}`,token:'fixture-only',connectorId:'one',dataDir,projects:{},pollIntervalMs:5};
-    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{},run:async(_c:unknown,_cwd:string,_prompt:string,thread:string,onEvent:Function)=>{executions++;onEvent({type:'agent_message',text:'Persist this once',threadId:thread});return{threadId:thread,text:'Persist this once',checks:[]};}} as unknown as CodexAppServer;
+    const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{},run:async(_c:unknown,_cwd:string,_prompt:string,thread:string,onEvent:Function)=>{executions++;onEvent({type:'agent_message',text:'Persist this once',threadId:thread});return{threadId:thread,text:'Persist this once',checks:[],canonicalFinal};}} as unknown as CodexAppServer;
     runner=new ConnectorRunner(cfg,{native:()=>native,client:models=>new HttpClient(cfg,fetch,models)});
     try{await runner.run();expect(executions).toBe(1);expect(ids.size).toBe(1);expect(lostEvent).toBe(true);expect(completed).toBe(true);expect(await readdir(path.join(dataDir,'spool'))).toEqual([]);}
     finally{await runner.stop();await new Promise<void>(resolve=>server.close(()=>resolve()));await rm(dataDir,{recursive:true,force:true});}

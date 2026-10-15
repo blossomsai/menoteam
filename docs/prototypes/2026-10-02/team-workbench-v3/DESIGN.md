@@ -30,4 +30,4 @@ Instructions is a free-text document with edit/save/cancel and optional insertab
 
 ## Truthfulness
 
-Keep current product decisions separate from prototype capabilities. Do not describe sample interactions as real installs, model login, permissions enforcement, automatic source matching, or execution. The user has authorized design work, not implementation of these services.
+Keep current product decisions separate from prototype capabilities. Do not describe sample interactions as real installs, model login, permissions enforcement, automatic source matching, or execution.

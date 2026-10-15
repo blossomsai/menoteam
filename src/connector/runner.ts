@@ -18,7 +18,7 @@ import { savedQaPolicy,sameQaPolicy } from '../workbench/local-qa.js';
 import { mergePullRequest } from './github-merge-pr.js';
 import { runStagingOperation, stopStagingProcess, verifyStagingImage, type StagingReceipt, type StagingRequest } from './staging-deploy.js';
 import { discoverStagingBuild, StagingBuildDiscoveryError, verifyFrozenStagingBuild, type StagingBuildReceipt } from './staging-build.js';
-import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact } from './types.js';
+import type { ClaimedRun, ConnectorConfig, ConnectorEvent, UploadArtifact, RunCompletion } from './types.js';
 
 const activeDeliveryExecutors=new Set<string>();
 interface Spool {
@@ -34,7 +34,7 @@ interface Spool {
   stagingTransportStarted?:boolean;
   stagingTransportStopped?:boolean;
   threadId?: string;
-  completion?: {threadId?:string;error?:string};
+  completion?: RunCompletion;
   stopped?: boolean;
   gitStopUnconfirmed?: boolean;
   gitProcesses?: Record<string,GitProcessIdentity|null>;
@@ -512,7 +512,7 @@ export class ConnectorRunner {
         if(reviewModified) throw new Error('Review modified immutable candidate');
       }
       runAbort.signal.throwIfAborted();
-      spool.completion={threadId:result.threadId}; await this.save(spool); if(claim.run.kind==='implementation')await this.flushEvidence(spool,runAbort.signal);else await this.flush(spool);
+      spool.completion={threadId:result.threadId,...(result.canonicalFinal?{canonicalFinal:result.canonicalFinal}:{})}; await this.save(spool); if(claim.run.kind==='implementation')await this.flushEvidence(spool,runAbort.signal);else await this.flush(spool);
     } catch (error) {
       try{await stopRunProcesses();}catch(stopError){if((stopError as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);}throw stopError;}
       if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);throw error;}

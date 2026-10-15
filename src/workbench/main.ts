@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { resolve, relative } from "node:path";
 import { migrate } from "../db/migrate.js";
 import { createWorkbenchApp } from "./app.js";
+import { processSlackReplies } from './slack-replies.js';
+import { WorkbenchStore } from './store.js';
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl)
     throw new Error("DATABASE_URL required");
@@ -35,6 +37,15 @@ const app = await createWorkbenchApp({
         });
     }
 });
+const slackToken=process.env.WORKBENCH_SLACK_BOT_TOKEN;
+let slackBusy=false;
+const slackTimer=slackToken?setInterval(()=>{
+    if(slackBusy)return;
+    slackBusy=true;
+    void processSlackReplies(new WorkbenchStore(sql),{token:slackToken}).catch(()=>{app.log.error('Slack reply worker failed');}).finally(()=>{slackBusy=false;});
+},1000):undefined;
+slackTimer?.unref();
+app.addHook('onClose',async()=>{if(slackTimer)clearInterval(slackTimer);});
 await app.listen({
     host: process.env.HOST ?? "127.0.0.1",
     port: Number(process.env.PORT ?? 3200)

@@ -38,6 +38,17 @@ export interface Message {
     runId?: string;
     createdAt: string;
 }
+export interface RunOrigin {
+    provider: 'slack';
+    connectionId: string;
+    appId: string;
+    teamId: string;
+    channelId: string;
+    threadTs: string;
+    eventId: string;
+    sourceId: string;
+}
+export interface CanonicalFinal { threadId: string; turnId: string; itemId: string; text: string }
 export interface Run {
     id: string;
     projectId: string;
@@ -46,6 +57,8 @@ export interface Run {
     requestedBy?: string;
     allowedActions?: string[];
     sourceIds?: string[];
+    origin?: RunOrigin;
+    slackReply?: { state: 'blocked'; cause: string };
     execution?: ExecutionContext;
     handoffFromRunId?: string;
     handoffRequestedBy?: string;

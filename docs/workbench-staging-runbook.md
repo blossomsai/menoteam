@@ -5,6 +5,24 @@ does not authorize a production-data export, a server change, a V1 change, or a
 user-facing cutover. Do not execute a remote mutation until the required
 authorization checks below are satisfied.
 
+## Current backup prerequisite — verified 2026-10-14
+
+The user granted specific production-data encrypted off-host backup and isolated
+restore authorization. One authorized operation completed: consistent custom
+pg_dump, standard CMS AES-256-GCM authenticated encryption, owner-only retained
+ciphertext and separately retained recipient key, fully authenticated tmpfs-only
+isolated PostgreSQL16.15 restore, migrations001/002/schema and count observations
+verified, owned restore resources removed. Production service/container/volume/
+route identities and source metadata remained unchanged. No backup/private-key
+paths or data belong in Git. Safe evidence is indexed in the
+[acceptance ledger](full-app-acceptance-ledger.md).
+
+This completes the backup/restore prerequisite; it does not create a staging
+target, authorize policy bypass, prove HTTPS/user flows, or verify version
+rollback. The old rejection paragraph below is historical and does not require
+another production dump. Use the retained authenticated backup and proof rather
+than automatically repeating the export.
+
 ## Verified remote baseline — 2026-10-06
 
 Read-only inspection of `root@217.160.151.9` found Debian 12, 1 vCPU, 1.8 GiB
@@ -26,13 +44,13 @@ database was about 8.9 MB with 24 Work records, one teammate, and 101 entity
 revisions. Migrations `001_initial.sql` and `002_owner_provenance.sql` were
 present. These are point-in-time observations, not a claim of current health.
 
-The requested encrypted production dump to a local destination was rejected
+At the historical pre-authorization checkpoint, the requested encrypted production dump to a local destination was rejected
 by automatic approval review because it would export private production data.
 No export, restore, or backup artifact was created. No alternate path may be
-used to work around that rejection. A15 remains pending until the user grants
-specific authorization for the data export and destination, after which a
-separate backup/restore procedure can be reviewed and run. The existing V1
-services and named volumes were not changed.
+used to work around that rejection. A15 remained pending at that checkpoint
+until specific export/destination authorization; the later authorized operation
+and verified prerequisite are recorded above. The existing V1 services and
+named volumes were not changed.
 
 ## Authorization and preflight gates
 
