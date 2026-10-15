@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { runStagingOperation, stopStagingProcess, validateStagingRequest, verifyStagingImage, type StagingReceipt, type StagingRequest } from '../src/connector/staging-deploy.js';
@@ -66,6 +66,109 @@ describe('fixed staging deployment adapter', () => {
     expect(received).toContain('refs/heads/main');
     expect(received).toContain(commitSha);
     expect(received).toContain('blossomsai/menoteam/.github/workflows/build-workbench-image.yml');
+  });
+
+  it('uses only fixed or temporary validated registry config with allowlisted gh environment', async () => {
+    const original = { HOME: process.env.HOME, PATH: process.env.PATH, MENOTEAM_GITHUB_TOKEN: process.env.MENOTEAM_GITHUB_TOKEN, DOCKER_CONFIG: process.env.DOCKER_CONFIG, XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, REGISTRY_AUTH_FILE: process.env.REGISTRY_AUTH_FILE, MENOTEAM_UNRELATED: process.env.MENOTEAM_UNRELATED };
+    const originalCwd = process.cwd();
+    const home = path.join(directory, 'fake-home');
+    const bin = path.join(directory, 'fake-bin');
+    const log = path.join(directory, 'gh-env.txt');
+    const fakeCwd = path.join(directory, 'fake-cwd');
+    const callerConfigDir = path.join(directory, 'caller-docker-config');
+    const xdgRuntime = path.join(directory, 'fake-xdg-runtime');
+    const configDir = path.join(home, '.config', 'menoteam', 'staging-registry');
+    const expected = JSON.stringify([{ verificationResult: { statement: { subject: [{ name: target.imageRepository, digest: { sha256: imageDigest.slice(7) } }] } } }]);
+    try {
+      await mkdir(bin, { recursive: true });
+      await mkdir(path.join(fakeCwd, 'containers'), { recursive: true });
+      await mkdir(callerConfigDir, { recursive: true });
+      await mkdir(path.join(xdgRuntime, 'containers'), { recursive: true });
+      await writeFile(path.join(fakeCwd, 'containers', 'auth.json'), '{"auths":{"ghcr.io":{"auth":"relative-cwd-sentinel"}}}');
+      await writeFile(path.join(callerConfigDir, 'config.json'), '{"credsStore":"caller-sentinel"}');
+      await writeFile(path.join(xdgRuntime, 'containers', 'auth.json'), '{"auths":{"ghcr.io":{"auth":"xdg-sentinel"}}}');
+      await mkdir(configDir, { recursive: true, mode: 0o700 });
+      await chmod(path.join(home), 0o700);
+      await chmod(path.join(home, '.config'), 0o700);
+      await chmod(path.join(home, '.config', 'menoteam'), 0o700);
+      await chmod(configDir, 0o700);
+      const operatorConfig = JSON.stringify({ auths: { 'ghcr.io': { registrytoken: 'fake-short-lived-token' } } });
+      await writeFile(path.join(configDir, 'config.json'), operatorConfig, { mode: 0o600 });
+      const fakeGh = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const configDir = ${JSON.stringify(configDir)};
+const logFile = ${JSON.stringify(log)};
+const expectedOutput = ${JSON.stringify(expected)};
+const dockerConfig = process.env.DOCKER_CONFIG || '';
+const configFile = path.join(dockerConfig, 'config.json');
+const explicit = Boolean(dockerConfig && fs.existsSync(configFile));
+const selected = explicit ? configFile : path.join(process.cwd(), 'containers', 'auth.json');
+const operatorConfig = dockerConfig === configDir;
+const contents = operatorConfig ? 'operator-not-read' : fs.readFileSync(selected, 'utf8');
+const dirMode = operatorConfig ? 'operator' : (fs.statSync(dockerConfig).mode & 0o777).toString(8);
+const fileMode = operatorConfig ? 'operator' : (fs.statSync(selected).mode & 0o777).toString(8);
+const marker = name => Object.prototype.hasOwnProperty.call(process.env, name) ? 'present' : 'absent';
+fs.writeFileSync(logFile, [dockerConfig || 'absent', explicit ? 'explicit' : 'relative', selected, contents, dirMode, fileMode, marker('GH_TOKEN'), marker('HOME'), marker('XDG_RUNTIME_DIR'), marker('REGISTRY_AUTH_FILE'), marker('MENOTEAM_UNRELATED')].join('|')+'\\n');
+if (process.env.GH_TOKEN === 'fake-gh-failure') process.exit(17);
+process.stdout.write(expectedOutput+'\\n');
+`;
+      await symlink(process.execPath, path.join(bin, 'node'));
+      await writeFile(path.join(bin, 'gh'), fakeGh, { mode: 0o700 });
+      await chmod(path.join(bin, 'gh'), 0o700);
+      process.chdir(fakeCwd);
+      process.env.HOME = home;
+      process.env.PATH = bin;
+      process.env.MENOTEAM_GITHUB_TOKEN = 'fake-gh-token';
+      process.env.DOCKER_CONFIG = callerConfigDir;
+      process.env.XDG_RUNTIME_DIR = xdgRuntime;
+      process.env.REGISTRY_AUTH_FILE = path.join(directory, 'caller-auth.json');
+      process.env.MENOTEAM_UNRELATED = 'must-not-pass';
+      await verifyStagingImage(target, commitSha, imageDigest);
+      const operatorFields = (await readFile(log, 'utf8')).trim().split('|');
+      expect(operatorFields.slice(0, 7)).toEqual([configDir, 'explicit', `${configDir}/config.json`, 'operator-not-read', 'operator', 'operator', 'present']);
+      expect(operatorFields.slice(7)).toEqual(['absent', 'absent', 'absent', 'absent']);
+      expect(await readFile(path.join(configDir, 'config.json'), 'utf8')).toBe(operatorConfig);
+
+      await rm(configDir, { recursive: true });
+      await mkdir(configDir, { recursive: true, mode: 0o700 });
+      await chmod(configDir, 0o700);
+      await rm(log, { force: true });
+      await verifyStagingImage(target, commitSha, imageDigest);
+      const successFields = (await readFile(log, 'utf8')).trim().split('|');
+      const successConfigDir = successFields[0]!;
+      expect(successConfigDir.startsWith(path.join(os.tmpdir(), 'menoteam-staging-registry-'))).toBe(true);
+      expect(successFields.slice(1)).toEqual(['explicit', `${successConfigDir}/config.json`, '{"auths":{"ghcr.io":{}}}', '700', '600', 'present', 'absent', 'absent', 'absent', 'absent']);
+      await expect(readFile(path.join(successConfigDir, 'config.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+
+      process.env.MENOTEAM_GITHUB_TOKEN = 'fake-gh-failure';
+      await rm(log, { force: true });
+      const failure = await verifyStagingImage(target, commitSha, imageDigest).then(() => '', error => String(error));
+      expect(failure).not.toContain('fake-gh-failure');
+      const failureFields = (await readFile(log, 'utf8')).trim().split('|');
+      const failureConfigDir = failureFields[0]!;
+      expect(failureFields.slice(1)).toEqual(['explicit', `${failureConfigDir}/config.json`, '{"auths":{"ghcr.io":{}}}', '700', '600', 'present', 'absent', 'absent', 'absent', 'absent']);
+      await expect(readFile(path.join(failureConfigDir, 'config.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+      process.env.MENOTEAM_GITHUB_TOKEN = 'fake-gh-token';
+
+      await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ auths: { 'ghcr.io': { registrytoken: 'fake-secret' } }, credsStore: 'injected' }), { mode: 0o600 });
+      await expect(verifyStagingImage(target, commitSha, imageDigest)).rejects.toThrow('schema is invalid');
+      await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ auths: { 'ghcr.io': { registrytoken: 'fake-secret' } } }), { mode: 0o600 });
+      await chmod(path.join(configDir, 'config.json'), 0o644);
+      await expect(verifyStagingImage(target, commitSha, imageDigest)).rejects.toThrow('file is unsafe');
+      await chmod(path.join(configDir, 'config.json'), 0o600);
+      const realConfig = path.join(configDir, 'real-config.json');
+      await rm(realConfig, { force: true });
+      await writeFile(realConfig, JSON.stringify({ auths: { 'ghcr.io': { registrytoken: 'fake-secret' } } }), { mode: 0o600 });
+      await rm(path.join(configDir, 'config.json'));
+      await symlink(realConfig, path.join(configDir, 'config.json'));
+      const rejection = await verifyStagingImage(target, commitSha, imageDigest).then(() => '', error => String(error));
+      expect(rejection).toContain('file is unsafe');
+      expect(rejection).not.toContain('fake-secret');
+    } finally {
+      process.chdir(originalCwd);
+      for (const [key, value] of Object.entries(original)) if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
   });
 
   it('fails closed when an attested subject digest differs from the requested image', async () => {

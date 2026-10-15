@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import { execFileJoined as execFile } from './exec-file.js';
-import { lstat, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 import type { StagingDeploymentTarget } from './types.js';
 import { readProcessIdentity, terminateProcessGroup, waitProcessGroup, type CodexProcessIdentity } from './codex.js';
@@ -73,8 +75,51 @@ export async function verifyStagingImage(target: StagingDeploymentTarget, commit
 async function verifyWithGh(args: string[], signal?:AbortSignal): Promise<string> {
   const token = process.env.MENOTEAM_GITHUB_TOKEN;
   if (!token) throw new Error('Staging image provenance verifier is unavailable');
-  const { stdout } = await execFile('gh', args, { encoding: 'utf8', maxBuffer: 256 * 1024, timeout: 30_000, ...(signal?{signal}:{}), env: { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C', GH_TOKEN: token } });
-  return stdout;
+  const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', LANG: 'C', GH_TOKEN: token } as Record<string, string>;
+  let temporaryConfigDirectory: string | undefined;
+  try {
+    let dockerConfig = await stagingRegistryDockerConfig();
+    if (!dockerConfig) {
+      temporaryConfigDirectory = await mkdtemp(path.join(tmpdir(), 'menoteam-staging-registry-'));
+      await chmod(temporaryConfigDirectory, 0o700);
+      // The explicit GHCR entry keeps keychain lookup anonymous and confined.
+      await writeFile(path.join(temporaryConfigDirectory, 'config.json'), '{"auths":{"ghcr.io":{}}}', { mode: 0o600, flag: 'wx' });
+      dockerConfig = temporaryConfigDirectory;
+    }
+    env.DOCKER_CONFIG = dockerConfig;
+    const { stdout } = await execFile('gh', args, { encoding: 'utf8', maxBuffer: 256 * 1024, timeout: 30_000, ...(signal?{signal}:{}), env });
+    return stdout;
+  } finally {
+    if (temporaryConfigDirectory) await rm(temporaryConfigDirectory, { recursive: true, force: true });
+  }
+}
+
+async function stagingRegistryDockerConfig(): Promise<string | undefined> {
+  const home = homedir();
+  const directory = path.join(home, '.config', 'menoteam', 'staging-registry');
+  const config = path.join(directory, 'config.json');
+  const uid = process.getuid?.();
+  if (uid === undefined) throw new Error('Staging registry credentials require a local user identity');
+  for (const parent of [home, path.join(home, '.config'), path.join(home, '.config', 'menoteam'), directory]) {
+    let info;
+    try { info = await lstat(parent); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw new Error('Staging registry credential directory is unavailable'); }
+    const finalDirectory = parent === directory;
+    if (info.isSymbolicLink() || !info.isDirectory() || info.uid !== uid || (info.mode & 0o022) !== 0 || finalDirectory && (info.mode & 0o777) !== 0o700) throw new Error('Staging registry credential directory is unsafe');
+  }
+  let info;
+  try { info = await lstat(config); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw new Error('Staging registry credential file is unavailable'); }
+  if (info.isSymbolicLink() || !info.isFile() || info.uid !== uid || (info.mode & 0o777) !== 0o600) throw new Error('Staging registry credential file is unsafe');
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(config, 'utf8')); }
+  catch { throw new Error('Staging registry credential file is invalid'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).length !== 1 || !('auths' in parsed)) throw new Error('Staging registry credential file schema is invalid');
+  const auths = (parsed as { auths?: unknown }).auths;
+  if (!auths || typeof auths !== 'object' || Array.isArray(auths) || Object.keys(auths).length !== 1 || !('ghcr.io' in auths)) throw new Error('Staging registry credential file schema is invalid');
+  const ghcr = (auths as Record<string, unknown>)['ghcr.io'];
+  if (!ghcr || typeof ghcr !== 'object' || Array.isArray(ghcr) || Object.keys(ghcr).length !== 1 || !('registrytoken' in ghcr) || typeof (ghcr as { registrytoken?: unknown }).registrytoken !== 'string' || !(ghcr as { registrytoken: string }).registrytoken.trim()) throw new Error('Staging registry credential file schema is invalid');
+  return directory;
 }
 
 async function validateTarget(target: StagingDeploymentTarget): Promise<void> {
