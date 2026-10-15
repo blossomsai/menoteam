@@ -1602,13 +1602,16 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     });
     it('reserves staging by target, authorizes effects against the merged receipt, and keeps revoked intents read-only',async()=>{
         const p=checkedJson(await user('POST','/projects',{name:'Staging authorization proof',repositoryUrl:'https://github.com/example/staging-proof'})) as Project;
-        const enrolled=await enrollProvider('staging-proof-connector',[p.id]);
+        const otherProject=checkedJson(await user('POST','/projects',{name:'Other staging project',repositoryUrl:'https://github.com/example/other-staging-proof'})) as Project;
+        const enrolled=await enrollProvider('staging-proof-connector',[p.id,otherProject.id]);
         const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Exact staging candidate'})) as Work;
+        const rollbackWork=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Rollback from another Work'})) as Work;
         const caps={runKinds:[],git:true,githubWrite:true,deliveryActions:['deploy_staging','rollback_staging'],deploymentTargets:['staging']};
         expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps}}})).statusCode).toBe(204);
         const policy=checkedJson(await user('POST','/settings',{projectId:p.id,kind:'connection',name:'Staging delivery policy',data:{provider:'github',url:p.repositoryUrl,purpose:'delivery',baseBranch:'main',allowDraftPr:true,allowStagingDeploy:true,stagingTargets:['staging'],configuredBy:(await user('GET','/me')).json().id}}));
         const mergedSha='a'.repeat(40),candidateSha='b'.repeat(40),candidateBase='c'.repeat(40),candidateRevision=createHash('sha256').update(candidateBase).update('\0').update(candidateSha).digest('hex');
         const merged:Run={id:randomUUID(),projectId:p.id,workId:work.id,prompt:'merged source receipt',requestedBy:(await user('GET','/me')).json().id,kind:'delivery',model:'internal',reasoning:'none',status:'completed',generation:1,connectorId:'staging-proof-connector',targetConnectorId:'staging-proof-connector',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),operation:{action:'merge_pr',actorId:(await user('GET','/me')).json().id,candidateRunId:randomUUID(),candidateRevision,artifactRevision:candidateRevision,commitSha:candidateSha,candidateFingerprint:'d'.repeat(64),repositoryUrl:p.repositoryUrl,baseRevision:candidateBase,baseBranch:'main',remoteBranch:'codex/staging-proof',workTitle:work.title,changeSummary:'verified change',qaStatus:'current',phase:'merged',effectIntentGeneration:1,external:{pullRequestNumber:17,pullRequestUrl:`${p.repositoryUrl}/pull/17`,pullRequestNodeId:'PR_staging_17',headSha:candidateSha,baseSha:'e'.repeat(40),mergeSha:mergedSha}}};
+        merged.targetRunId=merged.operation!.candidateRunId;merged.targetRevision=candidateRevision;merged.operation!.reviewRunId=randomUUID();merged.operation!.qaPolicySnapshot=qaPolicyFixture(p.id,p.repositoryUrl);merged.createdAt=new Date(Date.now()-120_000).toISOString();merged.updatedAt=merged.createdAt;
         await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${merged.id},'run',${p.id},${sql.json(merged as never)})`;
         const imageDigestForTest=`sha256:${'f'.repeat(64)}`;
         const request=(requestId:string)=>user('POST',`/works/${work.id}/staging`,{sourceMergeRunId:merged.id,targetId:'staging',requestId});
@@ -1667,18 +1670,32 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const enabledPolicy=checkedJson(await user('PATCH',`/settings/${policy.id}`,{expectedUpdatedAt:changed.updatedAt,data:{...policy.data,enabled:true}}));
         const previousId=randomUUID(),currentId=randomUUID(),previousDigest=`sha256:${'2'.repeat(64)}`,currentDigest=`sha256:${'3'.repeat(64)}`;
         const actorId=(await user('GET','/me')).json().id as string;
-        const verifiedDeployment=(id:string,digest:string,updatedAt:string,receipt:{deploymentId:string;previousDeploymentId?:string;previousImageDigest?:string}):Run=>({
-            id,projectId:p.id,workId:work.id,prompt:'previous staging receipt',requestedBy:actorId,kind:'delivery',model:'internal',reasoning:'none',status:'completed',generation:1,connectorId:'staging-proof-connector',targetConnectorId:'staging-proof-connector',createdAt:updatedAt,updatedAt,
-            operation:{action:'deploy_staging',actorId:actorId,candidateRunId:randomUUID(),candidateRevision,artifactRevision:candidateRevision,commitSha:mergedSha,candidateFingerprint:'d'.repeat(64),repositoryUrl:p.repositoryUrl,baseRevision:candidateBase,baseBranch:'main',remoteBranch:'codex/staging-proof',workTitle:work.title,changeSummary:'verified staged version',qaStatus:'current',phase:'health_passed',sourceMergeRunId:merged.id,targetId:'staging',targetPolicyVersion:enabledPolicy.updatedAt,imageDigest:digest,stagingReceipt:{operationId:id,targetId:'staging',phase:'health_passed',deploymentId:receipt.deploymentId,commitSha:mergedSha,imageDigest:digest,activeCommitSha:mergedSha,activeImageDigest:digest,...(receipt.previousDeploymentId?{previousDeploymentId:receipt.previousDeploymentId}:{}),...(receipt.previousImageDigest?{previousImageDigest:receipt.previousImageDigest}:{}),checkedAt:updatedAt}}
+        const revisionB=createHash('sha256').update(candidateBase).update('\0').update('7'.repeat(40)).digest('hex');
+        const sourceB:Run={...merged,id:randomUUID(),workId:rollbackWork.id,targetRevision:revisionB,createdAt:new Date(Date.now()-30_000).toISOString(),operation:{...merged.operation!,candidateRunId:randomUUID(),candidateRevision:revisionB,artifactRevision:revisionB,candidateFingerprint:'6'.repeat(64),commitSha:'7'.repeat(40),reviewRunId:randomUUID(),workTitle:rollbackWork.title,remoteBranch:'codex/staging-proof-b',changeSummary:'verified change B',external:{...merged.operation!.external,pullRequestNumber:18,pullRequestUrl:`${p.repositoryUrl}/pull/18`,pullRequestNodeId:'PR_staging_18',headSha:'7'.repeat(40),mergeSha:'8'.repeat(40)}}};
+        sourceB.targetRunId=sourceB.operation!.candidateRunId;sourceB.updatedAt=sourceB.createdAt;
+        await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${sourceB.id},'run',${p.id},${sql.json(sourceB as never)})`;
+        const verifiedDeployment=(source:Run,id:string,digest:string,updatedAt:string,receipt:{deploymentId:string;previousDeploymentId?:string;previousImageDigest?:string}):Run=>({
+            id,projectId:p.id,workId:source.workId,targetRunId:source.targetRunId,targetRevision:source.targetRevision,prompt:'previous staging receipt',requestedBy:actorId,kind:'delivery',model:'internal',reasoning:'none',status:'completed',generation:1,connectorId:'staging-proof-connector',targetConnectorId:'staging-proof-connector',createdAt:updatedAt,updatedAt,
+            operation:{...source.operation!,action:'deploy_staging',actorId,commitSha:source.operation!.external!.mergeSha!,phase:'health_passed',sourceMergeRunId:source.id,targetId:'staging',targetPolicyVersion:enabledPolicy.updatedAt,imageDigest:digest,buildStatus:'verified',buildReceipt:{...buildReceipt,sourceSha:source.operation!.external!.mergeSha!,imageDigest:digest,verifiedAt:updatedAt,verifiedGeneration:1},stagingReceipt:{operationId:id,targetId:'staging',phase:'health_passed',deploymentId:receipt.deploymentId,commitSha:source.operation!.external!.mergeSha!,imageDigest:digest,activeCommitSha:source.operation!.external!.mergeSha!,activeImageDigest:digest,...(receipt.previousDeploymentId?{previousDeploymentId:receipt.previousDeploymentId}:{}),...(receipt.previousImageDigest?{previousImageDigest:receipt.previousImageDigest}:{}),checkedAt:updatedAt}}
         });
         const previousAt=new Date(Date.now()-60_000).toISOString(),currentAt=new Date().toISOString();
-        const previousRun=verifiedDeployment(previousId,previousDigest,previousAt,{deploymentId:'deploy_previous'});
-        const currentRun=verifiedDeployment(currentId,currentDigest,currentAt,{deploymentId:'deploy_current',previousDeploymentId:'deploy_previous',previousImageDigest:previousDigest});
+        const previousRun=verifiedDeployment(merged,previousId,previousDigest,previousAt,{deploymentId:'deploy_previous'});
+        const currentRun=verifiedDeployment(sourceB,currentId,currentDigest,currentAt,{deploymentId:'deploy_current',previousDeploymentId:'deploy_previous',previousImageDigest:previousDigest});
         await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${previousRun.id},'run',${p.id},${sql.json(previousRun as never)}),(${currentRun.id},'run',${p.id},${sql.json(currentRun as never)})`;
         // Restore mutation capabilities via normal discovery after the read-only reconciliation proof.
         expect((await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps,runKinds:[]}}})).statusCode).toBe(204);
-        const rollbackRequest=(requestId:string)=>user('POST',`/works/${work.id}/staging/rollback`,{deploymentRunId:currentRun.id,targetId:'staging',requestId});
+        const otherProjectWork=checkedJson(await user('POST',`/projects/${otherProject.id}/works`,{title:'Foreign staging Work'})) as Work;
+        const otherProjectReceipt={...previousRun,id:randomUUID(),projectId:otherProject.id,workId:otherProjectWork.id,operation:{...previousRun.operation!,stagingReceipt:{...previousRun.operation!.stagingReceipt!,deploymentId:'deploy_other_project'}}};
+        const otherTargetReceipt={...previousRun,id:randomUUID(),operation:{...previousRun.operation!,targetId:'other-stage',stagingReceipt:{...previousRun.operation!.stagingReceipt!,targetId:'other-stage',deploymentId:'deploy_other_target'}}};
+        const foreignProjectCurrent={...currentRun,id:randomUUID(),operation:{...currentRun.operation!,stagingReceipt:{...currentRun.operation!.stagingReceipt!,deploymentId:'deploy_current_foreign_project',previousDeploymentId:'deploy_other_project'}}};
+        const foreignTargetCurrent={...currentRun,id:randomUUID(),operation:{...currentRun.operation!,stagingReceipt:{...currentRun.operation!.stagingReceipt!,deploymentId:'deploy_current_foreign_target',previousDeploymentId:'deploy_other_target'}}};
+        await sql`INSERT INTO wb_records(id,kind,project_id,data) VALUES (${otherProjectReceipt.id},'run',${otherProject.id},${sql.json(otherProjectReceipt as never)}),(${otherTargetReceipt.id},'run',${p.id},${sql.json(otherTargetReceipt as never)}),(${foreignProjectCurrent.id},'run',${p.id},${sql.json(foreignProjectCurrent as never)}),(${foreignTargetCurrent.id},'run',${p.id},${sql.json(foreignTargetCurrent as never)})`;
+        const rollbackRequest=(requestId:string,deploymentRunId=currentRun.id)=>user('POST',`/works/${rollbackWork.id}/staging/rollback`,{deploymentRunId,targetId:'staging',requestId});
+        expect((await rollbackRequest('reject-other-project',foreignProjectCurrent.id)).statusCode).toBe(409);
+        expect((await rollbackRequest('reject-other-target',foreignTargetCurrent.id)).statusCode).toBe(409);
+        await sql`DELETE FROM wb_records WHERE id IN (${foreignProjectCurrent.id},${foreignTargetCurrent.id})`;
         const rollbackQueued=checkedJson(await rollbackRequest('rollback-first')) as {run:Run};
+        expect(rollbackQueued.run).toMatchObject({workId:rollbackWork.id,operation:{candidateRunId:merged.operation!.candidateRunId,candidateFingerprint:merged.operation!.candidateFingerprint,sourceMergeRunId:merged.id,expectedCurrentDeploymentId:'deploy_current',buildReceipt:previousRun.operation!.buildReceipt}});
         expect(rollbackQueued.run.operation).toMatchObject({action:'rollback_staging',phase:'queued',previousDeploymentRunId:previousRun.id,previousDeploymentId:'deploy_previous',rollbackToImageDigest:previousDigest});
         const rollbackClaim=checkedJson(await app.inject({method:'POST',url:'/api/workbench/connector/claim',headers:{authorization:`Bearer ${enrolled.token}`},payload:{capabilities:{...fixtureCapabilities,...caps,runKinds:['delivery']}}})).run as Run;
         expect(rollbackClaim.id).toBe(rollbackQueued.run.id);
@@ -1700,6 +1717,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(changed.data.enabled).toBe(false);
         await sql`DELETE FROM wb_records WHERE project_id=${p.id}`;
         await sql`DELETE FROM wb_requests WHERE scope LIKE ${`%${p.id}%`} OR result->>'runId'=${claimed.id}`;
+        await sql`DELETE FROM wb_records WHERE project_id=${otherProject.id}`;
+        await sql`DELETE FROM wb_requests WHERE scope LIKE ${`%${otherProject.id}%`}`;
     });
     it('reviewer bridge reads exact candidate evidence and denies wider reads or mutations',async()=>{
         const p=(await user('POST','/projects',{name:'Scoped review proof'})).json();
