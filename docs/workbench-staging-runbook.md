@@ -2,8 +2,8 @@
 
 This runbook describes an additive, isolated staging deployment beside V1. It
 does not itself authorize a server change, a V1 change, or a user-facing cutover.
-The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-15).
-The target is already provisioned as described there. This document records
+The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-16).
+This document records
 future operator instructions; this documentation update executed no operation.
 
 ## Completed backup prerequisite — verified 2026-10-14
@@ -109,7 +109,7 @@ build. Record the digest and matching source revision in the deployment record.
    configuration, capabilities, network, physical volume and DB health. Do not
    require `:3200` to be unused, expect staging resources to be absent, or rerun
    initial-create/bootstrap steps. The App is not yet started.
-2. After registry-read authorization, validate OCI provenance for the approved
+2. After correct GitHub registry authentication is available, validate OCI provenance for the approved
    immutable digest. Main workflow success by itself is not provenance validation.
    Pull the approved candidate by exact digest. Review the dedicated Compose
    file and render its configuration with secrets redacted. Confirm its
