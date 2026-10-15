@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,8 @@ STATE = Path('/var/lib/menoteam-workbench-stage/state.json')
 LOCK = Path('/var/lib/menoteam-workbench-stage/state.lock')
 COMPOSE = Path('/opt/menoteam/workbench-stage/compose.yml')
 ENV_FILE = Path('/etc/menoteam/workbench-stage.env')
+RUNTIME_DIR = Path('/run')
+REGISTRY_CONFIG_DIR = RUNTIME_DIR / 'menoteam-workbench-stage-registry'
 PROJECT = 'menoteam-workbench-stage'
 HEALTH_URL = 'http://127.0.0.1:3200/healthz'
 MAX_REQUEST = 4096
@@ -101,10 +104,56 @@ def run_compose(action, image=None, source=None):
     if not image or not source:
         fail('compose actions require an immutable image and source revision')
     env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'}
+    docker_config = registry_docker_config()
     env['MENOTEAM_STAGING_IMAGE'] = image
     env['MENOTEAM_STAGING_SOURCE_SHA'] = source
     command = ['docker', 'compose', '--project-name', PROJECT, '--file', str(COMPOSE), '--env-file', str(ENV_FILE)] + action
-    subprocess.run(command, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=180)
+    temporary_config = None
+    try:
+        if docker_config is None:
+            temporary_config = tempfile.TemporaryDirectory(prefix='menoteam-staging-registry-', dir=RUNTIME_DIR)
+            os.chmod(temporary_config.name, 0o700)
+            docker_config = Path(temporary_config.name)
+            config_path = docker_config / 'config.json'
+            fd = os.open(config_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as output:
+                output.write('{"auths":{"ghcr.io":{}}}')
+        env['DOCKER_CONFIG'] = str(docker_config)
+        subprocess.run(command, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=180)
+    finally:
+        if temporary_config is not None:
+            temporary_config.cleanup()
+
+
+def registry_docker_config():
+    paths = (RUNTIME_DIR, REGISTRY_CONFIG_DIR)
+    for directory in paths:
+        try:
+            info = os.lstat(directory)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or directory == REGISTRY_CONFIG_DIR and stat.S_IMODE(info.st_mode) != 0o700:
+            fail('staging registry credential directory is unsafe')
+    config = REGISTRY_CONFIG_DIR / 'config.json'
+    try:
+        info = os.lstat(config)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
+        fail('staging registry credential file is unsafe')
+    try:
+        value = json.loads(config.read_text())
+    except Exception:
+        fail('staging registry credential file is invalid')
+    if not isinstance(value, dict) or set(value) != {'auths'}:
+        fail('staging registry credential file schema is invalid')
+    auths = value['auths']
+    if not isinstance(auths, dict) or set(auths) != {'ghcr.io'}:
+        fail('staging registry credential file schema is invalid')
+    registry = auths['ghcr.io']
+    if not isinstance(registry, dict) or set(registry) != {'registrytoken'} or not isinstance(registry['registrytoken'], str) or not registry['registrytoken'].strip():
+        fail('staging registry credential file schema is invalid')
+    return REGISTRY_CONFIG_DIR
 
 
 def container_ids(service):

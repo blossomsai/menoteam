@@ -217,6 +217,7 @@ describe('Integrated connector lifecycle',()=>{
     const cfg:ConnectorConfig={serverUrl:'http://127.0.0.1:3200',token:'unused',connectorId:'one',dataDir,projects:{},pollIntervalMs:1,leaseRenewIntervalMs:5};
     const bounded=<T>(promise:Promise<T>)=>{let timer:ReturnType<typeof setTimeout>;return Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('Timed out waiting for deterministic cancellation barrier')),2_000);})]).finally(()=>clearTimeout(timer));};
     let remoteStatus:'running'|'paused'='running';let rejectTurn:((e:Error)=>void)|undefined;let runEnteredResolve!:()=>void;const runEntered=new Promise<void>(resolve=>{runEnteredResolve=resolve;});
+    let renewedResolve!:()=>void;const renewed=new Promise<void>(resolve=>{renewedResolve=resolve;});
     let appendAttemptResolve!:(events:unknown[])=>void;const appendAttempt=new Promise<unknown[]>(resolve=>{appendAttemptResolve=resolve;});
     let releaseAppend!:()=>void;let rejectAppend!:(error:Error)=>void;const appendResponse=new Promise<void>((resolve,reject)=>{releaseAppend=resolve;rejectAppend=reject;});
     let pausedObservedResolve!:()=>void;const pausedObserved=new Promise<void>(resolve=>{pausedObservedResolve=resolve;});
@@ -225,9 +226,10 @@ describe('Integrated connector lifecycle',()=>{
     const native={start:async()=>['gpt-6.1-sol'],processIdentity:async()=>({pid:123,processGroupId:123,startedAt:'test',command:'codex app-server'}),stop:async()=>{if(nativeRunEntered&&!processStopped){processStopped=true;order.push('process-stop');rejectTurn?.(new Error('stopped'));}},run:async(_c:unknown,_cwd:string,_prompt:string,_thread:string,onEvent:Function)=>{nativeRunEntered=true;processStopped=false;order.push('native-run-entered');runEnteredResolve();onEvent({type:'agent_message',text:'Pending evidence',threadId:'persistent-thread'});return new Promise((_resolve,reject)=>{rejectTurn=reject;});}} as unknown as CodexAppServer;
     const client={
       claim:async()=>{if(!claimed){claimed=true;return claim();}await acknowledgement;await runner.stop();return undefined;},
-      createBridgeToken:async()=>({token:'bounded',expiresAt:'later'}),
+      createBridgeToken:async()=>{await bounded(renewed);return{token:'bounded',expiresAt:'later'};},
       appendEvents:async(_id:string,_generation:number,events:unknown[])=>{appendAttemptResolve(events);await appendResponse;},
       readRun:async()=>{if(nativeRunEntered&&remoteStatus==='paused')pausedObservedResolve();return{...claim().run,status:remoteStatus};},
+      renew:async()=>{renewedResolve();return{...claim().run,status:remoteStatus};},
       stopped:async()=>{expect(processStopped).toBe(true);order.push('cancellation-ack');acknowledged=true;acknowledgeResolve();},
       complete:async()=>{throw new Error('Cancelled turn must not complete');}
     } as unknown as WorkbenchConnectorClient;

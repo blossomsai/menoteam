@@ -1,6 +1,6 @@
 # Full app execution contract
 
-2026-10-06. Owner: parent orchestrator; implementation: GPT 6 Luna; backend architecture/implementation and independent review: GPT 6.1 Sol. This contract advances the V3 prototype into a real cloud team app. It does not declare any feature delivered. Current product and navigation documents remain the UX contract.
+2026-10-06. Owner: parent orchestrator; implementation: GPT 6 Luna; backend architecture/implementation and independent review: GPT 6.1 Sol. This contract advances the V3 prototype into a real cloud team app. It does not declare any feature delivered. Current product and navigation documents remain the UX contract. For the sole current delivery/staging status and proof limits, see the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-15); dated sections below are historical checkpoints.
 
 ## Outcome and baseline
 
@@ -66,18 +66,18 @@ Native profile tool allowlists are not supported in this release: nonempty arbit
 
 Master `update_settings` supports either `{instructions}` for the current project or `{settingId,expectedUpdatedAt,name?,data?}` for an existing setting. It uses the same validated service as the UI, merges partial data only through strict kind schemas, and rechecks the initiating actor's current project/workspace role. Another project's setting ID is forbidden. Master updates require the timestamp from `read_context`; concurrent changes return409 rather than silently overwrite. External feedback intake grants exclude settings/skills changes.
 
-### Bounded delivery capability and remaining acceptance (A14, Partial)
+### Bounded delivery capability (A14; historical checkpoint, superseded status in ledger)
 
 The integrated source now provides bounded `create_draft_pr` and `merge_pr` operations through the existing Work/Run queue, authorized API/MCP and fixed Connector executors. Structured project delivery policy, the initiating actor's current authority, exact repository/base branch and immutable candidate SHA/fingerprint/diff govern effects; merge additionally requires typed independent review and current required QA/checks. Editable `deliveryAuthorization` text remains context, not executable permission. Source intake does not inherit delivery authority.
 
-Draft PR creation has historical native proof: PR #3 was created from candidate `776c692eb9576278b71d7c6689add0ff729f57b0`. That older candidate must not be merged as the current app. The integrated merge adapter and its authorization/recovery contracts have source and test evidence, but no real merge of the current integrated candidate is proven. Free-form review praise cannot replace a typed, correctly bound disposition.
+Draft PR creation has historical native proof: PR #3 was created from candidate `776c692eb9576278b71d7c6689add0ff729f57b0`. That older candidate must not be merged as the current app. At that checkpoint, the integrated merge adapter and its authorization/recovery contracts had source and test evidence, but no real merge of the then-current integrated candidate was proven. Free-form review praise cannot replace a typed, correctly bound disposition.
 
-Fixed-target staging deploy, trusted build discovery, health/version verification, pre-effect retirement and rollback are integrated in the current source. Their local contract tests do not establish a live build/artifact/attestation or remote deployment/rollback. They must reuse the existing queue/executor, require a verified merge receipt and trusted immutable image provenance, accept no model-selected shell/host/path, and reconcile ambiguous effects by durable identity before replay. Health alone cannot mark Work Verified; post-deployment user-flow QA must bind to the deployed identity. A15's backup/isolated-restore prerequisite and automatic-review export restriction remain in force. No local operator upgrade establishes this cloud delivery capability.
+Fixed-target staging deploy, trusted build discovery, health/version verification, pre-effect retirement and rollback are integrated in the current source. Their local contract tests do not establish a live build/artifact/attestation or remote deployment/rollback. They must reuse the existing queue/executor, require a verified merge receipt and trusted immutable image provenance, accept no model-selected shell/host/path, and reconcile ambiguous effects by durable identity before replay. Health alone cannot mark Work Verified; post-deployment user-flow QA must bind to the deployed identity. At that earlier checkpoint, the A15 backup/isolated-restore prerequisite and export-review restriction remained in force. The later completed backup/restore and current delivery state are recorded in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-15). No local operator upgrade establishes cloud delivery capability.
 
-The full goal still includes actual authorized merge, isolated staging deployment, rollback and user-flow verification. A14 remains Partial until these real workflows are evidenced; deployment implementation or contract tests alone do not complete the row.
+At this checkpoint, the remaining goal was actual authorized merge, isolated staging deployment, rollback and user-flow verification. See the current [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-15) for subsequent merge and staging evidence.
 
 
-### Latest local evidence and unresolved required QA — 2026-10-07
+### Historical local evidence and unresolved required QA — 2026-10-07
 
 Main source is `bdab98e25d5fbb86045be7750632726933f24f43`; local runtime remains `8b96295858a3dab274f222322d9913028972c718`. Later ledger entries supersede the historical `8ab4bed` summaries above: official React skill import/reload and native use for the real Overview task, same-Work correction, and two restricted-member native Master tool denials have bounded actual evidence. Alpha Luna documentation work and Beta Sol read-only authorization/recovery audit naturally overlapped for 39 seconds in separate checkouts; this is not two code-writer collision proof.
 
@@ -89,7 +89,7 @@ The independent server-bound typed review remains **insufficient_evidence**, wit
 A subsequent local Luna UI delta after `bdab98e` adjusts desktop Work split scrolling and removes unavailable-Marketplace explanatory copy; a short-viewport clipping finding was corrected and bounded Sol source review found no remaining actionable issue. Reported mounted/UI checks and UI typecheck/build are supporting evidence only: browser behavior, a new full gate and runtime upgrade remain unproven; the 633/633 gate above applies only to committed `bdab98e`.
 
 
-### Current local execution checkpoint — 2026-10-12
+### Historical local execution checkpoint — 2026-10-12
 
 Local app **55253** and acceptance Connector **55741** / PTY **14382** now run exact `6cfa77311adde38436a3aa4a78ff71e7df75588e` from the verified Application Support layout, with same-schema rollback retained and data/session/config/grants preserved. Dogfood **85202** stays live at `8b96295`. UI HTML/assets and normal long-artifact GET return 200; Root's original authenticated browser displays All projects, but QA projection and New Work/Changes fixes are still awaiting app-only deployment. Current source/runtime evidence supersedes historical GET414/browser-denial checkpoints without changing their recorded facts.
 

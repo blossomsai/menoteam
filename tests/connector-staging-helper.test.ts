@@ -59,8 +59,9 @@ print(json.dumps({'terminal':terminal,'first':first,'second':second,'legacy':leg
 
   it('supplies immutable image inputs to every Compose call and uses Docker labels for status lookup', async () => {
     const result = await simulate(`
-import importlib.util,importlib.machinery,json,sys,types
+import importlib.util,importlib.machinery,json,sys,types,tempfile,pathlib
 spec=importlib.util.spec_from_loader('stage',importlib.machinery.SourceFileLoader('stage',sys.argv[1]));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+m.RUNTIME_DIR=pathlib.Path(tempfile.mkdtemp());m.registry_docker_config=lambda:None
 calls=[]
 def run(command,**kwargs):
  calls.append({'command':command,'env':kwargs.get('env',{})})
@@ -84,6 +85,60 @@ print(json.dumps({'calls':calls,'missing':missing,'app':app,'appCall':app_call,'
     expect((result.appCall as string[]).slice(0, 2)).toEqual(['docker', 'ps']);
     expect(result.schema).toBe('006_owner_provenance.sql');
     expect((result.dbCall as string[]).slice(0, 3)).toEqual(['docker', 'exec', 'abc123456789']);
+  });
+
+  it('confines anonymous Compose auth and cleans its temporary config after success or failure', async () => {
+    const result = await simulate(`
+import importlib.util,importlib.machinery,json,sys,tempfile,pathlib,os,types,io,stat
+spec=importlib.util.spec_from_loader('stage',importlib.machinery.SourceFileLoader('stage',sys.argv[1]));m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+root=pathlib.Path(tempfile.mkdtemp());os.chmod(root,0o700);m.RUNTIME_DIR=root;m.REGISTRY_CONFIG_DIR=root/'menoteam-workbench-stage-registry';m.REGISTRY_CONFIG_DIR.mkdir(mode=0o700);os.chmod(m.REGISTRY_CONFIG_DIR,0o700);config=m.REGISTRY_CONFIG_DIR/'config.json';config.write_text(json.dumps({'auths':{'ghcr.io':{'registrytoken':'fake-root-token'}}}));os.chmod(config,0o600)
+original_lstat=os.lstat
+def fake_lstat(path):
+ info=original_lstat(path)
+ if pathlib.Path(path) in (root,m.REGISTRY_CONFIG_DIR,config):return types.SimpleNamespace(st_uid=0,st_mode=info.st_mode)
+ return info
+m.os.lstat=fake_lstat;ambient=root/'ambient-docker';ambient.mkdir(mode=0o700);(ambient/'config.json').write_text('{"credsStore":"sentinel-helper"}');os.environ['DOCKER_CONFIG']=str(ambient);calls=[];fail_run=False
+def fake_docker(command,**kwargs):
+ global fail_run
+ env=kwargs['env'];passed=pathlib.Path(env['DOCKER_CONFIG']);data=json.loads((passed/'config.json').read_text());mode=stat.S_IMODE(os.stat(passed).st_mode);filemode=stat.S_IMODE(os.stat(passed/'config.json').st_mode)
+ calls.append({'path':str(passed),'anonymous':data=={'auths':{'ghcr.io':{}}},'external':data=={'auths':{'ghcr.io':{'registrytoken':'fake-root-token'}}},'directoryMode':mode,'fileMode':filemode,'env':env})
+ if fail_run:raise RuntimeError('mocked docker failure')
+m.subprocess.run=fake_docker
+image='ghcr.io/blossomsai/menoteam-work-map@sha256:'+'b'*64;source='a'*40
+for action in (['pull','app'],['up','-d','app'],['up','-d','app']):m.run_compose(action,image,source)
+m.REGISTRY_CONFIG_DIR=root/'missing';m.run_compose(['pull','app'],image,source);success_path=pathlib.Path(calls[-1]['path']);success_gone=not success_path.exists();fail_run=True
+try:m.run_compose(['pull','app'],image,source)
+except RuntimeError:failure_caught=True
+failure_path=pathlib.Path(calls[-1]['path']);failure_gone=not failure_path.exists()
+m.REGISTRY_CONFIG_DIR=root/'menoteam-workbench-stage-registry'
+config.write_text(json.dumps({'auths':{'ghcr.io':{'registrytoken':'fake-root-token'}},'credsStore':'injected'}))
+try:m.registry_docker_config()
+except ValueError as error:shapeError=str(error)
+config.write_text(json.dumps({'auths':{'ghcr.io':{'registrytoken':'fake-root-token'}}}));os.chmod(config,0o644)
+try:m.registry_docker_config()
+except ValueError as error:modeError=str(error)
+os.chmod(config,0o600);real=config.with_name('real-config.json');config.rename(real);config.symlink_to(real)
+try:m.registry_docker_config()
+except ValueError as error:linkError=str(error)
+old_stdin=m.sys.stdin;m.sys.stdin=io.TextIOWrapper(io.BytesIO(json.dumps({'action':'deploy','operationId':'run_11111111-2222-3333-4444-555555555555','targetId':'staging','commitSha':'a'*40,'imageDigest':'sha256:'+'b'*64,'expectedCurrentDeploymentId':None,'dockerConfig':'/request/injected/path'}).encode()))
+try:m.parse_request()
+except ValueError as error:requestError=str(error)
+finally:m.sys.stdin=old_stdin
+print(json.dumps({'external':calls[:3],'anonymous':calls[3:],'successGone':success_gone,'failureGone':failure_gone,'failureCaught':failure_caught,'requestError':requestError,'shapeError':shapeError,'modeError':modeError,'linkError':linkError,'fixedConfig':str(root/'menoteam-workbench-stage-registry'),'ambient':str(ambient)}))
+`);
+    const external = result.external as Array<{ path: string; external: boolean; env: Record<string, string> }>;
+    const anonymous = result.anonymous as Array<{ path: string; anonymous: boolean; directoryMode: number; fileMode: number; env: Record<string, string> }>;
+    expect(external.map(call => call.path)).toEqual(Array(3).fill(result.fixedConfig));
+    expect(external.every(call => call.external && Object.keys(call.env).sort().join(',') === 'DOCKER_CONFIG,LANG,MENOTEAM_STAGING_IMAGE,MENOTEAM_STAGING_SOURCE_SHA,PATH')).toBe(true);
+    expect(anonymous).toHaveLength(2);
+    expect(anonymous.every(call => call.anonymous && call.directoryMode === 0o700 && call.fileMode === 0o600 && call.path.startsWith(`${result.fixedConfig.slice(0, result.fixedConfig.lastIndexOf('/'))}/menoteam-staging-registry-`) && call.path !== result.ambient && Object.keys(call.env).sort().join(',') === 'DOCKER_CONFIG,LANG,MENOTEAM_STAGING_IMAGE,MENOTEAM_STAGING_SOURCE_SHA,PATH')).toBe(true);
+    expect(result.successGone).toBe(true);
+    expect(result.failureGone).toBe(true);
+    expect(result.failureCaught).toBe(true);
+    expect(result.requestError).toContain('request schema');
+    expect(result.shapeError).toContain('schema is invalid');
+    expect(result.modeError).toContain('file is unsafe');
+    expect(result.linkError).toContain('file is unsafe');
   });
 
   it('keeps a failed first bootstrap offline and never removes its database volume', async () => {

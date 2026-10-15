@@ -1,11 +1,12 @@
 # Workbench staging runbook
 
 This runbook describes an additive, isolated staging deployment beside V1. It
-does not authorize a production-data export, a server change, a V1 change, or a
-user-facing cutover. Do not execute a remote mutation until the required
-authorization checks below are satisfied.
+does not itself authorize a server change, a V1 change, or a user-facing cutover.
+The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-15).
+The target is already provisioned as described there. This document records
+future operator instructions; this documentation update executed no operation.
 
-## Current backup prerequisite — verified 2026-10-14
+## Completed backup prerequisite — verified 2026-10-14
 
 The user granted specific production-data encrypted off-host backup and isolated
 restore authorization. One authorized operation completed: consistent custom
@@ -74,8 +75,11 @@ Keep staging files in a dedicated directory such as
 name `menoteam-workbench-stage`. Never run staging commands from the V1 Compose
 directory or omit `-p menoteam-workbench-stage`.
 
-Use a dedicated staging PostgreSQL service and a Compose-managed volume named
-`workbench_stage_pgdata` (Compose will namespace it under the staging project).
+For a new isolated target, use a dedicated staging PostgreSQL service and
+Compose key
+`stage_pgdata`, whose exact physical volume is
+`menoteam-workbench-stage_stage_pgdata`. The current target is already
+provisioned; do not apply initial-create steps to it blindly.
 Do not attach or mount `menoteam_menoteam-postgres` or
 `menoteam_menoteam-gateway`. The staging database name is
 `menoteam_workbench_stage`; its user and password are staging-only. Publish no
@@ -99,17 +103,22 @@ build. Record the digest and matching source revision in the deployment record.
 
 ## Staging deployment sequence
 
-1. Verify the explicit authorization and backup prerequisite; inspect disk,
-   memory, CPU, current containers, named volumes, active Caddy file, and
-   listener ports again. Confirm `:3200` is unused and that no staging
-   resources already exist under the chosen Compose project.
-2. Pull the approved candidate by exact digest. Review the dedicated Compose
+1. Verify current explicit authorization and the completed backup/restore receipt;
+   inspect disk, memory, CPU, containers, volumes, active Caddy file, and ports.
+   For this already-provisioned target, verify the exact owned container IDs,
+   configuration, capabilities, network, physical volume and DB health. Do not
+   require `:3200` to be unused, expect staging resources to be absent, or rerun
+   initial-create/bootstrap steps. The App is not yet started.
+2. After registry-read authorization, validate OCI provenance for the approved
+   immutable digest. Main workflow success by itself is not provenance validation.
+   Pull the approved candidate by exact digest. Review the dedicated Compose
    file and render its configuration with secrets redacted. Confirm its
    project name, staging-only database, unique named volume, loopback-only app
    bind, and absence of V1 mounts or ports.
-3. Start the staging database first; verify its database name and migration
-   state from inside that container. Start the app only after confirming its
-   effective database host/name point to the staging service. Check that the
+3. The existing isolated database is installed and healthy. Verify its exact
+   identity and migration state in place; do not recreate it. Start the App only
+   after separate authorization and confirming its effective DB host/name point
+   to this staging service. Check that the
    app is reachable on loopback `:3200` and not on a public interface.
 4. Before editing Caddy, make a root-readable, timestamped copy of
    `/etc/caddy/Caddyfile` outside the repository. Add only the staging site
@@ -143,12 +152,11 @@ volume, its data, and the failure evidence; do not run `down -v`, prune, or
 delete volumes. Record the outcome as `deploy failed / target offline`, not
 `rolled back` or `rollback verified`.
 
-This bootstrap exception applies only to a new, isolated staging target. It
-does not bypass the authorization or backup prerequisite in the preflight
-section: A15 remains blocked until the user explicitly authorizes the
-production-data export and destination and the required backup/restore proof
-is completed. Do not create the staging target while that prerequisite is
-unmet.
+This bootstrap exception applies only to a genuinely new isolated target. The
+current target is already provisioned and the backup/restore prerequisite is
+complete. Follow the already-provisioned preflight instead; historical export
+rejections remain point-in-time context and do not establish a permanent product
+rule or require another export.
 
 After the first version passes actual version, authentication, and user-flow
 verification, record its immutable digest and source SHA as the first verified
