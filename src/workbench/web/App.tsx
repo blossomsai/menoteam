@@ -285,8 +285,15 @@ function canBootstrapMaster(snapshot: Snapshot, projectId: string, messages: Mes
 
 function ProjectCard({ project, snapshot, setError, refresh }: { project: Project; snapshot: Snapshot; setError: (value: string) => void; refresh: () => Promise<void> }) {
   const { messages, loadOlder, hasOlder, loadingOlder } = useMessageHistory(project.id, undefined, false);
+  const [observedMessages, setObservedMessages] = useState<Message[]>([]);
+  useEffect(() => {
+    const incoming = snapshot.messages.filter(message => message.projectId === project.id && !message.workId);
+    if (!incoming.length) return;
+    // Keep snapshot updates for this mounted card even after global snapshot eviction.
+    setObservedMessages(current => [...new Map([...current, ...incoming].map(message => [message.id, message])).values()]);
+  }, [snapshot.messages, project.id]);
   const byId = new Map(messages.map(message => [message.id, message]));
-  snapshot.messages.filter(message => message.projectId === project.id && !message.workId).forEach(message => byId.set(message.id, message));
+  observedMessages.forEach(message => byId.set(message.id, message));
   const visibleMessages = [...byId.values()].sort(messageOrder);
   return <section className="flex h-[min(70vh,46rem)] min-h-[26rem] min-w-0 flex-col rounded-xl border bg-background p-4 md:p-5">
     <header className="mb-3 flex items-center justify-between gap-3"><div className="flex min-w-0 items-center gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-lg bg-accent font-semibold text-accent-foreground">{project.name.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><h2 className="truncate font-semibold">{project.name}</h2><a className="text-xs text-muted-foreground no-underline hover:underline" href={href('master', project.id)}>Open Master</a></div></div><Badge variant="outline">Project</Badge></header>

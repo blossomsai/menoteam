@@ -82,16 +82,87 @@ describe('All projects polling budget', () => {
     expect(host.textContent).not.toContain('wrong work');
     expect(host.textContent).not.toContain('other-0');
     expect(host.querySelectorAll('article')).toHaveLength(3);
-    // Even a later, stale history page cannot overwrite the snapshot's copy.
+    // Other scopes can evict every message for this project from the global snapshot.
+    vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...current, messages: Array.from({ length: 500 }, (_, i) => message(`evicting-${i}`, { projectId: 'other' })) });
+    await tick();
+    expect(host.textContent).toContain('snapshot wins');
+    expect(host.textContent).toContain('new snapshot message');
+    expect(host.textContent).toContain('ancient');
+    expect(host.textContent).not.toContain('evicting-0');
+    expect(host.querySelectorAll('article')).toHaveLength(3);
+    expect(older().disabled).toBe(false);
+    // Even a later, stale history page cannot overwrite the retained snapshot's copy.
     vi.mocked(workbenchApi.projectMessages).mockResolvedValueOnce({ messages: [message('existing'), message('oldest', { createdAt: '2019-01-01T00:00:00.000Z' })], nextBefore: null });
     await flush(() => older().click());
     expect(workbenchApi.projectMessages).toHaveBeenLastCalledWith(project.id, { before: 'page-3' });
     expect(host.textContent).toContain('snapshot wins');
+    expect(host.textContent).toContain('new snapshot message');
     expect(host.textContent).toContain('oldest');
     expect(host.textContent).toContain('ancient');
     expect(host.querySelectorAll('article')).toHaveLength(4);
     expect(older()).toBeUndefined();
   });
+});
+
+it('keeps observed messages in their project cards through reorder and clears them on card removal', async () => {
+  const otherProject = { ...project, id: 'other', name: 'Other' };
+  const current = { ...snapshot(), projects: [project, otherProject], messages: [message('project private'), message('other private', { projectId: 'other' }), message('work private', { workId: work.id })] };
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue(current);
+  await render();
+  const card = (name: string) => host.querySelector(`[aria-label="${name} conversation"]`)!;
+  expect(card('Project').textContent).toContain('project private');
+  expect(card('Project').textContent).not.toContain('other private');
+  expect(card('Project').textContent).not.toContain('work private');
+  expect(card('Other').textContent).toContain('other private');
+  expect(card('Other').textContent).not.toContain('project private');
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...current, projects: [otherProject, project], messages: [] });
+  await tick();
+  expect(card('Project').textContent).toContain('project private');
+  expect(card('Other').textContent).toContain('other private');
+  expect(card('Other').textContent).not.toContain('project private');
+  expect(workbenchApi.projectMessages).toHaveBeenCalledTimes(2);
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...current, projects: [otherProject], messages: [] });
+  await tick();
+  expect(host.textContent).not.toContain('project private');
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...current, messages: [] });
+  await tick();
+  expect(card('Project').textContent).not.toContain('project private');
+  expect(card('Other').textContent).toContain('other private');
+  expect(workbenchApi.projectMessages).toHaveBeenCalledTimes(3);
+});
+
+it.each(['same member', 'different member'])('discards retained card messages across logout/login for %s and fences the old snapshot', async identity => {
+  vi.spyOn(workbenchApi, 'logout').mockResolvedValue();
+  vi.spyOn(workbenchApi, 'login').mockResolvedValue({ authenticated: true });
+  vi.mocked(workbenchApi.projectMessages).mockResolvedValueOnce({ messages: [message('session history private')], nextBefore: null });
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...snapshot(), messages: [message('session snapshot private')] });
+  await render();
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue(snapshot());
+  await tick();
+  expect(host.textContent).toContain('session history private');
+  expect(host.textContent).toContain('session snapshot private');
+  const oldSnapshot = deferred<Snapshot>();
+  vi.mocked(workbenchApi.snapshot).mockReturnValueOnce(oldSnapshot.promise);
+  await tick();
+  await flush(() => host.querySelector<HTMLButtonElement>('aside > button')!.click());
+  expect(host.textContent).not.toContain('session snapshot private');
+  const nextMember = identity === 'same member' ? member : { ...member, id: 'next-member', name: 'Next member' };
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...snapshot(), member: nextMember });
+  await flush(() => {
+    for (const [selector, value] of [['#login-email', nextMember.email], ['#login-password', 'mock password']]) {
+      const input = host.querySelector<HTMLInputElement>(selector!)!;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  });
+  await flush(() => host.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+  expect(workbenchApi.login).toHaveBeenCalledExactlyOnceWith(nextMember.email, 'mock password');
+  expect(host.querySelector('[aria-label="Project conversation"]')).not.toBeNull();
+  await flush(() => oldSnapshot.resolve({ ...snapshot(), messages: [message('stale session snapshot private')] }));
+  expect(host.querySelectorAll('article')).toHaveLength(0);
+  expect(host.textContent).not.toContain('session snapshot private');
+  expect(host.textContent).not.toContain('session history private');
+  expect(workbenchApi.projectMessages).toHaveBeenCalledTimes(2);
 });
 
 it.each(['master', 'work-detail'])('keeps one focused %s poll, guards slow initial/incremental requests and preserves cursor overlap', async view => {
