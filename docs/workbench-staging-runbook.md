@@ -2,7 +2,7 @@
 
 This runbook describes an additive, isolated staging deployment beside V1. It
 does not itself authorize a server change, a V1 change, or a user-facing cutover.
-The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-16).
+The sole current status is in the [acceptance ledger authority](full-app-acceptance-ledger.md#current-delivery-and-staging-authority-2026-10-17).
 This document records
 future operator instructions; this documentation update executed no operation.
 
@@ -101,102 +101,64 @@ The candidate image must be selected by immutable registry digest
 (`image@sha256:...`), not `latest`, a mutable branch tag, or an unreviewed local
 build. Record the digest and matching source revision in the deployment record.
 
-## Staging deployment sequence
+## Current fixed-target deployment and rollback
 
-1. Verify current explicit authorization and the completed backup/restore receipt;
-   inspect disk, memory, CPU, containers, volumes, active Caddy file, and ports.
-   For this already-provisioned target, verify the exact owned container IDs,
-   configuration, capabilities, network, physical volume and DB health. Do not
-   require `:3200` to be unused, expect staging resources to be absent, or rerun
-   initial-create/bootstrap steps. The App is not yet started.
-2. After correct GitHub registry authentication is available, validate OCI provenance for the approved
-   immutable digest. Main workflow success by itself is not provenance validation.
-   Pull the approved candidate by exact digest. Review the dedicated Compose
-   file and render its configuration with secrets redacted. Confirm its
-   project name, staging-only database, unique named volume, loopback-only app
-   bind, and absence of V1 mounts or ports.
-3. The existing isolated database is installed and healthy. Verify its exact
-   identity and migration state in place; do not recreate it. Start the App only
-   after separate authorization and confirming its effective DB host/name point
-   to this staging service. Check that the
-   app is reachable on loopback `:3200` and not on a public interface.
-4. Before editing Caddy, make a root-readable, timestamped copy of
-   `/etc/caddy/Caddyfile` outside the repository. Add only the staging site
-   block. Validate the candidate config with
-   `caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile`; on any
-   validation error, restore the saved file and stop. After validation,
-   reload Caddy with `systemctl reload caddy` (do not restart it) and confirm
-   both existing sites still route to their original upstreams.
-5. Verify HTTPS and authentication on the staging hostname. Exercise the
-   staging database from the app, invite flow, project isolation, Work and
-   conversation persistence, connector enrollment/execution as authorized,
-   and V1 dashboard/MCP/Gateway routes. Health alone is insufficient. Keep
-   this candidate private to invited test identities; do not invite real team
-   members without separate authorization.
-6. Save the approved image digest, source revision, staging migration list,
-   before/after Caddy config checksums, service health, test evidence, and
-   rollback result without recording secret values or production record data.
+The isolated target is already provisioned and has completed normal A deploy,
+B deploy, and cross-Work rollback to A. The current remote is rolled-back A,
+not B or latest main. See the ledger for exact run, digest, source, retained
+state, and proof boundaries. These are Owner-attributed observations.
 
-## First isolated deployment: bootstrap failure handling
+For any separately authorized future candidate, use the normal Workbench
+deployment API/Work flow against the fixed target. Require that candidate's own
+verified merge/build provenance together with the current actor, policy, target
+authorization and target compare-and-swap (CAS); do not substitute a helper or
+manual host command. Verify terminal run state, exact immutable image/source,
+health, migration compatibility and post-deployment authenticated user flow.
+Health alone is not acceptance. On rollback from deployed B, invoke the normal
+target rollback flow: it must use prior A's immutable source/build provenance
+while preserving current deployed-B actor, policy, target authorization and
+target CAS. Preserve the physical staging volume and data; never reverse
+migrations automatically or use `down -v`/prune. Confirm V1 services and routes
+remain intact after the terminal result.
 
-The first isolated staging deployment has no previously verified Workbench
-image to roll back to. Record this explicitly as `previousVersion: null` before
-starting; do not invent a rollback target or describe bootstrap cleanup as a
-version rollback.
+The initial bootstrap and manual Caddy/Compose procedures below are historical
+contingency guidance only. They are not the current deployment or rollback
+path and are not evidence that those manual steps were performed. The actual
+rollback left Caddy unchanged. Keep the physical volume
+`menoteam-workbench-stage_stage_pgdata` (Compose key `stage_pgdata`) and
+migrations 001–008; do not recreate the target or database.
 
-If the first deployment fails verification, remove only the newly added staging
-Caddy route, validate the restored configuration, and reload Caddy. Confirm
-that the V1 and Gateway routes still use their original upstreams, then stop
-the staging app and leave the target offline. Preserve the staging database
-volume, its data, and the failure evidence; do not run `down -v`, prune, or
-delete volumes. Record the outcome as `deploy failed / target offline`, not
-`rolled back` or `rollback verified`.
-
-This bootstrap exception applies only to a genuinely new isolated target. The
-current target is already provisioned and the backup/restore prerequisite is
-complete. Follow the already-provisioned preflight instead; historical export
-rejections remain point-in-time context and do not establish a permanent product
-rule or require another export.
-
-After the first version passes actual version, authentication, and user-flow
-verification, record its immutable digest and source SHA as the first verified
-version. A later candidate can then use that version as its rollback target.
-
-## Subsequent version rollback sequence
-
-Rollback is an app/config operation. Do not delete either database volume and
-do not reverse applied migrations automatically.
-
-1. Stop traffic to staging by restoring the pre-change Caddyfile copy (or
-   removing only the staging site block), then validate it and run
-   `systemctl reload caddy`. Confirm the V1 and Gateway sites still point to
-   `127.0.0.1:3000` and `127.0.0.1:3100`.
-2. For a deployment after bootstrap, recreate the staging app using the
-   previously recorded, verified image
-   digest with `docker compose -p menoteam-workbench-stage -f
-   /opt/menoteam/workbench-stage/compose.yml up -d app`. Do not use `latest`.
-   If the prior staging image is not available, leave staging offline rather
-   than guessing a version.
-3. Confirm the staging app/database health and migration compatibility, then
-   verify V1 app, V1 database, Gateway, and both existing HTTPS routes. Do not
-   point either app to the other's database as a rollback shortcut.
-4. Keep the staging volume and database until evidence has been preserved and
-   a separately authorized cleanup is approved. Never run `down -v`, prune
-   volumes, or remove the V1 project/volumes as part of staging rollback.
-
-Before enabling version rollback as a release capability, perform a second
-isolated deployment and drill switching back to the first verified digest.
-Verify the service reports that exact digest/source SHA and that persisted
-staging data and a representative authenticated Work flow still work. This is
-the first real version-rollback proof; first-deployment bootstrap cleanup does
-not count.
+The older bootstrap-failure and manual Caddy removal/Compose rollback
+instructions are retained below as historical contingency context. They apply
+only to a genuinely new target or a separately authorized emergency procedure,
+not this provisioned target's normal API-controlled release flow.
 
 Schema changes must remain additive and backward-compatible while V1 remains
-live. If a candidate migration is not compatible with its previous app
-revision, deployment is blocked until an isolated rollback drill demonstrates
-a safe recovery. A future user-facing cutover requires a separate explicit
-authorization and is outside this runbook.
+live. A candidate migration incompatible with its previous app revision blocks
+deployment until an isolated rollback drill demonstrates safe recovery. A
+user-facing cutover requires separate explicit authorization.
 
+## Historical first isolated deployment: bootstrap failure handling
+
+The following procedure describes the earlier first-deployment contingency; it
+does not describe the current provisioned target, which has an active App and a
+verified prior image. For a genuinely new isolated target only, no prior image
+exists: record `previousVersion: null`, and do not call cleanup a version
+rollback. If such a first deployment fails verification, remove only its added
+Caddy route, validate and reload Caddy, preserve the staging database volume and
+failure evidence, and record `deploy failed / target offline`. The current
+target state and actual A/B/rollback evidence are in the ledger.
+
+## Historical manual rollback contingency
+
+The following host-level steps are retained as contingency documentation and
+were not the current rollback execution. Normal rollback uses the Workbench
+target rollback flow described above. If a separately authorized emergency
+requires manual host recovery, restore only the saved staging Caddy route
+configuration, validate/reload Caddy, then recreate the app from the previously
+verified immutable digest using the dedicated Compose project. Preserve the
+staging volume, do not reverse migrations, and verify V1 routes. Never use
+`latest`, `down -v`, or volume pruning.
 
 ## Local isolated Work dependency readiness
 
