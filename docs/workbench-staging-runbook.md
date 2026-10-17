@@ -109,14 +109,15 @@ not B or latest main. See the ledger for exact run, digest, source, retained
 state, and proof boundaries. These are Owner-attributed observations.
 
 For any separately authorized future candidate, use the normal Workbench
-deployment API/Work flow against the fixed target. Require the immutable A
-source/build provenance and current B actor, policy, target authorization and
-compare-and-swap check; do not substitute a helper or manual host command.
-Verify terminal run state, exact immutable image/source, health, migration
-compatibility and post-deployment authenticated user flow. Health alone is not
-acceptance. On rollback, invoke the normal target rollback flow: it must derive
-the prior image's immutable provenance while preserving current authorization
-and target CAS. Preserve the physical staging volume and data; never reverse
+deployment API/Work flow against the fixed target. Require that candidate's own
+verified merge/build provenance together with the current actor, policy, target
+authorization and target compare-and-swap (CAS); do not substitute a helper or
+manual host command. Verify terminal run state, exact immutable image/source,
+health, migration compatibility and post-deployment authenticated user flow.
+Health alone is not acceptance. On rollback from deployed B, invoke the normal
+target rollback flow: it must use prior A's immutable source/build provenance
+while preserving current deployed-B actor, policy, target authorization and
+target CAS. Preserve the physical staging volume and data; never reverse
 migrations automatically or use `down -v`/prune. Confirm V1 services and routes
 remain intact after the terminal result.
 
