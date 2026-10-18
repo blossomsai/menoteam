@@ -1,11 +1,11 @@
 // @vitest-environment happy-dom
 import { qaPolicyFixture, requiredQaFixture } from './helpers/local-qa-fixture';
-import { createElement, act } from 'react';
+import { createElement, act, StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
-import { workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { ApiError, workbenchApi, type Snapshot } from '../src/workbench/web/api';
 
 const owner = { id: 'owner', email: 'owner@example.test', name: 'Owner', role: 'owner' as const };
 const admin = { ...owner, id: 'admin', email: 'admin@example.test', role: 'admin' as const };
@@ -34,12 +34,12 @@ function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) 
 let root: Root;
 let host: HTMLDivElement;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
-async function mount(current: Snapshot) {
+async function mount(current: Snapshot, strictMode = false) {
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(current.member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(current);
   vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [], nextBefore: null });
   vi.spyOn(workbenchApi, 'projectMembers').mockResolvedValue({ members: [current.member] });
-  await flush(() => root.render(createElement(App)));
+  await flush(() => root.render(strictMode ? createElement(StrictMode, null, createElement(App)) : createElement(App)));
 }
 function button(label: string) {
   const found = [...host.querySelectorAll('button')].find(item => item.textContent?.trim() === label || item.getAttribute('aria-label') === label);
@@ -140,6 +140,177 @@ it('falls back to Agent when a saved Work profile is unavailable', async () => {
   expect(composer?.getAttribute('aria-label')).toBe('Message Agent');
   expect(composer?.placeholder).toBe('Message Agent…');
   expect(composer?.outerHTML).not.toContain(profileId);
+});
+
+describe('mounted Work overview editor', () => {
+  function overviewSnapshot(overview='old',revision=7) {
+    const current=snapshot();
+    current.works=[{id:'overview-work',projectId:project.id,title:'Overview Work',overview,status:'in_progress',revision,profileId:'',sources:[],createdAt:'',updatedAt:''}];
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=overview-work`);
+    return current;
+  }
+
+  it('saves exact text and frozen revision, while Cancel makes no mutation', async () => {
+    const current=overviewSnapshot('first');
+    const update=vi.spyOn(workbenchApi,'updateWork').mockImplementation(async (_id,input)=>({...current.works[0]!,overview:input.overview??'',revision:8}));
+    await mount(current);
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','line one\n\nline two');
+    await flush(()=>button('Cancel').click());
+    expect(update).not.toHaveBeenCalled();
+    expect(host.textContent).toContain('first');
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','line one\n\nline two');
+    await flush(()=>button('Save').click());
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledWith('overview-work',{revision:7,overview:'line one\n\nline two'});
+    expect(host.textContent).toContain('line one');
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','');
+    await flush(()=>button('Save').click());
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls[1]).toEqual(['overview-work',{revision:8,overview:''}]);
+  });
+
+  it('blocks duplicate pending saves', async () => {
+    const current=overviewSnapshot();
+    const pending=deferred<Awaited<ReturnType<typeof workbenchApi.updateWork>>>();
+    const update=vi.spyOn(workbenchApi,'updateWork').mockReturnValue(pending.promise);
+    await mount(current);
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','my draft');
+    await flush(()=>button('Save').click());
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(button('Saving…').disabled).toBe(true);
+    expect(host.querySelector('textarea')?.disabled).toBe(true);
+    pending.resolve({...current.works[0]!,overview:'my draft',revision:8});
+    await flush();
+    expect(host.textContent).toContain('my draft');
+  });
+
+  it('retains a 409 draft until explicitly using latest and retrying with its revision', async () => {
+    const current=overviewSnapshot();
+    await mount(current);
+    const latest={...current,works:[{...current.works[0]!,overview:'other writer',revision:8}]};
+    vi.spyOn(workbenchApi,'snapshot').mockResolvedValue(latest);
+    const update=vi.spyOn(workbenchApi,'updateWork').mockRejectedValueOnce(new ApiError('Conflict',409)).mockResolvedValueOnce({...latest.works[0]!,overview:'my draft',revision:9});
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','my draft');
+    await flush(()=>button('Save').click());
+    await flush();
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toContain('Work changed elsewhere');
+    expect(host.textContent).toContain('other writer');
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('my draft');
+    await flush(()=>button('Use latest').click());
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('other writer');
+    await type('textarea#work-overview-overview-work','my draft');
+    await flush(()=>button('Save').click());
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(update.mock.calls[1]).toEqual(['overview-work',{revision:8,overview:'my draft'}]);
+  });
+
+  it('shows the latest polled revision without replacing a dirty draft', async () => {
+    const current=overviewSnapshot();
+    await mount(current);
+    const latest={...current,works:[{...current.works[0]!,overview:'poll update',revision:8}]};
+    vi.spyOn(workbenchApi,'snapshot').mockResolvedValue(latest);
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','my draft');
+    await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
+    expect(host.textContent).toContain('Work changed elsewhere');
+    expect(host.textContent).toContain('poll update');
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('my draft');
+    expect(button('Save').disabled).toBe(true);
+  });
+
+  it('keeps the editor draft after a failed request', async () => {
+    const current=overviewSnapshot();
+    await mount(current);
+    vi.spyOn(workbenchApi,'updateWork').mockRejectedValue(new Error('Network unavailable'));
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','retained draft');
+    await flush(()=>button('Save').click());
+    await flush();
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('retained draft');
+    expect(host.textContent).toContain('Network unavailable');
+    expect(button('Save').disabled).toBe(false);
+  });
+
+  it('ignores a late save response after switching Work scope', async () => {
+    const current=overviewSnapshot();
+    current.works.push({...current.works[0]!,id:'next-work',title:'Next Work',overview:'next overview'});
+    const pending=deferred<Awaited<ReturnType<typeof workbenchApi.updateWork>>>();
+    vi.spyOn(workbenchApi,'updateWork').mockReturnValue(pending.promise);
+    await mount(current);
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','old private draft');
+    await flush(()=>button('Save').click());
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=next-work`);
+    await flush(()=>root.render(createElement(App)));
+    pending.resolve({...current.works[0]!,overview:'old private draft',revision:8});
+    await flush();
+    expect(host.textContent).toContain('next overview');
+    expect(host.textContent).not.toContain('old private draft');
+  });
+
+  it('handles PATCH success under StrictMode and preserves conversation state', async () => {
+    const current=overviewSnapshot();
+    current.messages=[{id:'existing-message',projectId:project.id,workId:'overview-work',speaker:'Agent',role:'agent',text:'Existing conversation message',createdAt:''}];
+    sessionStorage.setItem('menoteam-workbench:draft:owner:project:overview-work','composer draft');
+    const send=vi.spyOn(workbenchApi,'sendMessage');
+    const pending=deferred<Awaited<ReturnType<typeof workbenchApi.updateWork>>>();
+    vi.spyOn(workbenchApi,'updateWork').mockReturnValue(pending.promise);
+    await mount(current,true);
+    const assertConversation=()=>{
+      expect(host.textContent).toContain('Existing conversation message');
+      expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Agent"]')?.value).toBe('composer draft');
+    };
+    await flush(()=>button('Edit').click());
+    assertConversation();
+    await type('textarea#work-overview-overview-work','saved overview');
+    await flush(()=>button('Save').click());
+    expect(button('Saving…').disabled).toBe(true);
+    assertConversation();
+    pending.resolve({...current.works[0]!,overview:'saved overview',revision:8});
+    await flush();
+    expect(button('Edit')).toBeTruthy();
+    expect(host.textContent).toContain('saved overview');
+    assertConversation();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('releases failed PATCH under StrictMode, retains draft and permits explicit retry', async () => {
+    const current=overviewSnapshot();
+    current.messages=[{id:'existing-message',projectId:project.id,workId:'overview-work',speaker:'Agent',role:'agent',text:'Existing conversation message',createdAt:''}];
+    sessionStorage.setItem('menoteam-workbench:draft:owner:project:overview-work','composer draft');
+    const send=vi.spyOn(workbenchApi,'sendMessage');
+    const update=vi.spyOn(workbenchApi,'updateWork')
+      .mockRejectedValueOnce(new Error('PATCH failed'))
+      .mockResolvedValueOnce({...current.works[0]!,overview:'retry draft',revision:8});
+    await mount(current,true);
+    const assertConversation=()=>{
+      expect(host.textContent).toContain('Existing conversation message');
+      expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Agent"]')?.value).toBe('composer draft');
+    };
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','retry draft');
+    assertConversation();
+    await flush(()=>button('Save').click());
+    await flush();
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('retry draft');
+    expect(host.textContent).toContain('PATCH failed');
+    expect(button('Save').disabled).toBe(false);
+    assertConversation();
+    await flush(()=>button('Save').click());
+    await flush();
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(button('Edit')).toBeTruthy();
+    expect(host.textContent).toContain('retry draft');
+    assertConversation();
+    expect(send).not.toHaveBeenCalled();
+  });
 });
 
 describe('mounted marketplace skill selection', () => {
