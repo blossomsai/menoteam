@@ -473,7 +473,7 @@ function WorkProfileSelector({ work, project, snapshot, refresh, setError }: { w
 function WorkOverviewEditor({work,refresh}:{work:Work;refresh:()=>Promise<void>}) {
   const [editing,setEditing]=useState(false),[draft,setDraft]=useState(''),[baseRevision,setBaseRevision]=useState(work.revision),[busy,setBusy]=useState(false),[conflict,setConflict]=useState(false),[error,setError]=useState(''),[saved,setSaved]=useState<{revision:number;overview:string}|null>(null);
   const active=useRef(true),saving=useRef(false);
-  useEffect(()=>()=>{active.current=false;},[]);
+  useEffect(()=>{active.current=true;return()=>{active.current=false;};},[]);
   const changed=editing&&(conflict||work.revision>baseRevision);
   const currentRevision=saved&&saved.revision>work.revision?saved.revision:work.revision;
   const currentOverview=saved&&saved.revision>work.revision?saved.overview:work.overview;

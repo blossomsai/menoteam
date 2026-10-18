@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { qaPolicyFixture, requiredQaFixture } from './helpers/local-qa-fixture';
-import { createElement, act } from 'react';
+import { createElement, act, StrictMode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -34,12 +34,12 @@ function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) 
 let root: Root;
 let host: HTMLDivElement;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
-async function mount(current: Snapshot) {
+async function mount(current: Snapshot, strictMode = false) {
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(current.member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(current);
   vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [], nextBefore: null });
   vi.spyOn(workbenchApi, 'projectMembers').mockResolvedValue({ members: [current.member] });
-  await flush(() => root.render(createElement(App)));
+  await flush(() => root.render(strictMode ? createElement(StrictMode, null, createElement(App)) : createElement(App)));
 }
 function button(label: string) {
   const found = [...host.querySelectorAll('button')].find(item => item.textContent?.trim() === label || item.getAttribute('aria-label') === label);
@@ -252,6 +252,64 @@ describe('mounted Work overview editor', () => {
     await flush();
     expect(host.textContent).toContain('next overview');
     expect(host.textContent).not.toContain('old private draft');
+  });
+
+  it('handles PATCH success under StrictMode and preserves conversation state', async () => {
+    const current=overviewSnapshot();
+    current.messages=[{id:'existing-message',projectId:project.id,workId:'overview-work',speaker:'Agent',role:'agent',text:'Existing conversation message',createdAt:''}];
+    sessionStorage.setItem('menoteam-workbench:draft:owner:project:overview-work','composer draft');
+    const send=vi.spyOn(workbenchApi,'sendMessage');
+    const pending=deferred<Awaited<ReturnType<typeof workbenchApi.updateWork>>>();
+    vi.spyOn(workbenchApi,'updateWork').mockReturnValue(pending.promise);
+    await mount(current,true);
+    const assertConversation=()=>{
+      expect(host.textContent).toContain('Existing conversation message');
+      expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Agent"]')?.value).toBe('composer draft');
+    };
+    await flush(()=>button('Edit').click());
+    assertConversation();
+    await type('textarea#work-overview-overview-work','saved overview');
+    await flush(()=>button('Save').click());
+    expect(button('Saving…').disabled).toBe(true);
+    assertConversation();
+    pending.resolve({...current.works[0]!,overview:'saved overview',revision:8});
+    await flush();
+    expect(button('Edit')).toBeTruthy();
+    expect(host.textContent).toContain('saved overview');
+    assertConversation();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('releases failed PATCH under StrictMode, retains draft and permits explicit retry', async () => {
+    const current=overviewSnapshot();
+    current.messages=[{id:'existing-message',projectId:project.id,workId:'overview-work',speaker:'Agent',role:'agent',text:'Existing conversation message',createdAt:''}];
+    sessionStorage.setItem('menoteam-workbench:draft:owner:project:overview-work','composer draft');
+    const send=vi.spyOn(workbenchApi,'sendMessage');
+    const update=vi.spyOn(workbenchApi,'updateWork')
+      .mockRejectedValueOnce(new Error('PATCH failed'))
+      .mockResolvedValueOnce({...current.works[0]!,overview:'retry draft',revision:8});
+    await mount(current,true);
+    const assertConversation=()=>{
+      expect(host.textContent).toContain('Existing conversation message');
+      expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Agent"]')?.value).toBe('composer draft');
+    };
+    await flush(()=>button('Edit').click());
+    await type('textarea#work-overview-overview-work','retry draft');
+    assertConversation();
+    await flush(()=>button('Save').click());
+    await flush();
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(host.querySelector<HTMLTextAreaElement>('textarea')?.value).toBe('retry draft');
+    expect(host.textContent).toContain('PATCH failed');
+    expect(button('Save').disabled).toBe(false);
+    assertConversation();
+    await flush(()=>button('Save').click());
+    await flush();
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(button('Edit')).toBeTruthy();
+    expect(host.textContent).toContain('retry draft');
+    assertConversation();
+    expect(send).not.toHaveBeenCalled();
   });
 });
 
