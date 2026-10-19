@@ -1152,7 +1152,8 @@ describe('delivery action and narrow breadcrumb UI',()=>{
     expect(links[0]?.getAttribute('aria-label')).toBe(projectName);expect(links[0]?.title).toBe(projectName);
     expect(links[0]?.className).toContain('truncate');expect(links[0]?.className).toContain('basis-[38%]');expect(links[0]?.className).toContain('shrink-0');expect(links[0]?.className).toContain('sm:basis-auto');
     const workLink=links[1]!;expect(workLink.textContent).toBe('Work');expect(workLink.getAttribute('href')).toContain(`view=work&project=${project.id}`);
-    const currentLabel=nav.querySelector('strong')!;expect(currentLabel.textContent).toBe(workTitle);expect(currentLabel.title).toBe(workTitle);expect(currentLabel.className).toContain('min-w-16');expect(currentLabel.className).toContain('flex-1');expect(currentLabel.className).toContain('truncate');
+    const currentLabel=nav.querySelector('strong')!;expect(currentLabel.textContent).toBe('Work detail');expect(currentLabel.getAttribute('aria-label')).toBe(workTitle);expect(currentLabel.title).toBe(workTitle);expect(currentLabel.className).toContain('min-w-16');expect(currentLabel.className).toContain('flex-1');expect(currentLabel.className).toContain('truncate');
+    expect(host.querySelectorAll('h1')).toHaveLength(1);expect(host.querySelector('h1')?.textContent).toBe(workTitle);
   });
 });
 
