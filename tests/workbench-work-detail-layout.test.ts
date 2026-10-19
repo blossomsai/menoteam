@@ -53,7 +53,10 @@ describe('mounted Work detail layout', () => {
     expect(rightPane.className).toContain('xl:border-l');
     expect(rightPane.className).toContain('border-border');
     expect([...host.querySelectorAll('nav[aria-label="Work details"] a')].map(link => link.textContent)).toEqual(['overview', 'changes', 'QA']);
-    expect([...host.querySelectorAll('h1')].map(heading => heading.textContent)).not.toContain(work.title);
+    const headings = [...host.querySelectorAll('h1')];
+    expect(headings).toHaveLength(1);
+    expect(headings[0]?.textContent).toBe(work.title);
+    expect(host.querySelector('[aria-label="Breadcrumb"]')?.textContent).not.toContain(work.title);
   });
 
   it('preserves the keyed Work conversation, scoped draft, message identity and usable composer', async () => {
@@ -62,11 +65,22 @@ describe('mounted Work detail layout', () => {
     expect(host.textContent).toContain(message.text);
     expect(host.querySelector('[aria-label="Work details"]')).not.toBeNull();
     const composer = host.querySelector<HTMLInputElement>(`input[aria-label="Message Agent"]`)!;
+    const existingMessage = [...host.querySelectorAll('article')].find(article => article.textContent?.includes(message.text));
+    expect(existingMessage).toBeDefined();
     expect(composer.value).toBe('Draft survives layout');
     expect(composer.className).toContain('min-w-0');
-    expect(composer.className).toContain('flex-1');
+    expect(composer.className).toContain('w-full');
     expect(host.querySelector('[aria-label="Send message"]')).not.toBeNull();
-    expect(current.messages[0]?.id).toBe(message.id);
     expect(sessionStorage.getItem(`menoteam-workbench:draft:${member.id}:${project.id}:${work.id}`)).toBe('Draft survives layout');
+
+    const laterMessage = { ...message, id: 'later-message', text: 'A later polled message.', createdAt: '2026-10-19T02:00:02.000Z' };
+    vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...current, messages: [message, laterMessage] });
+    vi.mocked(workbenchApi.projectMessages).mockResolvedValue({ messages: [message, laterMessage], nextBefore: null });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+
+    expect(host.textContent).toContain(laterMessage.text);
+    expect([...host.querySelectorAll('article')].find(article => article.textContent?.includes(message.text))).toBe(existingMessage);
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="Message Agent"]`)).toBe(composer);
+    expect(composer.value).toBe('Draft survives layout');
   });
 });
