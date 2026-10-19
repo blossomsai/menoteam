@@ -3,7 +3,7 @@ import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
-import { workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot } from '../src/workbench/web/api';
 import type { Message } from '../src/workbench/types';
 
 const member = { id: 'owner', name: 'Owner', email: 'owner@example.test', role: 'owner' as const };
@@ -29,6 +29,7 @@ async function render(route = '/workbench/?view=all') {
 function older() { return [...host.querySelectorAll('button')].find(button => button.textContent === 'Load earlier messages')!; }
 
 beforeEach(() => {
+  resetRateLimitCooldown();
   vi.useFakeTimers();
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected live fetch'); }));
@@ -42,8 +43,75 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await flush(() => root.unmount()); host.remove();
-  expect(fetch).not.toHaveBeenCalled();
-  vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
+  if (host.dataset.realApiTest !== 'true') expect(fetch).not.toHaveBeenCalled();
+  resetRateLimitCooldown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
+});
+
+it('shares a real API 429 cooldown between snapshot and focused history pollers', async () => {
+  host.dataset.realApiTest = 'true';
+  const diff = { id: 'diff-cooldown', projectId: project.id, workId: work.id, runId: 'candidate-cooldown', kind: 'diff' as const, revision: 'revision-cooldown', createdAt: '', data: { candidateRevision: 'candidate-cooldown-sha', files: [], totalFiles: 0, truncated: false } };
+  const diffMetadata = { ...diff, data: undefined };
+  const candidate = { id: diff.runId, projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: '', model: 'gpt-6-luna', reasoning: 'medium' as const, status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
+  const reviewBinding={candidateRunId:diff.runId,commitSha:'candidate-cooldown-sha',candidateFingerprint:'a'.repeat(64),diffArtifactId:diff.id,diffRevision:diff.revision,qaArtifactIds:['qa-cooldown']};
+  const review={id:'review-cooldown',projectId:project.id,workId:work.id,kind:'review' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'',updatedAt:'',reviewBinding} as Snapshot['runs'][number];
+  const qa={id:'qa-cooldown',projectId:project.id,workId:work.id,runId:review.id,kind:'qa' as const,revision:diff.revision,createdAt:'',data:{typedReview:{...reviewBinding,reviewerRunId:review.id,disposition:'approved',findings:[]}}};
+  const qaMetadata={id:qa.id,projectId:qa.projectId,workId:qa.workId,runId:qa.runId,kind:qa.kind,revision:qa.revision,createdAt:qa.createdAt};
+  const workSnapshot = { ...snapshot(), works: [work], messages: [message('snapshot retained', { workId: work.id })], runs: [candidate,review], artifacts: [diffMetadata,qaMetadata] };
+  vi.spyOn(workbenchApi, 'me').mockRestore();
+  vi.spyOn(workbenchApi, 'snapshot').mockRestore();
+  vi.spyOn(workbenchApi, 'projectMessages').mockRestore();
+  let snapshotCalls = 0, historyCalls = 0, artifactCalls = 0;
+  let sendMessage: ReturnType<typeof vi.spyOn>;
+  vi.spyOn(workbenchApi, 'artifact').mockRestore();
+  sendMessage = vi.spyOn(workbenchApi, 'sendMessage');
+  sessionStorage.setItem('menoteam-workbench:draft:owner:project:work', 'saved composer draft');
+  const calls: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const path = String(input); calls.push(path);
+    if (path.endsWith('/me')) return Response.json(member);
+    if (path.endsWith('/snapshot')) {
+      snapshotCalls++;
+      if (snapshotCalls === 2) return new Response(JSON.stringify({ message: 'Rate limited' }), { status: 429, headers: { 'Retry-After': '6' } });
+      return Response.json(workSnapshot);
+    }
+    if (path.includes('/messages')) {
+      historyCalls++;
+      return Response.json({ messages: [message('retained history', { workId: work.id })], nextBefore: null });
+    }
+    if (path.includes('/artifacts/')) {
+      artifactCalls++;
+      return Response.json(path.includes(qa.id)?qa:diff);
+    }
+    throw new Error(`Unexpected API path ${path}`);
+  }));
+  await render(`/workbench/?view=work-detail&project=${project.id}&work=${work.id}&tab=qa`);
+  await flush();
+  expect(snapshotCalls).toBe(1);
+  expect(historyCalls).toBe(1);
+  expect(artifactCalls).toBe(2);
+  expect(host.textContent).toContain('retained history');
+  expect(host.textContent).toContain('candidate-cooldown-sha');
+  expect(host.querySelector<HTMLInputElement>('[aria-label="Message Agent"]')?.value).toBe('saved composer draft');
+  await tick();
+  expect(snapshotCalls).toBe(2);
+  expect(canAutoPoll()).toBe(false);
+  expect(host.textContent).toContain('Rate limited');
+  const snapshotCount = snapshotCalls, historyCount = historyCalls;
+  await tick(2);
+  expect(snapshotCalls).toBe(snapshotCount);
+  expect(historyCalls).toBe(historyCount);
+  await tick();
+  expect(snapshotCalls).toBe(snapshotCount + 1);
+  expect(historyCalls).toBe(historyCount + 1);
+  expect(canAutoPoll()).toBe(true);
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+  expect(host.textContent).toContain('retained history');
+  expect(host.querySelector<HTMLInputElement>('[aria-label="Message Agent"]')?.value).toBe('saved composer draft');
+  expect(host.textContent).toContain('candidate-cooldown-sha');
+  expect(host.textContent).toContain('Current evidence');
+  expect(artifactCalls).toBe(2);
+  expect(sendMessage).not.toHaveBeenCalled();
+  expect(calls.filter(path => path.includes('/messages')).length).toBe(historyCalls);
 });
 
 describe('All projects polling budget', () => {
