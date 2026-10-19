@@ -846,6 +846,55 @@ describe('mounted provider connection settings', () => {
     expect(workbenchApi.diffFile).not.toHaveBeenCalled();
   });
 
+  it('leads Changes with file paths and LOC, while keeping every delivery receipt closed by default',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Changes hierarchy',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const candidate={id:'candidate-run',projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6-luna',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'};
+    const delivery={id:'delivery-run',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'gpt-6-luna',reasoning:'medium' as const,status:'completed' as const,generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',operation:{action:'create_draft_pr' as const,phase:'pr_created' as const,external:{pullRequestNumber:42,pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/42'}}} as Snapshot['runs'][number];
+    const diff={id:'diff-hierarchy',projectId:project.id,workId:work.id,runId:candidate.id,kind:'diff' as const,revision:'diff-revision',createdAt:'2026-10-06',data:{baseRevision:'base-sha',additions:5,deletions:2,totalFiles:2,truncated:false,files:[{path:'src/first.ts',status:'modified',binary:false,additions:3,deletions:1,hunks:[]},{path:'tests/second.test.ts',status:'modified',binary:false,additions:2,deletions:1,hunks:[]}]}};
+    const firstReceipt={id:'receipt-pr',projectId:project.id,workId:work.id,runId:delivery.id,kind:'delivery' as const,revision:'receipt-revision-pr',createdAt:'2026-10-06T10:00:00.000Z',data:{action:'create_draft_pr',phase:'pr_created',pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/42',commitSha:'candidate-sha'}};
+    const secondReceipt={...firstReceipt,id:'receipt-merge',revision:'receipt-revision-merge',createdAt:'2026-10-06T11:00:00.000Z',data:{action:'merge_pr',phase:'merge_intent',commitSha:'candidate-sha',operationId:'merge-operation-exact'}};
+    const current=snapshot();current.works=[work];current.runs=[candidate,delivery];current.artifacts=[diff,firstReceipt,secondReceipt];
+    vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id==='receipt-pr'?firstReceipt as never:secondReceipt as never);
+    await mount(current);await flush();
+    const changes=[...host.querySelectorAll('section')].find(section=>section.querySelector('h2')?.textContent==='Changes')!;
+    expect(changes.textContent).toContain('Showing 2 of 2 changed files');expect(changes.textContent).toContain('+5');expect(changes.textContent).toContain('−2');
+    const fileRows=[...changes.querySelectorAll('details')].filter(item=>item.querySelector('summary')?.textContent?.includes('src/first.ts')||item.querySelector('summary')?.textContent?.includes('tests/second.test.ts'));
+    expect(fileRows).toHaveLength(2);expect(fileRows.every(item=>!item.open)).toBe(true);
+    expect(fileRows.map(item=>item.querySelector('summary')?.textContent)).toEqual(expect.arrayContaining([expect.stringContaining('src/first.ts'),expect.stringContaining('tests/second.test.ts')]));
+    const history=[...changes.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.startsWith('Delivery history'))!;
+    expect(history.open).toBe(false);expect(history.querySelector('summary')?.textContent).toContain('2 receipts');
+    const relatedPr=changes.querySelector<HTMLAnchorElement>('a[href="https://github.com/blossomsai/menoteam/pull/42"]');
+    expect(relatedPr?.textContent).toBe('Related pull request');
+    expect(host.querySelectorAll('h1')).toHaveLength(1);
+    await flush(()=>{history.open=true;});await flush();
+    expect(history.textContent).toContain('pr created');expect(history.textContent).toContain('merge intent');expect(history.textContent).toContain('merge-operation-exact');
+  });
+
+  it('keeps the mounted Work conversation and unsent composer through a tab change and snapshot update',async()=>{
+    const work={id:'conversation-work',projectId:project.id,title:'Conversation identity',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const current=snapshot();current.works=[work];current.messages=[{id:'message-stable',projectId:project.id,workId:work.id,speaker:'Agent',role:'agent',text:'Stable message node',createdAt:''}];
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    const send=vi.spyOn(workbenchApi,'sendMessage'),create=vi.spyOn(workbenchApi,'createWork');
+    await mount(current);
+    const composer=host.querySelector<HTMLInputElement>('input[aria-label="Message Agent"]')!;
+    await typeInput(composer,'unsent draft survives');
+    const message=[...host.querySelectorAll('article')].find(item=>item.textContent?.includes('Stable message node'))!;
+    const next=freshClone(current);next.runs=[{id:'implementation-update',projectId:project.id,workId:work.id,kind:'implementation',prompt:'',model:'gpt-6-luna',reasoning:'medium',status:'completed',generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'},{id:'delivery-update',projectId:project.id,workId:work.id,targetRunId:'implementation-update',kind:'delivery',prompt:'',model:'internal',reasoning:'none',status:'failed',generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',operation:{action:'create_draft_pr',actorId:owner.id,candidateRunId:'implementation-update',candidateRevision:'revision',artifactRevision:'revision',commitSha:'sha',candidateFingerprint:'fingerprint',repositoryUrl:'',baseRevision:'base',baseBranch:'main',remoteBranch:'branch',workTitle:work.title,changeSummary:'',qaStatus:'unknown',phase:'published'}}];
+    next.artifacts=[{id:'change-update',projectId:project.id,workId:work.id,runId:'implementation-update',kind:'diff',revision:'revision',createdAt:'2026-10-06',data:{baseRevision:'base',candidateRevision:'revision',files:[],totalFiles:0,truncated:false}}];
+    vi.mocked(workbenchApi.snapshot).mockResolvedValue(next);
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=${work.id}&tab=changes`);
+    await flush(()=>root.render(createElement(App)));
+    await advanceSnapshotPoll();
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Agent"]')).toBe(composer);
+    expect(composer.value).toBe('unsent draft survives');
+    expect([...host.querySelectorAll('article')].find(item=>item.textContent?.includes('Stable message node'))).toBe(message);
+    expect(host.querySelector<HTMLAnchorElement>('nav[aria-label="Work details"] a[href$="tab=changes"]')?.className).toContain('font-medium');
+    expect([...host.querySelectorAll('h2')].some(item=>item.textContent==='Conversation')).toBe(true);
+    expect(host.querySelector('[aria-label="Current delivery status"] [role="alert"]')?.textContent).toContain('Latest delivery · failed · Published');
+    expect(send).not.toHaveBeenCalled();expect(create).not.toHaveBeenCalled();
+  });
+
   it('loads only an expanded file page and follows its bound cursor',async()=>{
     window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
     const work={id:'work-1',projectId:project.id,title:'Lazy diff',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
@@ -1127,6 +1176,14 @@ describe('delivery action and narrow breadcrumb UI',()=>{
     vi.spyOn(workbenchApi,'artifact').mockResolvedValue(diff);
     const request=vi.spyOn(workbenchApi,'requestDraftPr');
     await mount(current);await flush();
+    const history=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.startsWith('Delivery history'))!;
+    expect(history.open).toBe(false);
+    const currentStatus=host.querySelector('[aria-label="Current delivery status"]');
+    const readablePhase=phase==='pr_created'?'Draft PR created':phase==='unknown'?'Unknown':phase.replaceAll('_',' ').replace(/\b\w/gu,letter=>letter.toUpperCase());
+    expect(currentStatus?.textContent).toContain(`Latest delivery · ${status} · ${readablePhase}`);
+    if(status==='failed')expect(currentStatus?.querySelector('[role="alert"]')?.textContent).toContain('Latest delivery · failed');
+    else expect(currentStatus?.querySelector('[role="alert"]')).toBeNull();
+    await flush(()=>{history.open=true;});
     const action=button(label);expect(action.disabled).toBe(disabled);
     expect(action.closest('section')?.textContent).toContain(`Delivery ${status} · ${phase}`);
     if(status==='paused'){
@@ -1220,6 +1277,70 @@ describe('overview typed-review polling identity',()=>{
     await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(evidence.mock.calls[1]?.[0]).toBe('review-qa-work-2');expect(reviewButton()).toBeNull();
     oldResult.resolve(first.qa as never);await flush();expect(reviewButton()).toBeNull();
     newResult.resolve(second.qa as never);await flush();expect(reviewButton()).not.toBeNull();
+  });
+
+  it('keeps Overview receipts closed while retaining exact receipt details and the bound merge action',async()=>{
+    openOverview();const fixture=reviewOverviewFixture();
+    const receipt={id:'delivery-receipt-overview',projectId:project.id,workId:fixture.work.id,runId:'delivery-work-1',kind:'delivery' as const,revision:'delivery-receipt-revision',createdAt:'2026-10-06T12:00:00.000Z',data:{action:'create_draft_pr',phase:'pr_created',pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/42',commitSha:'exact-candidate-sha'}};
+    fixture.snapshot.artifacts.push(receipt);
+    vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id==='review-qa'?fixture.qa as never:receipt as never);
+    await mount(fixture.snapshot);await flush();
+    const history=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.startsWith('Delivery history'))!;
+    expect(history.open).toBe(false);expect(history.querySelector('summary')?.textContent).toContain('1 receipts');
+    expect(host.querySelector('[aria-label="Current delivery status"]')?.textContent).toContain('Latest delivery · completed · Draft PR created');
+    const overview=host.querySelector('h2');const disclosure=history.querySelector('summary');
+    expect(overview?.textContent).toBe('Current overview');expect(overview!.compareDocumentPosition(disclosure!)&Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await flush(()=>{history.open=true;});await flush();
+    expect(history.textContent).toContain('pr created');expect(history.textContent).toContain('exact-candidate-sha');expect(history.textContent).toContain('https://github.com/blossomsai/menoteam/pull/42');
+    expect(button('Queue merge').disabled).toBe(false);
+  });
+
+  it.each([{reverse:false,tab:'changes'},{reverse:true,tab:'changes'},{reverse:false,tab:'overview'},{reverse:true,tab:'overview'}] as const)('shows the newest candidate lifecycle in $tab regardless of run array order (reversed=$reverse)',async({reverse,tab})=>{
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=project&work=work-1${tab==='changes'?'&tab=changes':''}`);
+    const work={id:'work-1',projectId:project.id,title:'Delivery order',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const candidate={id:'candidate-current',projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status:'completed' as const,generation:1,createdAt:'2026-10-06T09:00:00.000Z',updatedAt:'2026-10-06T09:00:00.000Z'};
+    const otherCandidate={...candidate,id:'candidate-other'};
+    const priorPr={id:'delivery-pr',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'internal',reasoning:'none',status:'completed' as const,generation:0,createdAt:'2026-10-06T10:00:00.000Z',updatedAt:'2026-10-06T10:00:00.000Z',operation:{action:'create_draft_pr',phase:'pr_created',candidateRunId:candidate.id,external:{pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/41'}}};
+    const merge={...priorPr,id:'delivery-merge',status:'completed' as const,createdAt:'2026-10-06T12:00:00.000Z',updatedAt:'2026-10-06T12:05:00.000Z',operation:{action:'merge_pr',phase:'merged',candidateRunId:candidate.id,external:{pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/41',mergeSha:'merge-sha'}}};
+    const otherPr={...priorPr,id:'delivery-other-pr',targetRunId:otherCandidate.id,createdAt:'2026-10-06T13:00:00.000Z',updatedAt:'2026-10-06T13:00:00.000Z',operation:{...priorPr.operation,candidateRunId:otherCandidate.id,external:{pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/99'}}};
+    const diff={id:'delivery-diff',projectId:project.id,workId:work.id,runId:candidate.id,kind:'diff' as const,revision:'delivery-revision',createdAt:'2026-10-06T09:00:00.000Z',data:{candidateRevision:'candidate-sha',baseRevision:'base-sha',files:[],totalFiles:0,truncated:false}};
+    const lifecycle:Snapshot['runs']=[priorPr,merge,otherPr];const current=snapshot();current.projects[0]={...project,repositoryUrl:'https://github.com/blossomsai/menoteam'};current.works=[work];current.runs=[candidate,otherCandidate,...(reverse?[...lifecycle].reverse():lifecycle)];current.artifacts=[diff];
+    vi.spyOn(workbenchApi,'artifact').mockResolvedValue(diff);await mount(current);await flush();
+    const summary=host.querySelector('[aria-label="Current delivery status"]')!;
+    expect(summary.textContent).toContain('Latest delivery · completed · Merged');expect(summary.textContent).not.toContain('generation');expect(summary.textContent).toContain('10/6/2026');
+    expect(summary.querySelector('a')?.getAttribute('href')).toBe('https://github.com/blossomsai/menoteam/pull/41');
+    expect(summary.textContent).not.toContain('Draft PR created');expect(summary.textContent).not.toContain('/pull/99');
+    if(tab==='changes'){const history=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.startsWith('Delivery history'))!;expect(history.open).toBe(false);}
+  });
+
+  it.each([
+    ['failed','merge_intent','failed · Merge in progress'],
+    ['completed','unknown','completed · Unknown'],
+  ] as const)('does not replace a newest failure or Unknown phase with an older PR success (%s/%s)',async(status,phase,expected)=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Current delivery state',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const candidate={id:'candidate-state',projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status:'completed' as const,generation:1,createdAt:'2026-10-06T09:00:00.000Z',updatedAt:'2026-10-06T09:00:00.000Z'};
+    const earlier={id:'delivery-old-pr',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'internal',reasoning:'none',status:'completed' as const,generation:0,createdAt:'2026-10-06T10:00:00.000Z',updatedAt:'2026-10-06T10:00:00.000Z',operation:{action:'create_draft_pr',phase:'pr_created',candidateRunId:candidate.id,external:{pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/41'}}};
+    const latest={...earlier,id:'delivery-current',status,generation:2,createdAt:'2026-10-06T11:00:00.000Z',updatedAt:'2026-10-06T12:00:00.000Z',operation:{...earlier.operation,action:'merge_pr',phase,candidateRunId:candidate.id,external:{pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/41'}}} as Snapshot['runs'][number];
+    const diff={id:'delivery-diff',projectId:project.id,workId:work.id,runId:candidate.id,kind:'diff' as const,revision:'delivery-revision',createdAt:'2026-10-06T09:00:00.000Z',data:{candidateRevision:'candidate-sha',baseRevision:'base-sha',files:[],totalFiles:0,truncated:false}};
+    const current=snapshot();current.projects[0]={...project,repositoryUrl:'https://github.com/blossomsai/menoteam'};current.works=[work];current.runs=[candidate,earlier,latest];current.artifacts=[diff];vi.spyOn(workbenchApi,'artifact').mockResolvedValue(diff);await mount(current);await flush();
+    const summary=host.querySelector('[aria-label="Current delivery status"]')!;expect(summary.textContent).toContain(`Latest delivery · ${expected}`);expect(summary.textContent).not.toContain('Draft PR created');
+    if(status==='failed')expect(summary.querySelector('[role="alert"]')?.textContent).toContain('Latest delivery · failed');else expect(summary.querySelector('[role="alert"]')).toBeNull();
+    expect(summary.querySelector('a')?.getAttribute('href')).toBe('https://github.com/blossomsai/menoteam/pull/41');
+  });
+
+  it('keeps Draft PR action gating and request binding on its original first matching run',async()=>{
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=changes');
+    const work={id:'work-1',projectId:project.id,title:'Action binding',overview:'',status:'in_progress' as const,revision:1,profileId:'',sources:[],createdAt:'',updatedAt:''};
+    const candidate={id:'candidate-action',projectId:project.id,workId:work.id,kind:'implementation' as const,prompt:'',model:'gpt-6.1-sol',reasoning:'medium',status:'completed' as const,generation:1,createdAt:'2026-10-06T09:00:00.000Z',updatedAt:'2026-10-06T09:00:00.000Z'};
+    const failed={id:'delivery-first-failed',projectId:project.id,workId:work.id,targetRunId:candidate.id,kind:'delivery' as const,prompt:'',model:'internal',reasoning:'none',status:'failed' as const,generation:1,createdAt:'2026-10-06T10:00:00.000Z',updatedAt:'2026-10-06T10:00:00.000Z',operation:{action:'create_draft_pr',phase:'queued',candidateRunId:candidate.id}};
+    const merged={...failed,id:'delivery-later-merge',status:'completed' as const,createdAt:'2026-10-06T11:00:00.000Z',updatedAt:'2026-10-06T11:00:00.000Z',operation:{action:'merge_pr',phase:'merged',candidateRunId:candidate.id,external:{pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/41'}}};
+    const diff={id:'delivery-diff',projectId:project.id,workId:work.id,runId:candidate.id,kind:'diff' as const,revision:'exact-diff-revision',createdAt:'2026-10-06T09:00:00.000Z',data:{candidateRevision:'exact-candidate-sha',baseRevision:'base-sha',files:[],totalFiles:0,truncated:false}};
+    const current=snapshot();current.projects[0]={...project,repositoryUrl:'https://github.com/blossomsai/menoteam'};current.works=[work];current.runs=[candidate,failed,merged];current.artifacts=[diff];vi.spyOn(workbenchApi,'artifact').mockResolvedValue(diff);const request=vi.spyOn(workbenchApi,'requestDraftPr').mockResolvedValue(undefined as never);await mount(current);await flush();
+    expect(host.querySelector('[aria-label="Current delivery status"]')?.textContent).toContain('Latest delivery · completed · Merged');
+    const history=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent?.startsWith('Delivery history'))!;await flush(()=>{history.open=true;});
+    const action=button('Retry Draft PR');expect(action.disabled).toBe(false);await flush(()=>action.click());
+    expect(request).toHaveBeenCalledTimes(1);expect(request.mock.calls[0]?.[0]).toBe(work.id);expect(request.mock.calls[0]?.[1]).toMatchObject({candidateRunId:candidate.id,candidateRevision:'exact-diff-revision',action:'create_draft_pr'});expect(typeof request.mock.calls[0]?.[1].requestId).toBe('string');
   });
 });
 
