@@ -9,7 +9,7 @@ import { DIFF_VISIBLE_CHARS, historicalDiffRows, initialDiffPageState, parseDiff
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { isCausalMasterWake } from '../types';
 import { hasRequiredLocalQa, qaPolicySnapshot } from '../local-qa';
-import { ApiError, canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot } from './api';
+import { ApiError, canAutoPoll, invalidateRateLimitRequests, resetRateLimitCooldown, workbenchApi, type Snapshot } from './api';
 import { canManageProject, filterWorks, readRoute, selectProject, selectWork, type Route, type View } from './routes';
 import { cancelInstructionsDraft, completeInstructionsSave, editInstructionsDraft, hasRemoteInstructionsUpdate, keepInstructionsDraft, startInstructionsDraft, useLatestInstructions } from './instructions-draft';
 import { createSnapshotRequestHandler } from './snapshot-request';
@@ -84,7 +84,7 @@ function App() {
 
   useEffect(() => {
     void checkSession();
-    return () => { ++sessionGenerationRef.current; snapshotRequestsEnabledRef.current = false; };
+    return () => { ++sessionGenerationRef.current; snapshotRequestsEnabledRef.current = false; invalidateRateLimitRequests(); };
   }, [checkSession]);
 
   useEffect(() => {
@@ -691,32 +691,36 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
   const [retryMessage,setRetryMessage]=useState('');
   const evidenceGeneration=useRef(0);
   const retryPending=useRef(false);
+  const evidenceController=useRef<AbortController|null>(null);
   const expectedArtifacts=new Map<string,Artifact>([[latestDiff?.id??'',latestDiff!],...metadata.map(item=>[item.id,item] as [string,Artifact])]);
-  const loadEvidence=async(ids:string[],generation:number,replace:boolean)=>{
-    const results=await Promise.all(ids.map(async id=>{try{return await workbenchApi.artifact(id);}catch{return null;}}));
+  const loadEvidence=async(ids:string[],generation:number,replace:boolean,signal:AbortSignal)=>{
+    const results=await Promise.all(ids.map(async id=>{try{return await workbenchApi.artifact(id,signal);}catch{return null;}}));
     if(generation!==evidenceGeneration.current)return;
     const valid:Record<string,Artifact>={},missing:string[]=[];
     results.forEach((result,index)=>{const id=ids[index]!,reference=expectedArtifacts.get(id);if(!result||!reference||result.id!==id||result.workId!==work.id||result.projectId!==work.projectId||result.runId!==reference.runId||result.kind!==reference.kind||result.revision!==reference.revision)missing.push(id);else valid[id]=result;});
     setLoaded(current=>replace?valid:{...current,...valid});
-    setFailed(current=>[...new Set([...(replace?[]:current.filter(id=>!ids.includes(id))),...missing])]);
+    setFailed(current=>replace?missing:[...new Set([...current,...missing])]);
     setLoading(false);retryPending.current=false;
+    if(evidenceController.current?.signal===signal)evidenceController.current=null;
     if(!missing.length)setRetryMessage('');
   };
   useEffect(()=>{
     const generation=++evidenceGeneration.current;
     retryPending.current=false;setRetryMessage('');
     if(!latestDiff){setLoaded({});setFailed([]);setLoading(false);return()=>{++evidenceGeneration.current;};}
+    const controller=new AbortController();evidenceController.current=controller;
     const ids=[latestDiff.id,...metadata.map(item=>item.id)];
     setLoaded({});setFailed([]);setLoading(true);
-    void loadEvidence(ids,generation,true);
-    return()=>{++evidenceGeneration.current;};
+    void loadEvidence(ids,generation,true,controller.signal);
+    return()=>{evidenceController.current?.abort();evidenceController.current=null;++evidenceGeneration.current;};
   },[requestKey,work.id,work.projectId]);
 
   const retryFailedEvidence=async()=>{
     if(loading||retryPending.current||!failed.length)return;
     if(!canAutoPoll()){setRetryMessage('Please wait for the server cooldown before retrying.');return;}
     retryPending.current=true;setLoading(true);setRetryMessage('');
-    await loadEvidence([...failed],evidenceGeneration.current,false);
+    const controller=new AbortController();evidenceController.current=controller;
+    await loadEvidence([...failed],evidenceGeneration.current,false,controller.signal);
   };
 
   const diff=latestDiff?loaded[latestDiff.id]:undefined;
@@ -766,10 +770,26 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
   const reviewData=isRecord(reviewArtifact?.data)&&isRecord(reviewArtifact.data.typedReview)?reviewArtifact.data.typedReview:{};
   const binding=reviewRun?.reviewBinding;
   const reviewMatches=Boolean(candidate&&latestDiff&&commitSha&&reviewRun?.status==='completed'&&binding&&binding.candidateRunId===candidate.id&&binding.diffArtifactId===latestDiff.id&&binding.diffRevision===latestDiff.revision&&binding.commitSha===commitSha&&/^[a-f0-9]{64}$/u.test(binding.candidateFingerprint)&&(!localFingerprint||binding.candidateFingerprint===localFingerprint)&&reviewArtifact?.revision===latestDiff.revision&&reviewData.candidateRunId===candidate.id&&reviewData.diffArtifactId===binding.diffArtifactId&&reviewData.diffRevision===latestDiff.revision&&reviewData.commitSha===commitSha&&reviewData.candidateFingerprint===binding.candidateFingerprint&&reviewData.reviewerRunId===reviewRun.id&&reviewData.disposition&&['approved','changes_requested','insufficient_evidence'].includes(String(reviewData.disposition)));
+  const retrySemanticallyValid=(id:string,item:Artifact)=>{
+    if(id===latestDiff?.id){
+      const sha=isRecord(item.data)?item.data.candidateRevision:undefined;
+      return typeof sha==='string'&&sha.length>0&&candidateReviews.every(run=>run.reviewBinding?.diffArtifactId===item.id&&run.reviewBinding?.commitSha===sha);
+    }
+    const data=isRecord(item.data)?item.data:{};
+    if(item.id===reviewArtifact?.id&&isRecord(data.typedReview)&&binding?.candidateRunId===candidate?.id&&binding?.diffArtifactId===latestDiff?.id&&binding?.diffRevision===latestDiff?.revision)return reviewMatches;
+    if(item.id===localQa?.id&&data.localQaContract==='project-local-qa/v2'&&data.verification==='current')return localCurrent;
+    if(item.id===commandQa?.id&&Array.isArray(data.checks)&&data.verification==='current'&&data.stale===false)return commandCurrent;
+    return true;
+  };
+  useEffect(()=>{
+    const recovered=failed.filter(id=>loaded[id]&&retrySemanticallyValid(id,loaded[id]!));
+    if(recovered.length){setFailed(current=>current.filter(id=>!recovered.includes(id)));setRetryMessage('');}
+  },[failed,loaded]);
   let reviewStatus:'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
   if(!reviewRun)reviewStatus='Missing';
   else if(['queued','running'].includes(reviewRun.status))reviewStatus='Pending';
   else if(binding?.candidateRunId!==candidate?.id||binding?.diffRevision!==latestDiff?.revision)reviewStatus='Stale';
+  else if(reviewArtifact&&failed.includes(reviewArtifact.id)&&!reviewMatches)reviewStatus='Unknown';
   else if(reviewArtifact&&!reviewMatches)reviewStatus='Stale';
   else if(reviewMatches)reviewStatus='Current';
   else if(failed.some(id=>metadata.some(item=>item.id===id&&item.runId===reviewRun.id)))reviewStatus='Unknown';

@@ -38,11 +38,15 @@ let cooldownUntil = 0;
 let authScopeEpoch = 0;
 
 export function canAutoPoll(now = Date.now()) { return now >= cooldownUntil; }
-export function resetRateLimitCooldown() { cooldownUntil = 0; authScopeEpoch++; }
+export function invalidateRateLimitRequests() { authScopeEpoch++; }
+export function resetRateLimitCooldown() { cooldownUntil = 0; invalidateRateLimitRequests(); }
 
 function applyRetryAfter(value: string | null, now: number) {
   const seconds = value?.trim();
-  const deadline = seconds && /^\d+$/u.test(seconds) ? now + Number(seconds) * 1_000 : seconds ? Date.parse(seconds) : NaN;
+  const integerSeconds = Boolean(seconds && /^\d+$/u.test(seconds));
+  const httpDate = Boolean(seconds && /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(seconds));
+  const parsedDate = httpDate ? Date.parse(seconds!) : NaN;
+  const deadline = integerSeconds ? now + Number(seconds) * 1_000 : httpDate && Number.isFinite(parsedDate) && new Date(parsedDate).toUTCString() === seconds ? parsedDate : NaN;
   const valid = Number.isFinite(deadline) && deadline >= now;
   cooldownUntil = Math.max(cooldownUntil, valid ? deadline : now + 2_000);
 }
@@ -57,7 +61,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     if (response.status === 429) {
       const retryAfter = response.headers.get('Retry-After');
-      if (requestEpoch === authScopeEpoch) applyRetryAfter(retryAfter, Date.now());
+      if (requestEpoch === authScopeEpoch && !init?.signal?.aborted) applyRetryAfter(retryAfter, Date.now());
     }
     const body = await response.json().catch(() => null) as { message?: string } | null;
     throw new ApiError(body?.message ?? `Request failed (${response.status})`, response.status, response.status === 429 ? response.headers.get('Retry-After') : undefined);
@@ -71,7 +75,7 @@ export const workbenchApi = {
   login: (email: string, password: string) => request<{ authenticated: true }>('/session', { method: 'POST', body: JSON.stringify({ email, password }) }),
   logout: () => request<void>('/logout', { method: 'POST' }),
   snapshot: () => request<Snapshot>('/snapshot'),
-  artifact: (id: string) => request<Artifact>(`/artifacts/${encodeURIComponent(id)}`),
+  artifact: (id: string, signal?: AbortSignal) => request<Artifact>(`/artifacts/${encodeURIComponent(id)}`, { signal }),
   diffFile: (id:string,path:string,revision:string,cursor?:string,signal?:AbortSignal) => { const query=new URLSearchParams({path,revision});if(cursor)query.set('cursor',cursor);return request<{path:string;binary:boolean;encodingUnsupported?:boolean;complete:boolean;verified?:boolean;incomplete?:boolean;integrity?:'pending'|'verified'|'incomplete';chunkIndex:number;chunkCount:number;fileSha256?:string;contentBase64:string;nextCursor:string|null;reason?:string}>(`/artifacts/${encodeURIComponent(id)}/diff-file?${query}`,{signal}); },
   projectMessages: (projectId: string, query: { workId?: string; before?: string; after?: string } = {}) => {
     const params = new URLSearchParams();

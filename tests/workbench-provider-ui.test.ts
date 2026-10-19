@@ -5,7 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
-import { ApiError, workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { ApiError, canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot } from '../src/workbench/web/api';
 
 const owner = { id: 'owner', email: 'owner@example.test', name: 'Owner', role: 'owner' as const };
 const admin = { ...owner, id: 'admin', email: 'admin@example.test', role: 'admin' as const };
@@ -59,6 +59,7 @@ async function chooseSelect(select: HTMLSelectElement, value: string) { await fl
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
 
 beforeEach(() => {
+  resetRateLimitCooldown();
   vi.useFakeTimers(); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('Unexpected live fetch in mounted UI test'))));
   sessionStorage.clear();
   window.history.replaceState(null, '', '/workbench/?view=model-providers');
@@ -381,7 +382,7 @@ describe('mounted marketplace skill selection', () => {
     expect(host.textContent).not.toContain('Import 1 selected skill');
   });
 });
-afterEach(async () => { await flush(() => root.unmount()); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
+afterEach(async () => { await flush(() => root.unmount()); host.remove(); resetRateLimitCooldown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 describe('mounted provider connection settings', () => {
   it('shows the supported initial Work selection before its first execution snapshot exists', async () => {
@@ -939,8 +940,8 @@ describe('mounted provider connection settings', () => {
     const candidateRun = { id: 'run-1', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '', qaPolicySnapshot: { id: 'policy-1', version: '2026-10-06T09:00:00.000Z', projectId: project.id, repositoryUrl: 'https://github.com/blossomsai/menoteam', configuredBy: owner.id, coverage: 'project/v1' as const, requirements: [] } } as Snapshot['runs'][number];
     await mount({ ...snapshot(), works: [work], runs: [candidateRun], artifacts: [diff, staleQa, currentQa] } as Snapshot);
     await flush();
-    expect(workbenchApi.artifact).toHaveBeenCalledWith(currentQa.id);
-    expect(workbenchApi.artifact).not.toHaveBeenCalledWith(staleQa.id);
+    expect(workbenchApi.artifact.mock.calls.map(([id])=>id)).toContain(currentQa.id);
+    expect(workbenchApi.artifact.mock.calls.map(([id])=>id)).not.toContain(staleQa.id);
     expect(host.textContent).toContain('Unknown');
     expect(host.textContent).toContain('Required checks are missing for this candidate.');
     expect(host.textContent).toContain('Typed review');
@@ -962,7 +963,7 @@ describe('mounted provider connection settings', () => {
     const candidateRun = { id: 'candidate-new', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
     await mount({ ...snapshot(), works: [work], runs: [candidateRun, reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
     await flush();
-    expect(artifactSpy).toHaveBeenCalledWith(mismatchedQa.id);
+    expect(artifactSpy.mock.calls.map(([id])=>id)).toContain(mismatchedQa.id);
     expect(host.textContent).toContain('does not match the latest candidate');
     expect(host.textContent).not.toContain('Current evidence');
     expect(host.textContent).not.toContain('approved');
@@ -1031,7 +1032,7 @@ describe('mounted provider connection settings', () => {
     const candidateRun = { id: 'candidate-run', projectId: project.id, workId: work.id, kind: 'implementation' as const, prompt: 'Build', model: 'gpt-6-luna', reasoning: 'medium', status: 'completed' as const, generation: 1, createdAt: '', updatedAt: '' } as Snapshot['runs'][number];
     await mount({ ...snapshot(), works: [work], runs: [candidateRun, reviewRun], artifacts: [diffMetadata, qaMetadata] } as Snapshot);
     await flush();
-    expect(artifactSpy).toHaveBeenCalledWith(qa.id);
+    expect(artifactSpy.mock.calls.map(([id])=>id)).toContain(qa.id);
     expect(host.textContent).toContain('Typed review');
     expect(host.textContent).toContain('Keep evidence bound');
     expect(host.textContent).toContain('Current evidence');
@@ -1039,7 +1040,7 @@ describe('mounted provider connection settings', () => {
 
   it('keeps a failed diff unknown and lets the user retry only failed evidence after cooldown', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
-    const fixture=reviewOverviewFixture();
+    const fixture=reviewOverviewFixture({qaRevision:'diff-revision'});
     const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
     const requested:string[]=[];
     let firstDiff=true;
@@ -1062,8 +1063,113 @@ describe('mounted provider connection settings', () => {
     await flush();
     expect(requested.filter(id=>id===diff.id)).toHaveLength(2);
     expect(requested.filter(id=>id===fixture.metadata.id)).toHaveLength(1);
-    expect(host.textContent).toContain('candidate-commit');
+    expect(host.textContent).toContain('Current evidence');
+    expect(host.textContent).toContain('approved');
     expect(host.textContent).not.toContain('Some evidence could not be loaded');
+  });
+
+  it.each(['work', 'revision', 'typed commit', 'typed diff revision', 'typed fingerprint', 'partial failure'] as const)('keeps a failed typed review retry Unknown for %s while preserving loaded evidence', async failure => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const fixture=reviewOverviewFixture({qaRevision:'diff-revision'});
+    const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
+    const fingerprint='a'.repeat(64);
+    const commandMetadata={id:'qa-command',projectId:project.id,workId:fixture.work.id,runId:'candidate-run',kind:'qa' as const,revision:'diff-revision',createdAt:'2026-10-06T10:30:00.000Z'};
+    const command={...commandMetadata,data:{verification:'current',stale:false,candidateFingerprint:fingerprint,checks:[{name:'typecheck',exitCode:0,testedRevision:fingerprint}]}};
+    fixture.snapshot.artifacts.push(commandMetadata);
+    const requested:string[]=[];let qaAttempts=0;
+    vi.spyOn(document,'hidden','get').mockReturnValue(true);
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{
+      const path=String(input),id=decodeURIComponent(path.split('/artifacts/')[1]??'').split('/')[0]!;requested.push(id);
+      if(id===fixture.metadata.id){qaAttempts++;if(qaAttempts===1)return new Response(JSON.stringify({message:'limited'}),{status:429});if(failure==='partial failure')return new Response(JSON.stringify({message:'still unavailable'}),{status:500});
+        if(failure==='work')return Response.json({...fixture.qa,workId:'wrong-work'});
+        if(failure==='revision')return Response.json({...fixture.qa,revision:'wrong-revision'});
+        const typed={...fixture.qa.data.typedReview,...(failure==='typed commit'?{commitSha:'wrong-commit'}:{}),...(failure==='typed diff revision'?{diffRevision:'wrong-diff-revision'}:{}),...(failure==='typed fingerprint'?{candidateFingerprint:'b'.repeat(64)}:{})};
+        return Response.json({...fixture.qa,data:{...fixture.qa.data,typedReview:typed}});
+      }
+      return Response.json(id===diff.id?diff:command);
+    }));
+    await mount(fixture.snapshot);await flush();
+    expect(host.textContent).toContain('Current evidence');
+    expect(host.textContent).toContain('Some evidence could not be loaded');
+    await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
+    await flush();
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(host.textContent).toContain('Unknown');
+    expect(host.textContent).toContain('Some evidence could not be loaded');
+    expect(button('Retry failed evidence').disabled).toBe(false);
+    expect(requested.filter(id=>id===diff.id)).toHaveLength(1);
+    expect(requested.filter(id=>id===commandMetadata.id)).toHaveLength(1);
+    expect(requested.filter(id=>id===fixture.metadata.id)).toHaveLength(2);
+  });
+
+  it.each([
+    { transition:'Work switch', late:'429' },{ transition:'Work switch', late:'success' },
+    { transition:'same-member logout/login', late:'429' },{ transition:'same-member logout/login', late:'success' },
+    { transition:'unmount', late:'429' },{ transition:'unmount', late:'success' },
+  ] as const)('fences a pending QA evidence retry after $transition and late $late',async({transition,late})=>{
+    const first=reviewOverviewFixture({qaRevision:'diff-revision'});
+    const second=reviewOverviewFixture({workId:'work-2',qaId:'review-qa-2',qaRevision:'diff-revision',commitSha:'second-candidate-commit',diffRevision:'second-diff-revision'});
+    let current=first.snapshot;
+    if(transition==='Work switch'){
+      current={...first.snapshot,works:[first.work,second.work],runs:[...first.snapshot.runs,...second.snapshot.runs],artifacts:[...first.snapshot.artifacts,...second.snapshot.artifacts]};
+    }
+    const artifacts=new Map<string,unknown>([...first.snapshot.artifacts.map(item=>[item.id,item] as [string,unknown]),[first.qa.id,first.qa],[second.qa.id,second.qa],...second.snapshot.artifacts.map(item=>[item.id,item] as [string,unknown])]);
+    let qaCalls=0,snapshotCalls=0;const requested:string[]=[];let finishRetry!: (response:Response)=>void;let retrySignal:AbortSignal|undefined;
+    const retryResponse=new Promise<Response>(resolve=>{finishRetry=resolve;});
+    vi.spyOn(document,'hidden','get').mockReturnValue(true);
+    vi.spyOn(workbenchApi,'sendMessage');
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{
+      const path=String(input),id=decodeURIComponent(path.split('/artifacts/')[1]??'').split('/')[0]!;
+      requested.push(id);
+      if(path.endsWith('/snapshot')){
+        snapshotCalls++;
+        return snapshotCalls===1?new Response(JSON.stringify({message:'current scope limited'}),{status:429,headers:{'Retry-After':'30'}}):Response.json(current);
+      }
+      if(id===first.metadata.id){qaCalls++;if(qaCalls===1)return new Response(JSON.stringify({message:'limited'}),{status:429});if(qaCalls===2){retrySignal=init?.signal??undefined;return retryResponse;}}
+      const artifact=artifacts.get(id);if(artifact)return Response.json(artifact);
+      throw new Error(`Unexpected evidence request ${id}`);
+    }));
+    window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=${first.work.id}&tab=qa`);
+    await mount(current);await flush();
+    expect(host.textContent).toContain('Some evidence could not be loaded');
+    await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});await flush();
+    await flush(()=>button('Retry failed evidence').click());
+    expect(qaCalls).toBe(2);expect(retrySignal?.aborted).toBe(false);
+
+    if(transition==='Work switch'){
+      window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=${second.work.id}&tab=qa`);
+      vi.mocked(workbenchApi.snapshot).mockRestore();
+      vi.spyOn(document,'hidden','get').mockReturnValue(false);
+      await advanceSnapshotPoll();
+      expect(host.textContent).toContain('second-candidate-commit');
+      expect(canAutoPoll()).toBe(false);
+    }else if(transition==='same-member logout/login'){
+      vi.spyOn(workbenchApi,'logout').mockResolvedValue();
+      vi.spyOn(workbenchApi,'login').mockResolvedValue({authenticated:true});
+      await flush(()=>host.querySelector('aside > button')!.click());
+      await type('#login-email',owner.email);await type('#login-password','mock password');
+      await flush(()=>host.querySelector('form')!.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+      expect(host.textContent).toContain('candidate-commit');
+    }else{
+      await flush(()=>root.unmount());
+    }
+    expect(retrySignal?.aborted).toBe(true);
+    const lateArtifact={...first.qa,data:{...first.qa.data,typedReview:{...first.qa.data.typedReview,commitSha:'late-old-response'}}};
+    finishRetry(late==='429'?new Response(JSON.stringify({message:'late limited'}),{status:429,headers:{'Retry-After':'120'}}):Response.json(lateArtifact));
+    await flush();
+    if(transition==='Work switch'){
+      expect(canAutoPoll()).toBe(false);
+      await act(async()=>{await vi.advanceTimersByTimeAsync(30_000);});await flush();
+      expect(snapshotCalls).toBe(2);
+      expect(canAutoPoll()).toBe(true);
+    }else expect(canAutoPoll()).toBe(true);
+    expect(vi.mocked(workbenchApi.sendMessage)).not.toHaveBeenCalled();
+    expect(qaCalls).toBe(transition==='same-member logout/login'?3:2);
+    expect(requested.filter(id=>id===first.snapshot.artifacts.find(item=>item.kind==='diff')!.id)).toHaveLength(transition==='same-member logout/login'?2:1);
+    if(transition!=='unmount'){
+      expect(host.textContent).not.toContain('late-old-response');
+      expect(host.textContent).toContain(transition==='Work switch'?'second-candidate-commit':'Current evidence');
+    }
   });
 
   it('keeps freshness separate from failed command results', async () => {
