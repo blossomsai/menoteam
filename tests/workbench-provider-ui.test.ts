@@ -1040,7 +1040,7 @@ describe('mounted provider connection settings', () => {
 
   it('keeps a failed diff unknown and lets the user retry only failed evidence after cooldown', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
-    const fixture=reviewOverviewFixture({qaRevision:'diff-revision'});
+    const fixture=reviewOverviewFixture({qaRevision:'diff-revision',commitSha:'c'.repeat(40)});
     const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
     const requested:string[]=[];
     let firstDiff=true;
@@ -1068,7 +1068,7 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).not.toContain('Some evidence could not be loaded');
   });
 
-  it.each(['work', 'revision', 'typed commit', 'typed diff revision', 'typed fingerprint', 'partial failure'] as const)('keeps a failed typed review retry Unknown for %s while preserving loaded evidence', async failure => {
+  it.each(['work', 'revision', 'typed commit', 'typed diff revision', 'typed fingerprint', 'transport failure'] as const)('keeps a failed typed review retry Unknown for %s while preserving loaded evidence', async failure => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
     const fixture=reviewOverviewFixture({qaRevision:'diff-revision'});
     const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
@@ -1080,7 +1080,7 @@ describe('mounted provider connection settings', () => {
     vi.spyOn(document,'hidden','get').mockReturnValue(true);
     vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{
       const path=String(input),id=decodeURIComponent(path.split('/artifacts/')[1]??'').split('/')[0]!;requested.push(id);
-      if(id===fixture.metadata.id){qaAttempts++;if(qaAttempts===1)return new Response(JSON.stringify({message:'limited'}),{status:429});if(failure==='partial failure')return new Response(JSON.stringify({message:'still unavailable'}),{status:500});
+      if(id===fixture.metadata.id){qaAttempts++;if(qaAttempts===1)return new Response(JSON.stringify({message:'limited'}),{status:429});if(failure==='transport failure')return new Response(JSON.stringify({message:'still unavailable'}),{status:500});
         if(failure==='work')return Response.json({...fixture.qa,workId:'wrong-work'});
         if(failure==='revision')return Response.json({...fixture.qa,revision:'wrong-revision'});
         const typed={...fixture.qa.data.typedReview,...(failure==='typed commit'?{commitSha:'wrong-commit'}:{}),...(failure==='typed diff revision'?{diffRevision:'wrong-diff-revision'}:{}),...(failure==='typed fingerprint'?{candidateFingerprint:'b'.repeat(64)}:{})};
@@ -1103,17 +1103,97 @@ describe('mounted provider connection settings', () => {
   });
 
   it.each([
+    ['review','missing'],['review','null'],['review','string'],
+    ['required','missing'],['required','unknown'],['command','missing'],['command','unknown'],
+  ] as const)('keeps %s retry failed for %s role data until correct evidence returns',async(role,invalid)=>{
+    const fixture=reviewOverviewFixture({qaRevision:'diff-revision',commitSha:'c'.repeat(40)});
+    const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
+    const fingerprint='a'.repeat(64),required=localQaFixture(project.id,fingerprint);
+    const id=role==='review'?fixture.qa.id:`artifact:candidate-run:${role==='required'?'required-qa':'qa'}:candidate-run:1`;
+    const qa=role==='review'?fixture.qa:{...fixture.qa,id,runId:'candidate-run',data:role==='required'?required.data:{verification:'current',stale:false,candidateFingerprint:fingerprint,checks:[{name:'command',exitCode:0,testedRevision:fingerprint}]}};
+    if(role!=='review'){
+      fixture.snapshot.runs=fixture.snapshot.runs.filter(run=>run.kind==='implementation');
+      if(role==='required')fixture.snapshot.runs[0]!.qaPolicySnapshot=required.policy;
+      const {data,...metadata}=qa;fixture.snapshot.artifacts=[diff,metadata];
+    }
+    let attempts=0;const requested:string[]=[];
+    vi.spyOn(document,'hidden','get').mockReturnValue(true);
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{
+      const artifactId=decodeURIComponent(String(input).split('/artifacts/')[1]!);requested.push(artifactId);
+      if(artifactId===diff.id)return Response.json(diff);
+      attempts++;if(attempts===1)return new Response('{}',{status:429});
+      if(attempts===2){
+        const data=invalid==='missing'?{}:invalid==='null'?{typedReview:null}:invalid==='string'?{typedReview:'approved'}:{...qa.data,verification:'unknown'};
+        return Response.json({...qa,data});
+      }
+      return Response.json(qa);
+    }));
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    await mount(fixture.snapshot);await flush();
+    await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(host.textContent).toContain('Some evidence could not be loaded');
+    const section=role==='review'?[...host.querySelectorAll('section')].find(item=>item.querySelector('h3')?.textContent==='Typed review'):host.querySelector(`[aria-label="${role==='required'?'Required':'Command'} checks"]`);
+    expect(section?.textContent).toContain('Unknown');
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(host.textContent).not.toContain('Some evidence could not be loaded');
+    expect(host.textContent).toContain('Current evidence');
+    expect(requested.filter(value=>value===diff.id)).toHaveLength(1);
+    expect(attempts).toBe(3);
+  });
+
+  it.each(['b'.repeat(40),'not-a-sha'])('binds a no-review diff retry to the snapshot SHA instead of %s',async(wrongSha)=>{
+    const sha='c'.repeat(40),fixture=reviewOverviewFixture({commitSha:sha});
+    const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
+    fixture.snapshot.runs=fixture.snapshot.runs.filter(run=>run.kind==='implementation');fixture.snapshot.artifacts=[diff];
+    let attempts=0;vi.spyOn(document,'hidden','get').mockReturnValue(true);
+    vi.stubGlobal('fetch',vi.fn(async()=>{attempts++;return attempts===1?new Response('{}',{status:429}):Response.json(attempts===2?{...diff,data:{...diff.data,candidateRevision:wrongSha}}:diff);}));
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    await mount(fixture.snapshot);await flush();await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(host.textContent).toContain('Some evidence could not be loaded');
+    expect(host.textContent).not.toContain(`Current candidate · candidate-run · ${wrongSha}`);
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(host.textContent).not.toContain('Some evidence could not be loaded');expect(host.textContent).toContain(sha);expect(attempts).toBe(3);
+  });
+
+  it('recovers two initially failed IDs separately and retries only the remaining failure',async()=>{
+    const fixture=reviewOverviewFixture({qaRevision:'diff-revision',commitSha:'c'.repeat(40)}),fingerprint='a'.repeat(64);
+    const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
+    const command={...fixture.qa,id:'artifact:candidate-run:qa:candidate-run:1',runId:'candidate-run',data:{verification:'current',stale:false,candidateFingerprint:fingerprint,checks:[{name:'command',exitCode:0,testedRevision:fingerprint}]}};
+    const {data,...commandMetadata}=command;fixture.snapshot.artifacts.push(commandMetadata);
+    const counts=new Map<string,number>();vi.spyOn(document,'hidden','get').mockReturnValue(true);
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{
+      const id=decodeURIComponent(String(input).split('/artifacts/')[1]!),count=(counts.get(id)??0)+1;counts.set(id,count);
+      if(id===diff.id)return Response.json(diff);
+      if(count===1)return new Response('{}',{status:429});
+      if(id===command.id)return Response.json(command);
+      return Response.json(count===2?{...fixture.qa,data:{}}:fixture.qa);
+    }));
+    window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    await mount(fixture.snapshot);await flush();await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(host.querySelector('[aria-label="Command checks"]')?.textContent).toContain('Current evidence');
+    expect([...host.querySelectorAll('section')].find(item=>item.querySelector('h3')?.textContent==='Typed review')?.textContent).toContain('Unknown');
+    expect(host.textContent).toContain('Some evidence could not be loaded');expect(button('Retry failed evidence').disabled).toBe(false);
+    expect(counts.get(command.id)).toBe(2);expect(counts.get(fixture.qa.id)).toBe(2);
+    await flush(()=>button('Retry failed evidence').click());await flush();
+    expect(counts.get(command.id)).toBe(2);expect(counts.get(fixture.qa.id)).toBe(3);expect(counts.get(diff.id)).toBe(1);
+    expect(host.textContent).not.toContain('Some evidence could not be loaded');expect(host.textContent).toContain('approved');
+  });
+
+  it.each([
     { transition:'Work switch', late:'429' },{ transition:'Work switch', late:'success' },
     { transition:'same-member logout/login', late:'429' },{ transition:'same-member logout/login', late:'success' },
     { transition:'unmount', late:'429' },{ transition:'unmount', late:'success' },
   ] as const)('fences a pending QA evidence retry after $transition and late $late',async({transition,late})=>{
     const first=reviewOverviewFixture({qaRevision:'diff-revision'});
-    const second=reviewOverviewFixture({workId:'work-2',qaId:'review-qa-2',qaRevision:'diff-revision',commitSha:'second-candidate-commit',diffRevision:'second-diff-revision'});
+    const second=reviewOverviewFixture({workId:'work-2',qaId:'review-qa-2',qaRevision:'second-diff-revision',commitSha:'second-candidate-commit',diffRevision:'second-diff-revision'});
     let current=first.snapshot;
     if(transition==='Work switch'){
       current={...first.snapshot,works:[first.work,second.work],runs:[...first.snapshot.runs,...second.snapshot.runs],artifacts:[...first.snapshot.artifacts,...second.snapshot.artifacts]};
     }
-    const artifacts=new Map<string,unknown>([...first.snapshot.artifacts.map(item=>[item.id,item] as [string,unknown]),[first.qa.id,first.qa],[second.qa.id,second.qa],...second.snapshot.artifacts.map(item=>[item.id,item] as [string,unknown])]);
+    const artifacts=new Map<string,unknown>([...first.snapshot.artifacts.map(item=>[item.id,item] as [string,unknown]),...second.snapshot.artifacts.map(item=>[item.id,item] as [string,unknown]),[first.qa.id,first.qa],[second.qa.id,{...second.qa,data:{...second.qa.data,typedReview:{...second.qa.data.typedReview,disposition:'changes_requested'}}}]]);
     let qaCalls=0,snapshotCalls=0;const requested:string[]=[];let finishRetry!: (response:Response)=>void;let retrySignal:AbortSignal|undefined;
     const retryResponse=new Promise<Response>(resolve=>{finishRetry=resolve;});
     vi.spyOn(document,'hidden','get').mockReturnValue(true);
@@ -1144,6 +1224,7 @@ describe('mounted provider connection settings', () => {
       expect(host.textContent).toContain('second-candidate-commit');
       expect(canAutoPoll()).toBe(false);
     }else if(transition==='same-member logout/login'){
+      artifacts.set(first.qa.id,{...first.qa,data:{...first.qa.data,typedReview:{...first.qa.data.typedReview,disposition:'changes_requested'}}});
       vi.spyOn(workbenchApi,'logout').mockResolvedValue();
       vi.spyOn(workbenchApi,'login').mockResolvedValue({authenticated:true});
       await flush(()=>host.querySelector('aside > button')!.click());
@@ -1154,8 +1235,15 @@ describe('mounted provider connection settings', () => {
       await flush(()=>root.unmount());
     }
     expect(retrySignal?.aborted).toBe(true);
-    const lateArtifact={...first.qa,data:{...first.qa.data,typedReview:{...first.qa.data.typedReview,commitSha:'late-old-response'}}};
-    finishRetry(late==='429'?new Response(JSON.stringify({message:'late limited'}),{status:429,headers:{'Retry-After':'120'}}):Response.json(lateArtifact));
+    const typedState=()=>[...host.querySelectorAll('section')].find(item=>item.querySelector('h3')?.textContent==='Typed review')?.textContent;
+    const settledState=typedState();
+    if(transition!=='unmount'){
+      expect(settledState).toContain('Current evidence');expect(settledState).toContain('changes_requested');
+      expect(host.textContent).not.toContain('Some evidence could not be loaded');
+      expect(host.textContent).not.toContain('Loading candidate evidence');
+      expect([...host.querySelectorAll('button')].some(item=>item.textContent==='Retry failed evidence')).toBe(false);
+    }
+    finishRetry(late==='429'?new Response(JSON.stringify({message:'late limited'}),{status:429,headers:{'Retry-After':'120'}}):Response.json(first.qa));
     await flush();
     if(transition==='Work switch'){
       expect(canAutoPoll()).toBe(false);
@@ -1167,8 +1255,10 @@ describe('mounted provider connection settings', () => {
     expect(qaCalls).toBe(transition==='same-member logout/login'?3:2);
     expect(requested.filter(id=>id===first.snapshot.artifacts.find(item=>item.kind==='diff')!.id)).toHaveLength(transition==='same-member logout/login'?2:1);
     if(transition!=='unmount'){
-      expect(host.textContent).not.toContain('late-old-response');
-      expect(host.textContent).toContain(transition==='Work switch'?'second-candidate-commit':'Current evidence');
+      expect(typedState()).toBe(settledState);
+      expect(host.textContent).not.toContain('Some evidence could not be loaded');
+      expect(host.textContent).not.toContain('Loading candidate evidence');
+      expect([...host.querySelectorAll('button')].some(item=>item.textContent==='Retry failed evidence')).toBe(false);
     }
   });
 

@@ -693,6 +693,17 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
   const retryPending=useRef(false);
   const evidenceController=useRef<AbortController|null>(null);
   const expectedArtifacts=new Map<string,Artifact>([[latestDiff?.id??'',latestDiff!],...metadata.map(item=>[item.id,item] as [string,Artifact])]);
+  // Snapshot QA bodies are omitted; fixed IDs and owning runs establish the retry role.
+  const evidenceRoles=new Map(metadata.map(item=>{
+    const data=isRecord(item.data)?item.data:{};
+    const role=item.id.startsWith(`artifact:${item.runId}:required-qa:`)||data.localQaContract==='project-local-qa/v2'?'required'
+      :item.id.startsWith(`artifact:${item.runId}:typed-review:`)?'review'
+      :item.id.startsWith(`artifact:${item.runId}:qa:`)||Array.isArray(data.checks)&&!isRecord(data.typedReview)?'command'
+        :runs.find(run=>run.id===item.runId)?.kind==='review'?'review':item.runId===candidate?.id?'command':'unknown';
+    return [item.id,role] as const;
+  }));
+  const snapshotSha=isRecord(latestDiff?.data)?latestDiff.data.candidateRevision:undefined;
+  const trustedSha=typeof snapshotSha==='string'?snapshotSha:latestBoundReview?.reviewBinding?.commitSha;
   const loadEvidence=async(ids:string[],generation:number,replace:boolean,signal:AbortSignal)=>{
     const results=await Promise.all(ids.map(async id=>{try{return await workbenchApi.artifact(id,signal);}catch{return null;}}));
     if(generation!==evidenceGeneration.current)return;
@@ -725,7 +736,7 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
 
   const diff=latestDiff?loaded[latestDiff.id]:undefined;
   const diffData=isRecord(diff?.data)?diff.data:{};
-  const commitSha=typeof diffData.candidateRevision==='string'?diffData.candidateRevision:undefined;
+  const commitSha=latestDiff&&failed.includes(latestDiff.id)?typeof trustedSha==='string'&&/^[a-f0-9]{40,64}$/u.test(trustedSha)?trustedSha:undefined:typeof diffData.candidateRevision==='string'?diffData.candidateRevision:undefined;
   const candidateQa=metadata.filter(item=>item.runId===candidate?.id).map(item=>loaded[item.id]).filter((item):item is Artifact=>Boolean(item));
   const currentCandidateQa=candidateQa.filter(item=>item.revision===latestDiff?.revision).sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
   const localQa=currentCandidateQa.find(item=>isRecord(item.data)&&item.data.localQaContract==='project-local-qa/v2')??candidateQa.find(item=>isRecord(item.data)&&item.data.localQaContract==='project-local-qa/v2');
@@ -734,13 +745,20 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
   const localFingerprint=typeof localData.candidateFingerprint==='string'?localData.candidateFingerprint:undefined;
   const policy=candidate?.qaPolicySnapshot;
   const canonicalPolicy=qaPolicySnapshot.safeParse(policy);
-  const localCurrent=Boolean(localQa&&latestDiff&&candidate&&localQa.runId===candidate.id&&localQa.revision===latestDiff.revision&&localData.localQaContract==='project-local-qa/v2'&&localData.verification==='current'&&localData.stale===false&&localFingerprint&&/^[a-f0-9]{64}$/u.test(localFingerprint)&&localChecks.length>0&&localChecks.every(check=>check.testedRevision===localFingerprint));
+  const currentCheckEvidence=(item:Artifact|undefined,required:boolean)=>{
+    const data=isRecord(item?.data)?item.data:{};
+    const checks=Array.isArray(data.checks)?data.checks.filter(isRecord):[];
+    const fingerprint=data.candidateFingerprint;
+    return Boolean(item&&latestDiff&&candidate&&item.runId===candidate.id&&item.revision===latestDiff.revision&&(required?data.localQaContract==='project-local-qa/v2':data.localQaContract!=='project-local-qa/v2'&&!isRecord(data.typedReview))&&data.verification==='current'&&data.stale===false&&typeof fingerprint==='string'&&/^[a-f0-9]{64}$/u.test(fingerprint)&&checks.length>0&&checks.every(check=>check.testedRevision===fingerprint));
+  };
+  const localCurrent=currentCheckEvidence(localQa,true);
   const localFailed=localChecks.filter(check=>check.exitCode!==0).length;
   let requiredStatus:'Not configured'|'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
   if(!policy)requiredStatus='Not configured';
   else if(!localQa&&candidate&&candidate.status!=='completed')requiredStatus='Pending';
   else if(!localQa&&failed.some(id=>metadata.some(item=>item.id===id&&item.runId===candidate?.id)))requiredStatus='Unknown';
   else if(!localQa)requiredStatus='Missing';
+  else if(failed.includes(localQa.id))requiredStatus='Unknown';
   else if(localData.stale===true||localData.verification==='stale'||localQa.revision!==latestDiff?.revision)requiredStatus='Stale';
   else if(localCurrent)requiredStatus='Current';
   else requiredStatus='Unknown';
@@ -751,12 +769,12 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
     ??candidateQa.find(item=>{const data=isRecord(item.data)?item.data:{};return Array.isArray(data.checks)&&data.localQaContract!=='project-local-qa/v2'&&!isRecord(data.typedReview);});
   const commandData=isRecord(commandQa?.data)?commandQa.data:{};
   const commandChecks=Array.isArray(commandData.checks)?commandData.checks.filter(isRecord):[];
-  const commandFingerprint=typeof commandData.candidateFingerprint==='string'?commandData.candidateFingerprint:undefined;
-  const commandCurrent=Boolean(commandQa&&latestDiff&&candidate&&commandQa.runId===candidate.id&&commandQa.revision===latestDiff.revision&&commandData.verification==='current'&&commandData.stale===false&&commandFingerprint&&/^[a-f0-9]{64}$/u.test(commandFingerprint)&&commandChecks.length>0&&commandChecks.every(check=>check.testedRevision===commandFingerprint));
+  const commandCurrent=currentCheckEvidence(commandQa,false);
   let commandStatus:'Pending'|'Missing'|'Stale'|'Current'|'Unknown'='Unknown';
   if(!commandQa&&candidate&&candidate.status!=='completed')commandStatus='Pending';
   else if(!commandQa&&failed.some(id=>metadata.some(item=>item.id===id&&item.runId===candidate?.id)))commandStatus='Unknown';
   else if(!commandQa)commandStatus='Missing';
+  else if(failed.includes(commandQa.id))commandStatus='Unknown';
   else if(commandData.stale===true||commandData.verification==='stale'||commandQa.revision!==latestDiff?.revision)commandStatus='Stale';
   else if(commandCurrent)commandStatus='Current';
   else commandStatus='Unknown';
@@ -769,17 +787,22 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
     .map(item=>loaded[item.id]).find(item=>isRecord(item?.data)&&isRecord(item.data.typedReview));
   const reviewData=isRecord(reviewArtifact?.data)&&isRecord(reviewArtifact.data.typedReview)?reviewArtifact.data.typedReview:{};
   const binding=reviewRun?.reviewBinding;
-  const reviewMatches=Boolean(candidate&&latestDiff&&commitSha&&reviewRun?.status==='completed'&&binding&&binding.candidateRunId===candidate.id&&binding.diffArtifactId===latestDiff.id&&binding.diffRevision===latestDiff.revision&&binding.commitSha===commitSha&&/^[a-f0-9]{64}$/u.test(binding.candidateFingerprint)&&(!localFingerprint||binding.candidateFingerprint===localFingerprint)&&reviewArtifact?.revision===latestDiff.revision&&reviewData.candidateRunId===candidate.id&&reviewData.diffArtifactId===binding.diffArtifactId&&reviewData.diffRevision===latestDiff.revision&&reviewData.commitSha===commitSha&&reviewData.candidateFingerprint===binding.candidateFingerprint&&reviewData.reviewerRunId===reviewRun.id&&reviewData.disposition&&['approved','changes_requested','insufficient_evidence'].includes(String(reviewData.disposition)));
+  const matchesReviewEvidence=(item:Artifact|undefined)=>{
+    const data=isRecord(item?.data)&&isRecord(item.data.typedReview)?item.data.typedReview:{};
+    return Boolean(candidate&&latestDiff&&commitSha&&reviewRun?.status==='completed'&&binding&&binding.candidateRunId===candidate.id&&binding.diffArtifactId===latestDiff.id&&binding.diffRevision===latestDiff.revision&&binding.commitSha===commitSha&&/^[a-f0-9]{64}$/u.test(binding.candidateFingerprint)&&(!localFingerprint||binding.candidateFingerprint===localFingerprint)&&item?.revision===latestDiff.revision&&data.candidateRunId===candidate.id&&data.diffArtifactId===binding.diffArtifactId&&data.diffRevision===latestDiff.revision&&data.commitSha===commitSha&&data.candidateFingerprint===binding.candidateFingerprint&&data.reviewerRunId===reviewRun.id&&data.disposition&&['approved','changes_requested','insufficient_evidence'].includes(String(data.disposition)));
+  };
+  const reviewMatches=matchesReviewEvidence(reviewArtifact);
   const retrySemanticallyValid=(id:string,item:Artifact)=>{
     if(id===latestDiff?.id){
       const sha=isRecord(item.data)?item.data.candidateRevision:undefined;
-      return typeof sha==='string'&&sha.length>0&&candidateReviews.every(run=>run.reviewBinding?.diffArtifactId===item.id&&run.reviewBinding?.commitSha===sha);
+      return typeof sha==='string'&&/^[a-f0-9]{40,64}$/u.test(sha)&&sha===trustedSha&&candidateReviews.every(run=>run.reviewBinding?.diffArtifactId===item.id&&run.reviewBinding?.commitSha===sha);
     }
-    const data=isRecord(item.data)?item.data:{};
-    if(item.id===reviewArtifact?.id&&isRecord(data.typedReview)&&binding?.candidateRunId===candidate?.id&&binding?.diffArtifactId===latestDiff?.id&&binding?.diffRevision===latestDiff?.revision)return reviewMatches;
-    if(item.id===localQa?.id&&data.localQaContract==='project-local-qa/v2'&&data.verification==='current')return localCurrent;
-    if(item.id===commandQa?.id&&Array.isArray(data.checks)&&data.verification==='current'&&data.stale===false)return commandCurrent;
-    return true;
+    switch(evidenceRoles.get(id)){
+      case 'review':return matchesReviewEvidence(item);
+      case 'required':return currentCheckEvidence(item,true);
+      case 'command':return currentCheckEvidence(item,false);
+      default:return false;
+    }
   };
   useEffect(()=>{
     const recovered=failed.filter(id=>loaded[id]&&retrySemanticallyValid(id,loaded[id]!));
@@ -789,7 +812,7 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
   if(!reviewRun)reviewStatus='Missing';
   else if(['queued','running'].includes(reviewRun.status))reviewStatus='Pending';
   else if(binding?.candidateRunId!==candidate?.id||binding?.diffRevision!==latestDiff?.revision)reviewStatus='Stale';
-  else if(reviewArtifact&&failed.includes(reviewArtifact.id)&&!reviewMatches)reviewStatus='Unknown';
+  else if(reviewArtifact&&failed.includes(reviewArtifact.id))reviewStatus='Unknown';
   else if(reviewArtifact&&!reviewMatches)reviewStatus='Stale';
   else if(reviewMatches)reviewStatus='Current';
   else if(failed.some(id=>metadata.some(item=>item.id===id&&item.runId===reviewRun.id)))reviewStatus='Unknown';
