@@ -3,7 +3,7 @@ import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
-import { workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { resetRateLimitCooldown, workbenchApi, type Snapshot } from '../src/workbench/web/api';
 import type { Message } from '../src/workbench/types';
 
 const member = { id: 'owner', name: 'Owner', email: 'owner@example.test', role: 'owner' as const };
@@ -29,6 +29,7 @@ async function render(route = '/workbench/?view=all') {
 function older() { return [...host.querySelectorAll('button')].find(button => button.textContent === 'Load earlier messages')!; }
 
 beforeEach(() => {
+  resetRateLimitCooldown();
   vi.useFakeTimers();
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected live fetch'); }));
@@ -42,8 +43,43 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await flush(() => root.unmount()); host.remove();
-  expect(fetch).not.toHaveBeenCalled();
-  vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
+  if (host.dataset.realApiTest !== 'true') expect(fetch).not.toHaveBeenCalled();
+  resetRateLimitCooldown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
+});
+
+it('shares a real API 429 cooldown between snapshot and focused history pollers', async () => {
+  host.dataset.realApiTest = 'true';
+  const workSnapshot = { ...snapshot(), works: [work] };
+  vi.spyOn(workbenchApi, 'me').mockRestore();
+  vi.spyOn(workbenchApi, 'snapshot').mockRestore();
+  vi.spyOn(workbenchApi, 'projectMessages').mockRestore();
+  let limited = false;
+  const calls: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const path = String(input); calls.push(path);
+    if (path.endsWith('/me')) return Response.json(member);
+    if (path.endsWith('/snapshot')) {
+      if (limited) { limited = false; return new Response(JSON.stringify({ message: 'limited' }), { status: 429, headers: { 'Retry-After': '6' } }); }
+      return Response.json(workSnapshot);
+    }
+    if (path.includes('/messages')) {
+      if (limited) { limited = false; return new Response(JSON.stringify({ message: 'limited' }), { status: 429, headers: { 'Retry-After': '6' } }); }
+      return Response.json({ messages: [], nextBefore: null });
+    }
+    throw new Error(`Unexpected API path ${path}`);
+  }));
+  await render(`/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+  expect(calls.filter(path => path.endsWith('/snapshot'))).toHaveLength(1);
+  expect(calls.filter(path => path.includes('/messages'))).toHaveLength(1);
+  limited = true;
+  await tick();
+  const snapshotCount = calls.filter(path => path.endsWith('/snapshot')).length;
+  const historyCount = calls.filter(path => path.includes('/messages')).length;
+  await tick(2);
+  expect(calls.filter(path => path.endsWith('/snapshot'))).toHaveLength(snapshotCount);
+  expect(calls.filter(path => path.includes('/messages'))).toHaveLength(historyCount);
+  await tick();
+  expect(calls.filter(path => path.endsWith('/snapshot')).length + calls.filter(path => path.includes('/messages')).length).toBeGreaterThan(snapshotCount + historyCount);
 });
 
 describe('All projects polling budget', () => {

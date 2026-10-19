@@ -29,20 +29,38 @@ export interface ProviderConnection {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number) {
+  constructor(message: string, public status: number, public retryAfter?: string | null) {
     super(message);
   }
 }
 
+let cooldownUntil = 0;
+let authScopeEpoch = 0;
+
+export function canAutoPoll(now = Date.now()) { return now >= cooldownUntil; }
+export function resetRateLimitCooldown() { cooldownUntil = 0; authScopeEpoch++; }
+
+function applyRetryAfter(value: string | null, now: number) {
+  const seconds = value?.trim();
+  const deadline = seconds && /^\d+$/u.test(seconds) ? now + Number(seconds) * 1_000 : seconds ? Date.parse(seconds) : NaN;
+  const valid = Number.isFinite(deadline) && deadline >= now;
+  cooldownUntil = Math.max(cooldownUntil, valid ? deadline : now + 2_000);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const requestEpoch = authScopeEpoch;
   const response = await fetch(`/api/workbench${path}`, {
     ...init,
     credentials: 'same-origin',
     headers: { ...(init?.body ? { 'content-type': 'application/json' } : {}), ...init?.headers },
   });
   if (!response.ok) {
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('Retry-After');
+      if (requestEpoch === authScopeEpoch) applyRetryAfter(retryAfter, Date.now());
+    }
     const body = await response.json().catch(() => null) as { message?: string } | null;
-    throw new ApiError(body?.message ?? `Request failed (${response.status})`, response.status);
+    throw new ApiError(body?.message ?? `Request failed (${response.status})`, response.status, response.status === 429 ? response.headers.get('Retry-After') : undefined);
   }
   if (response.status === 204) return undefined as T;
   return await response.json() as T;

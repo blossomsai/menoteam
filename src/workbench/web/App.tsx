@@ -9,7 +9,7 @@ import { DIFF_VISIBLE_CHARS, historicalDiffRows, initialDiffPageState, parseDiff
 import type { Artifact, Member, Message, Project, Run, Setting, Work } from '../types';
 import { isCausalMasterWake } from '../types';
 import { hasRequiredLocalQa, qaPolicySnapshot } from '../local-qa';
-import { ApiError, workbenchApi, type Snapshot } from './api';
+import { ApiError, canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot } from './api';
 import { canManageProject, filterWorks, readRoute, selectProject, selectWork, type Route, type View } from './routes';
 import { cancelInstructionsDraft, completeInstructionsSave, editInstructionsDraft, hasRemoteInstructionsUpdate, keepInstructionsDraft, startInstructionsDraft, useLatestInstructions } from './instructions-draft';
 import { createSnapshotRequestHandler } from './snapshot-request';
@@ -36,6 +36,7 @@ function App() {
 
   const invalidateSession = useCallback((state: 'loading' | 'authenticating' | 'anonymous') => {
     const generation = ++sessionGenerationRef.current;
+    resetRateLimitCooldown();
     snapshotRequestsEnabledRef.current = false;
     setSnapshot(null); setMember(null); setError(''); setSessionState(state);
     return generation;
@@ -91,7 +92,7 @@ function App() {
     const sessionGeneration = sessionGenerationRef.current;
     let active = false;
     const timer = window.setInterval(() => {
-      if (document.hidden || active || sessionGeneration !== sessionGenerationRef.current) return;
+      if (document.hidden || active || !canAutoPoll() || sessionGeneration !== sessionGenerationRef.current) return;
       active = true;
       void requestSnapshot().catch(() => undefined).finally(() => { active = false; });
     }, 2_000);
@@ -351,7 +352,7 @@ function useMessageHistory(projectId: string, workId?: string, poll = true) {
     messagesRef.current = []; setMessages([]); setNextBefore(null); setLoadingOlder(false);
     void workbenchApi.projectMessages(projectId, query).then(result => { if (active) { merge(result.messages); setNextBefore(result.nextBefore); } }).catch(() => undefined).finally(() => { pending = false; });
     const timer = poll ? window.setInterval(() => {
-      if (!active || pending || document.hidden) return;
+      if (!active || pending || document.hidden || !canAutoPoll()) return;
       pending = true;
       const last = messagesRef.current.at(-1)?.createdAt;
       const after = last ? new Date(new Date(last).getTime() - 2_000).toISOString() : undefined;
@@ -687,20 +688,36 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
   const [loaded,setLoaded]=useState<Record<string,Artifact>>({});
   const [failed,setFailed]=useState<string[]>([]);
   const [loading,setLoading]=useState(false);
+  const [retryMessage,setRetryMessage]=useState('');
+  const evidenceGeneration=useRef(0);
+  const retryPending=useRef(false);
+  const expectedArtifacts=new Map<string,Artifact>([[latestDiff?.id??'',latestDiff!],...metadata.map(item=>[item.id,item] as [string,Artifact])]);
+  const loadEvidence=async(ids:string[],generation:number,replace:boolean)=>{
+    const results=await Promise.all(ids.map(async id=>{try{return await workbenchApi.artifact(id);}catch{return null;}}));
+    if(generation!==evidenceGeneration.current)return;
+    const valid:Record<string,Artifact>={},missing:string[]=[];
+    results.forEach((result,index)=>{const id=ids[index]!,reference=expectedArtifacts.get(id);if(!result||!reference||result.id!==id||result.workId!==work.id||result.projectId!==work.projectId||result.runId!==reference.runId||result.kind!==reference.kind||result.revision!==reference.revision)missing.push(id);else valid[id]=result;});
+    setLoaded(current=>replace?valid:{...current,...valid});
+    setFailed(current=>[...new Set([...(replace?[]:current.filter(id=>!ids.includes(id))),...missing])]);
+    setLoading(false);retryPending.current=false;
+    if(!missing.length)setRetryMessage('');
+  };
   useEffect(()=>{
-    let active=true;
-    if(!latestDiff){setLoaded({});setFailed([]);setLoading(false);return()=>{active=false;};}
+    const generation=++evidenceGeneration.current;
+    retryPending.current=false;setRetryMessage('');
+    if(!latestDiff){setLoaded({});setFailed([]);setLoading(false);return()=>{++evidenceGeneration.current;};}
     const ids=[latestDiff.id,...metadata.map(item=>item.id)];
-    const expected=new Map< string,Artifact>([[latestDiff.id,latestDiff],...metadata.map(item=>[item.id,item] as [string,Artifact])]);
     setLoaded({});setFailed([]);setLoading(true);
-    void Promise.all(ids.map(async id=>{try{return await workbenchApi.artifact(id);}catch{return null;}})).then(results=>{
-      if(!active)return;
-      const next:Record<string,Artifact>={};const missing:string[]=[];
-      results.forEach((result,index)=>{const id=ids[index]!,reference=expected.get(id);if(!result||!reference||result.id!==id||result.workId!==work.id||result.projectId!==work.projectId||result.runId!==reference.runId||result.kind!==reference.kind||result.revision!==reference.revision)missing.push(id);else next[id]=result;});
-      setLoaded(next);setFailed(missing);setLoading(false);
-    });
-    return()=>{active=false;};
+    void loadEvidence(ids,generation,true);
+    return()=>{++evidenceGeneration.current;};
   },[requestKey,work.id,work.projectId]);
+
+  const retryFailedEvidence=async()=>{
+    if(loading||retryPending.current||!failed.length)return;
+    if(!canAutoPoll()){setRetryMessage('Please wait for the server cooldown before retrying.');return;}
+    retryPending.current=true;setLoading(true);setRetryMessage('');
+    await loadEvidence([...failed],evidenceGeneration.current,false);
+  };
 
   const diff=latestDiff?loaded[latestDiff.id]:undefined;
   const diffData=isRecord(diff?.data)?diff.data:{};
@@ -764,6 +781,7 @@ function QaEvidencePanel({sessionKey,work,latestDiff,artifacts,runs}:{sessionKey
       <p className="break-all rounded-md bg-muted/40 p-3 text-xs text-muted-foreground">Current candidate · {candidate?.id??latestDiff.runId} · {commitSha??'commit unavailable'}</p>
       {loading&&<p role="status" className="text-sm text-muted-foreground">Loading candidate evidence…</p>}
       {failed.length>0&&!loading&&<p role="status" className="text-sm text-muted-foreground">Some evidence could not be loaded. Those results remain unknown.</p>}
+      {failed.length>0&&<div className="flex flex-wrap items-center gap-3"><Button variant="outline" disabled={loading} onClick={()=>void retryFailedEvidence()}>{loading?'Retrying evidence…':'Retry failed evidence'}</Button>{retryMessage&&<span role="status" className="text-sm text-muted-foreground">{retryMessage}</span>}</div>}
       <EvidenceSection title="Required checks" status={requiredStatus} detail={requiredDetail}/>
       <EvidenceSection title="Command checks" status={commandStatus} detail={commandDetail}/>
       <section className="min-w-0 space-y-2 rounded-lg border border-border p-3"><header className="flex items-center justify-between gap-3"><h3 className="text-sm font-medium">Typed review</h3><Badge variant={statusVariant(reviewStatus)}>{reviewStatus==='Current'?'Current evidence':reviewStatus}</Badge></header><p className="min-w-0 wrap-anywhere text-sm text-muted-foreground">{reviewRun?`Run ${reviewRun.id} · ${reviewMatches?String(reviewData.disposition):reviewStatus==='Stale'?'does not match the latest candidate':'result unavailable'}`:'No review is recorded.'}</p>{reviewMatches&&Array.isArray(reviewData.findings)&&reviewData.findings.map((item,index)=>isRecord(item)?<p key={String(item.id??index)} className="min-w-0 wrap-anywhere text-sm">{item.blocking===true?'Blocking · ':''}{String(item.summary??'Finding')}</p>:null)}{reviewStatus==='Stale'&&<p className="text-xs text-amber-800">This review does not match the latest candidate and cannot approve it.</p>}</section>

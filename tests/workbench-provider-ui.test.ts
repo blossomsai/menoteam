@@ -1037,6 +1037,35 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('Current evidence');
   });
 
+  it('keeps a failed diff unknown and lets the user retry only failed evidence after cooldown', async () => {
+    window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
+    const fixture=reviewOverviewFixture();
+    const diff=fixture.snapshot.artifacts.find(item=>item.kind==='diff')!;
+    const requested:string[]=[];
+    let firstDiff=true;
+    vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL)=>{
+      const path=String(input),id=decodeURIComponent(path.split('/artifacts/')[1]??'').split('/')[0]!;requested.push(id);
+      if(id===diff.id&&firstDiff){firstDiff=false;return new Response(JSON.stringify({message:'limited'}),{status:429});}
+      return Response.json(id===diff.id?diff:fixture.qa);
+    }));
+    await mount(fixture.snapshot);await flush();
+    expect(host.textContent).toContain('Some evidence could not be loaded');
+    expect(host.textContent).toContain('Those results remain unknown');
+    const retry=button('Retry failed evidence');
+    await flush(()=>retry.click());
+    expect(requested.filter(id=>id===diff.id)).toHaveLength(1);
+    expect(host.textContent).toContain('Please wait for the server cooldown');
+    await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
+    await flush();
+    const refreshed=button('Retry failed evidence');
+    await flush(()=>{refreshed.click();refreshed.click();});
+    await flush();
+    expect(requested.filter(id=>id===diff.id)).toHaveLength(2);
+    expect(requested.filter(id=>id===fixture.metadata.id)).toHaveLength(1);
+    expect(host.textContent).toContain('candidate-commit');
+    expect(host.textContent).not.toContain('Some evidence could not be loaded');
+  });
+
   it('keeps freshness separate from failed command results', async () => {
     window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work-1&tab=qa');
     const work = { id: 'work-1', projectId: project.id, title: 'Failed current checks', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
