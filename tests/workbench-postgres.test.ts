@@ -17,6 +17,38 @@ import { WorkbenchConnectorClient } from "../src/connector/client.js";
 import type { Artifact, Project, Run, Setting, Work } from "../src/workbench/types.js";
 import { enqueueSlackReply, processSlackReplies, type SlackTransport } from '../src/workbench/slack-replies.js';
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
+
+async function discardPersistedChunkAck(response: Response): Promise<never> {
+    await response.arrayBuffer();
+    throw new Error('Fixture ACK loss after PostgreSQL persisted the chunk');
+}
+
+it('consumes the persisted chunk response body before simulating ACK loss', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const response = new Response(new ReadableStream<Uint8Array>({ start(value) {
+        controller = value;
+        controller.enqueue(new TextEncoder().encode('{"persisted":true}'));
+    } }));
+    const events: string[] = [];
+    const consume = response.arrayBuffer.bind(response);
+    vi.spyOn(response, 'arrayBuffer').mockImplementation(async () => {
+        const bytes = await consume();
+        events.push('body consumed');
+        return bytes;
+    });
+    const ackLoss = discardPersistedChunkAck(response).catch(error => {
+        events.push('ACK lost');
+        throw error;
+    });
+    const rejection = expect(ackLoss).rejects.toThrow('Fixture ACK loss after PostgreSQL persisted the chunk');
+    await Promise.resolve();
+    expect(response.bodyUsed).toBe(true);
+    expect(events).toEqual([]);
+    controller.close();
+    await rejection;
+    expect(events).toEqual(['body consumed', 'ACK lost']);
+});
+
 describe.skipIf(!url)("Real workbench PostgreSQL", () => {
     let sql: ReturnType<typeof postgres>;
     let app: Awaited<ReturnType<typeof createWorkbenchApp>>;
@@ -2072,7 +2104,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(snap.json().projects.map((p:any)=>p.id).sort()).toEqual(before.projects.map((p:any)=>p.id).sort());
         expect(snap.json().messages.length).toBeGreaterThan(1);
     });
-    it('isolated PostgreSQL persists >1 MiB cross-generation chunks and verifies member/reviewer pages without fencing renewal',async()=>{
+    it('isolated PostgreSQL persists >1 MiB cross-generation chunks and verifies member/reviewer pages without fencing renewal',async(context)=>{
+        let phase='setup';
+        context.onTestFailed(()=>{console.error(`[large persisted diff fixture] last phase: ${phase}`);});
         const p=checkedJson(await user('POST','/projects',{name:'Large persisted diff fixture'}));
         const enrolled=await enrollProvider(`large-diff-${randomUUID()}`,[p.id]);
         const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Large file upload'}));
@@ -2082,7 +2116,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const artifact=String(input).endsWith('/artifacts')?JSON.parse(String(init?.body)):undefined;
             if(artifact){const length=Buffer.byteLength(String(init?.body));postBytes.push(length);expect(length).toBeLessThan(1048576);}
             const response=await fetch(input,init);
-            if(dropAck&&artifact?.kind==='diff_file_chunk'&&artifact.data.chunkIndex===0&&response.ok){dropAck=false;throw new Error('Fixture ACK loss after PostgreSQL persisted the chunk');}
+            if(dropAck&&artifact?.kind==='diff_file_chunk'&&artifact.data.chunkIndex===0&&response.ok){dropAck=false;return discardPersistedChunkAck(response);}
             return response;
         },['gpt-6-luna','gpt-6.1-sol']);
         const claim=await client.claim(['implementation']);expect(claim?.run.id).toBe(queued.run.id);let run=claim!.run;
@@ -2092,11 +2126,13 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         let parent=await client.addArtifact(run.id,run.generation,{kind:'diff',revision,requestId:`diff:${run.id}:${run.generation}`,data:{baseRevision,candidateRevision,diffFileChunksVersion:1,totalFiles:1,additions:56000,deletions:0,truncated:true,patch:'bounded preview',files:[{path:filePath,status:'added',binary:false,additions:56000,deletions:0,chunkCount:parts.length,textBytes:fileBytes,fileSha256}]}});
         let legacyIds=true;const payload=(index:number)=>({kind:'diff_file_chunk' as const,revision,requestId:`diff-file:${legacyIds?candidateRevision:createHash('sha256').update(parent.id).digest('hex')}:${createHash('sha256').update(filePath).digest('hex')}:${index}`,data:{parentArtifactId:parent.id,projectId:p.id,workId:work.id,runId:run.id,baseRevision,candidateRevision,diffRevision:revision,path:filePath,chunkIndex:index,chunkCount:parts.length,fileByteLength:fileBytes,fileSha256,chunkSha256:createHash('sha256').update(parts[index]!).digest('hex'),contentBase64:parts[index]!.toString('base64')}});
         const count=async()=>Number((await sql`SELECT count(*)::int AS count FROM wb_records WHERE kind='artifact' AND project_id=${p.id} AND data->>'kind'='diff_file_chunk' AND data->'data'->>'parentArtifactId'=${parent.id}`)[0]!.count);
+        phase='persisted chunk ACK loss and replay';
         await expect(client.addArtifact(run.id,run.generation,payload(0))).rejects.toThrow('Fixture ACK loss');expect(await count()).toBe(1);
         const retry=await client.addArtifact(run.id,run.generation,payload(0));expect(retry.id).toBe(`artifact:${run.id}:${payload(0).requestId}`);expect(await count()).toBe(1);
         expect((await client.addArtifact(run.id,run.generation,payload(0))).id).toBe(retry.id);expect(await count()).toBe(1);
         const changed=Buffer.from('different bytes\n');await expect(client.addArtifact(run.id,run.generation,{...payload(0),data:{...payload(0).data,contentBase64:changed.toString('base64'),chunkSha256:createHash('sha256').update(changed).digest('hex')}})).rejects.toMatchObject({status:409});expect(await count()).toBe(1);
         const query=new URLSearchParams({path:filePath,revision});const partial=await fetch(`${serverUrl}/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file?${query}`,{headers:{cookie}});expect(partial.status).toBe(200);expect(await partial.json()).toMatchObject({complete:false,incomplete:true});
+        phase='cross-generation resume and upload';
         const oldParent=parent,oldRequest=payload(0),oldGeneration=run.generation;
         expect((await user('POST',`/runs/${run.id}/pause`,{})).statusCode).toBe(200);
         await client.stopped(run.id,run.generation,'cross-generation-thread');
@@ -2108,6 +2144,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await client.addArtifact(run.id,run.generation,payload(0))).id).toBe(`artifact:${run.id}:${payload(0).requestId}`);expect(await count()).toBe(1);
         expect((await sql`SELECT data FROM wb_records WHERE id=${retry.id}`)[0]!.data.data).toEqual(oldRequest.data);
         for(let index=1;index<parts.length;index++)await client.addArtifact(run.id,run.generation,payload(index));expect(await count()).toBe(parts.length);
+        phase='latest diff indexed lookup and persisted metadata';
         const artifactStore=new WorkbenchStore(sql);
         // Actual latestWorkDiff SQL, with enough project-local payload rows to expose a project scan.
         await sql`INSERT INTO wb_records(id,kind,project_id,data)
@@ -2133,9 +2170,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(await count()).toBe(parts.length);
         const saved=(await sql`SELECT data FROM wb_records WHERE id=${parent.id} AND kind='artifact'`)[0]!.data;expect(saved.data.files[0]).toMatchObject({path:filePath,textBytes:fileBytes,fileSha256,chunkCount:parts.length});
         // Restart the reader with the same PostgreSQL store; no Connector is used for the offline reads.
+        phase='restart offline reader';
         await app.close();app=await createWorkbenchApp({sql,sourceFetcher:(...args)=>sourceFetch(...args)});const readerUrl=await app.listen({port:0,host:'127.0.0.1'});
         const owner=await fetch(`${readerUrl}/api/workbench/me`,{headers:{cookie}});expect(owner.status).toBe(200);expect(await owner.json()).toMatchObject({role:'owner'});
         let cursor:string|undefined,total=0;const seen=new Set<string>(),reconstructed=createHash('sha256');
+        phase='offline member page reconstruction';
         for(let index=0;index<parts.length;index++){
             const parameters=new URLSearchParams({path:filePath,revision,...(cursor?{cursor}:{})});const response=await fetch(`${readerUrl}/api/workbench/artifacts/${encodeURIComponent(parent.id)}/diff-file?${parameters}`,{headers:{cookie}});expect(response.status).toBe(200);const page=await response.json() as any;
             const bytes=Buffer.from(page.contentBase64,'base64');expect(bytes.equals(parts[index]!)).toBe(true);reconstructed.update(bytes);total+=bytes.length;expect(page.fileSha256).toBe(fileSha256);expect(page.chunkIndex).toBe(index);expect(page.complete).toBe(index===parts.length-1);expect(page.integrity).toBe(index===parts.length-1?'verified':'pending');
@@ -2144,6 +2183,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(total).toBe(fileBytes);expect(reconstructed.digest('hex')).toBe(fileSha256);expect(postBytes.every(length=>length<1048576)).toBe(true);
         // Gate a real PostgreSQL verification batch outside the mutation transaction.
         // Renewal must finish before the gate is released, for both HTTP readers.
+        phase='restart renewal-gated reader';
         await app.close();let reached:()=>void=()=>{},release:()=>void=()=>{},barrier:Promise<void>|undefined;
         let gate=false,batchQueries=0;const sqlProxy=new Proxy(sql,{apply(target,thisArg,args){
             const query=(args[0] as TemplateStringsArray).join('?');
@@ -2172,10 +2212,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             }finally{release();}
             const result=await response;expect(batchQueries-before).toBe(Math.ceil(parts.length/4));return result;
         };
+        phase='member verification with concurrent renewal';
         const memberPage=await whileReading(memberRead,otherRun);expect(memberPage.statusCode,memberPage.body).toBe(200);expect(memberPage.json().integrity).toBe('verified');
         const staleParent={...parent,id:parent.id+':newer',createdAt:new Date().toISOString()};
         const staleMember=await whileReading(memberRead,otherRun,()=>new WorkbenchStore(sql).put('artifact',staleParent));expect(staleMember.statusCode).toBe(409);
         await sql`DELETE FROM wb_records WHERE id=${staleParent.id}`;
+        phase='dispatch and claim reviewer';
         checkedJson(await send(`/runs/${run.id}/artifacts`,{generation:run.generation,kind:'qa',revision,requestId:'fixture-review-evidence',data:{candidateFingerprint:'c'.repeat(64),checks:[],stale:false}}));
         checkedJson(await send(`/runs/${run.id}/complete`,{generation:run.generation,threadId:'cross-generation-thread'}));
         const master=checkedJson(await send('/claim',{})).run;
@@ -2183,7 +2225,9 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         checkedJson(await send(`/runs/${master.id}/complete`,{generation:master.generation,threadId:'master-thread'}));
         const reviewer=checkedJson(await send('/claim',{capabilities:{runKinds:['review']}})).run;expect(reviewer.id).toBe(review.id);
         const reviewerRead=()=>send(`/runs/${reviewer.id}/tools`,{generation:reviewer.generation,action:'read_diff_file',input:{diffArtifactId:parent.id,revision,path:filePath,cursor:finalCursor},requestId:randomUUID()});
+        phase='reviewer verification with concurrent renewal';
         const reviewPage=await whileReading(reviewerRead,otherRun);expect(reviewPage.statusCode,reviewPage.body).toBe(200);expect(reviewPage.json().integrity).toBe('verified');
+        phase='reviewer replay journal and request collisions';
         const collisionId=randomUUID(),scope=`tools:${reviewer.id}`,priorAction={id:'immutable-prior-action'};
         await sql`INSERT INTO wb_requests(scope,request_id,result) VALUES (${scope},${collisionId},${sql.json(priorAction)})`;
         const readWithId=(requestId:string,path=filePath)=>send(`/runs/${reviewer.id}/tools`,{generation:reviewer.generation,action:'read_diff_file',input:{diffArtifactId:parent.id,revision,path,cursor:finalCursor},requestId});
@@ -2205,9 +2249,11 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await readWithId(retryId)).statusCode).toBe(409);expect(await journalBytes()).toBe(savedJournal);
         const newerRun=await genericRead('read_run',{runId:run.id},randomUUID());expect(newerRun.statusCode,newerRun.body).toBe(200);expect(newerRun.json().run).toEqual(plainRun.json().run);expect(newerRun.json().artifacts.some((artifact:any)=>artifact.kind==='qa'&&artifact.revision===revision)).toBe(true);expect(newerRun.body).not.toContain('contentBase64');
         await sql`DELETE FROM wb_records WHERE id=${staleParent.id}`;
+        phase='reviewer binding and generation invalidation';
         const stale=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json('e'.repeat(40))}) WHERE id=${reviewer.id}`;});expect(stale.statusCode).toBe(409);
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{reviewBinding,commitSha}',${sql.json(candidateRevision)}) WHERE id=${reviewer.id}`;
         const revoked=await whileReading(reviewerRead,otherRun,async()=>{await sql`UPDATE wb_records SET data=jsonb_set(data,'{generation}',${sql.json(reviewer.generation+1)}) WHERE id=${reviewer.id}`;});expect(revoked.statusCode).toBe(409);
+        phase='missing and corrupt persisted chunk evidence';
         // Legacy IDs remain readable, but missing storage/metadata or hash corruption cannot verify.
         await sql`DELETE FROM wb_records WHERE kind='artifact' AND data->'data'->>'parentArtifactId'=${parent.id} AND data->'data'->>'chunkIndex'='1'`;
         const incomplete=await memberRead();expect(incomplete.statusCode).toBe(200);expect(incomplete.json().integrity).toBe('incomplete');
