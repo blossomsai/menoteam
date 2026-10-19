@@ -34,10 +34,10 @@ function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) 
 let root: Root;
 let host: HTMLDivElement;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
-async function mount(current: Snapshot, strictMode = false) {
+async function mount(current: Snapshot, strictMode = false, projectMessagesImplementation?: typeof workbenchApi.projectMessages) {
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(current.member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(current);
-  vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [], nextBefore: null });
+  vi.spyOn(workbenchApi, 'projectMessages').mockImplementation(projectMessagesImplementation ?? (async () => ({ messages: [], nextBefore: null })));
   vi.spyOn(workbenchApi, 'projectMembers').mockResolvedValue({ members: [current.member] });
   await flush(() => root.render(strictMode ? createElement(StrictMode, null, createElement(App)) : createElement(App)));
 }
@@ -57,6 +57,127 @@ async function typeInput(input: HTMLInputElement | HTMLTextAreaElement, value: s
 async function choose(selector: string, value: string) { const select = host.querySelector<HTMLSelectElement>(selector)!; await flush(() => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }); }
 async function chooseSelect(select: HTMLSelectElement, value: string) { await flush(() => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }); }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
+
+describe('mounted message history recovery', () => {
+  function masterRoute(current = snapshot()) {
+    window.history.replaceState(null, '', `/workbench/?view=master&project=${project.id}`);
+    return current;
+  }
+
+  it('distinguishes first-load failure from a genuinely empty conversation and retries the failed request', async () => {
+    const current = masterRoute();
+    const history = vi.fn<typeof workbenchApi.projectMessages>()
+      .mockRejectedValueOnce(new Error('History unavailable'))
+      .mockResolvedValueOnce({ messages: [], nextBefore: null });
+    await mount(current, false, history);
+    await flush();
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('History unavailable');
+    expect(host.textContent).not.toContain('No messages yet. Send a message to begin.');
+    expect(history).toHaveBeenCalledTimes(1);
+    await type('input[aria-label="Message Master"]', 'Draft survives history failure');
+    await flush(() => button('Retry').click());
+    expect(history).toHaveBeenCalledTimes(2);
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe('Draft survives history failure');
+    expect(host.textContent).toContain('No messages yet. Send a message to begin.');
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('keeps loaded messages after an incremental request fails and retries from the current cursor', async () => {
+    const original = { id: 'loaded', projectId: project.id, speaker: 'Master', role: 'agent' as const, text: 'Already loaded', createdAt: '2026-10-19T10:00:00.000Z' };
+    const added = { ...original, id: 'incremental', text: 'Recovered update', createdAt: '2026-10-19T10:00:03.000Z' };
+    const current = masterRoute();
+    const history = vi.fn<typeof workbenchApi.projectMessages>()
+      .mockResolvedValueOnce({ messages: [original], nextBefore: null })
+      .mockRejectedValueOnce(new Error('Incremental request failed'))
+      .mockResolvedValueOnce({ messages: [added], nextBefore: null });
+    await mount(current, false, history);
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(host.textContent).toContain('Already loaded');
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Incremental request failed');
+    expect(host.textContent).not.toContain('No messages yet. Send a message to begin.');
+    await flush(() => button('Retry').click());
+    expect(history).toHaveBeenCalledTimes(3);
+    expect(history.mock.calls[2]?.[1]).toEqual({ after: '2026-10-19T09:59:58.000Z' });
+    expect(host.textContent).toContain('Already loaded');
+    expect(host.textContent).toContain('Recovered update');
+  });
+
+  it('releases older-load pending state after failure, blocks duplicate clicks, and retries the same cursor', async () => {
+    const current = masterRoute();
+    const first = { id: 'newest', projectId: project.id, speaker: 'Master', role: 'agent' as const, text: 'Newest message', createdAt: '2026-10-19T10:00:00.000Z' };
+    const older = { ...first, id: 'older', text: 'Older message', createdAt: '2026-10-18T10:00:00.000Z' };
+    const history = vi.fn<typeof workbenchApi.projectMessages>()
+      .mockResolvedValueOnce({ messages: [first], nextBefore: 'cursor-older' })
+      .mockRejectedValueOnce(new Error('Older page failed'))
+      .mockResolvedValueOnce({ messages: [older], nextBefore: null });
+    await mount(current, false, history);
+    await flush();
+    await flush(() => { button('Load earlier messages').click(); button('Load earlier messages').click(); });
+    expect(history).toHaveBeenCalledTimes(2);
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('Older page failed');
+    expect(button('Retry loading earlier messages').disabled).toBe(false);
+    await flush(() => button('Retry loading earlier messages').click());
+    expect(history).toHaveBeenCalledTimes(3);
+    expect(history.mock.calls[2]?.[1]).toEqual({ before: 'cursor-older' });
+    expect(host.textContent).toContain('Newest message');
+    expect(host.textContent).toContain('Older message');
+  });
+
+  it('ignores a late response from the prior Work scope', async () => {
+    const current = snapshot();
+    const work = { id: 'old-work', projectId: project.id, title: 'Old Work', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    const nextWork = { ...work, id: 'next-work', title: 'Next Work' };
+    current.works = [work, nextWork];
+    window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    const oldResponse = deferred<{ messages: typeof current.messages; nextBefore: string | null }>();
+    const history = vi.fn<typeof workbenchApi.projectMessages>().mockReturnValueOnce(oldResponse.promise).mockResolvedValueOnce({ messages: [], nextBefore: null });
+    await mount(current, false, history);
+    window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${nextWork.id}`);
+    await flush(() => root.render(createElement(App)));
+    oldResponse.resolve({ messages: [{ id: 'private-old', projectId: project.id, workId: work.id, speaker: 'Agent', role: 'agent', text: 'Old Work private message', createdAt: '' }], nextBefore: null });
+    await flush();
+    expect(host.textContent).toContain('Next Work');
+    expect(host.textContent).not.toContain('Old Work private message');
+  });
+
+  it('ignores a late history response after the authenticated session ends', async () => {
+    const current = snapshot();
+    const work = { id: 'session-work', projectId: project.id, title: 'Session Work', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    current.works = [work];
+    window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    const pending = deferred<{ messages: typeof current.messages; nextBefore: string | null }>();
+    const history = vi.fn<typeof workbenchApi.projectMessages>().mockReturnValueOnce(pending.promise);
+    vi.spyOn(workbenchApi, 'logout').mockResolvedValue(undefined);
+    await mount(current, false, history);
+    await flush(() => button('Sign out').click());
+    expect(host.textContent).toContain('Sign in');
+    pending.resolve({ messages: [{ id: 'old-session', projectId: project.id, workId: work.id, speaker: 'Agent', role: 'agent', text: 'Old session private message', createdAt: '' }], nextBefore: null });
+    await flush();
+    expect(host.textContent).toContain('Sign in');
+    expect(host.textContent).not.toContain('Old session private message');
+  });
+
+  it('renders accessible lucide actions, removes unavailable composer controls, and keeps participant initials', async () => {
+    const current = snapshot();
+    const work = { id: 'icon-work', projectId: project.id, title: 'Icon Work', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
+    current.works = [work];
+    current.messages = [
+      ...['Master', 'Coder', 'QA'].map((speaker, index) => ({ id: `speaker-${index}`, projectId: project.id, workId: work.id, speaker, role: 'agent' as const, text: `${speaker} reply`, createdAt: `2026-10-19T10:00:0${index}.000Z` })),
+      { id: 'user-message', projectId: project.id, workId: work.id, speaker: 'user', role: 'user' as const, text: 'User reply', createdAt: '2026-10-19T10:00:03.000Z' },
+    ];
+    window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
+    await mount(current);
+    expect(host.textContent).not.toContain('Attachments not available yet');
+    expect(host.textContent).not.toContain('Voice input not available yet');
+    expect([...host.querySelectorAll('button[aria-label]')].some(item => item.getAttribute('aria-label') === 'Send message')).toBe(true);
+    expect(host.querySelectorAll('button[aria-label="Send message"] svg[aria-hidden="true"]')).toHaveLength(1);
+    const composer = host.querySelector('form');
+    expect(composer?.querySelectorAll('svg[aria-hidden="true"]')).toHaveLength(3);
+    expect(composer?.querySelectorAll('button')).toHaveLength(1);
+    expect([...host.querySelectorAll('article > span')].map(item => item.textContent)).toEqual(['M', 'C', 'Q', 'O']);
+  });
+});
 
 beforeEach(() => {
   resetRateLimitCooldown();
