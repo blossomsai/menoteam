@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ChevronRight, LogOut, Menu, Plus, Send } from 'lucide-react';
 import { Badge } from '../../local/web/src/components/ui/badge';
 import { Button } from '../../local/web/src/components/ui/button';
 import { Input } from '../../local/web/src/components/ui/input';
@@ -211,16 +212,16 @@ function WorkbenchShell({ member, snapshot, route, error, refresh, onLogout }: {
           </div>
         </section>)}
         <div className="mt-auto grid gap-1 border-t border-border pt-3">
-          {canCreateProjects && <NavLink active={selectedView === 'connect'} href={href('connect')}>＋ Add project</NavLink>}
+          {canCreateProjects && <NavLink active={selectedView === 'connect'} href={href('connect')}><Plus aria-hidden="true" className="mr-1 inline size-4" />Add project</NavLink>}
           {member.role !== 'member' && <><NavLink active={['agent-profiles', 'model-providers', 'workspace-skills'].includes(selectedView)} href={href('agent-profiles')}>Workspace settings</NavLink><div className="ml-4 grid gap-0.5 border-l border-border pl-3"><NavLink active={selectedView === 'workspace-skills'} href={href('workspace-skills')}>Workspace skills</NavLink></div></>}
         </div>
       </nav>
-      <button type="button" className="mt-3 flex items-center gap-2 border-t border-border px-2 pt-3 text-left" onClick={() => void onLogout()}><span className="grid size-8 place-items-center rounded-full bg-accent text-xs font-semibold text-accent-foreground">{member.name.slice(0, 1).toUpperCase()}</span><span className="grid min-w-0 flex-1"><strong className="truncate text-sm">{member.name}</strong><small className="text-muted-foreground">{member.role}</small></span><span aria-hidden="true">↪</span></button>
+      <button type="button" aria-label="Sign out" className="mt-3 flex items-center gap-2 border-t border-border px-2 pt-3 text-left" onClick={() => void onLogout()}><span className="grid size-8 place-items-center rounded-full bg-accent text-xs font-semibold text-accent-foreground">{member.name.slice(0, 1).toUpperCase()}</span><span className="grid min-w-0 flex-1"><strong className="truncate text-sm">{member.name}</strong><small className="text-muted-foreground">{member.role}</small></span><LogOut aria-hidden="true" className="size-4" /></button>
     </aside>
     {mobileNav && <button className="fixed inset-0 z-30 bg-black/20 md:hidden" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
     <main className="flex min-w-0 flex-1 flex-col">
       <header className="sticky top-0 z-20 flex min-h-14 min-w-0 items-center gap-3 border-b border-border bg-background/95 px-4 backdrop-blur md:px-7">
-        <Button variant="ghost" size="icon-sm" className="md:hidden" aria-label="Open navigation" onClick={() => setMobileNav(!mobileNav)}>☰</Button>
+        <Button variant="ghost" size="icon-sm" className="md:hidden" aria-label="Open navigation" onClick={() => setMobileNav(!mobileNav)}><Menu aria-hidden="true" className="size-4" /></Button>
         <Breadcrumb route={route} project={project} work={currentWork} />
       </header>
       {report && <div role="alert" className="flex items-center justify-between gap-3 border-b border-destructive/30 bg-destructive/5 px-5 py-2.5 text-sm text-destructive"><span>{report}</span><Button variant="ghost" size="sm" onClick={() => { setLocalError(''); void refresh().catch(() => undefined); }}>Retry</Button></div>}
@@ -237,7 +238,7 @@ function Breadcrumb({ route, project, work }: { route: Route; project?: Project;
   const isWorkspaceView = route.view === 'all' || route.view === 'connect' || route.view === 'workspace-skills' || route.view === 'agent-profiles' || route.view === 'model-providers';
   const current = route.view === 'all' ? 'All projects' : route.view === 'connect' ? 'Connect project' : route.view === 'master' ? 'Master' : route.view === 'work' ? 'Work' : route.view === 'work-detail' ? 'Work detail' : route.view === 'instructions' ? 'Instructions' : route.view === 'skills' || route.view === 'workspace-skills' ? 'Skills' : route.view === 'members' ? 'Members' : route.view === 'connections' ? 'Connections' : route.view === 'model-providers' ? 'Model providers' : 'Agent profiles';
   const projectName = isWorkspaceView ? 'Workspace' : project?.name ?? 'Project';
-  return <nav aria-label="Breadcrumb" className="flex min-w-0 flex-1 items-center gap-2 text-sm text-muted-foreground"><a aria-label={projectName} title={projectName} className="min-w-0 basis-[38%] shrink-0 truncate text-muted-foreground no-underline hover:text-foreground sm:basis-auto sm:shrink sm:max-w-none" href={href(isWorkspaceView ? 'all' : 'master', isWorkspaceView ? '' : project?.id)}>{projectName}</a><span className="shrink-0" aria-hidden="true">›</span>{route.view === 'work-detail' ? <><a className="shrink-0 text-muted-foreground no-underline hover:text-foreground" href={href('work', project?.id)}>Work</a><span className="shrink-0" aria-hidden="true">›</span><strong aria-label={work?.title ?? current} title={work?.title ?? current} className="min-w-16 flex-1 truncate text-foreground">{current}</strong></> : ['instructions', 'skills', 'members', 'connections'].includes(route.view) ? <><a className="min-w-0 shrink truncate text-muted-foreground no-underline hover:text-foreground" href={href('instructions', project?.id)}>Project settings</a><span className="shrink-0" aria-hidden="true">›</span><strong title={current} className="min-w-16 flex-1 truncate text-foreground">{current}</strong></> : <strong title={current} className="min-w-16 flex-1 truncate text-foreground">{current}</strong>}</nav>;
+  return <nav aria-label="Breadcrumb" className="flex min-w-0 flex-1 items-center gap-2 text-sm text-muted-foreground"><a aria-label={projectName} title={projectName} className="min-w-0 basis-[38%] shrink-0 truncate text-muted-foreground no-underline hover:text-foreground sm:basis-auto sm:shrink sm:max-w-none" href={href(isWorkspaceView ? 'all' : 'master', isWorkspaceView ? '' : project?.id)}>{projectName}</a><ChevronRight aria-hidden="true" className="size-4 shrink-0" />{route.view === 'work-detail' ? <><a className="shrink-0 text-muted-foreground no-underline hover:text-foreground" href={href('work', project?.id)}>Work</a><ChevronRight aria-hidden="true" className="size-4 shrink-0" /><strong aria-label={work?.title ?? current} title={work?.title ?? current} className="min-w-16 flex-1 truncate text-foreground">{current}</strong></> : ['instructions', 'skills', 'members', 'connections'].includes(route.view) ? <><a className="min-w-0 shrink truncate text-muted-foreground no-underline hover:text-foreground" href={href('instructions', project?.id)}>Project settings</a><ChevronRight aria-hidden="true" className="size-4 shrink-0" /><strong title={current} className="min-w-16 flex-1 truncate text-foreground">{current}</strong></> : <strong title={current} className="min-w-16 flex-1 truncate text-foreground">{current}</strong>}</nav>;
 }
 
 function Login({ onSubmit, error }: { onSubmit: (email: string, password: string) => Promise<void>; error: string }) {
@@ -285,7 +286,8 @@ function canBootstrapMaster(snapshot: Snapshot, projectId: string, messages: Mes
 }
 
 function ProjectCard({ project, snapshot, setError, refresh }: { project: Project; snapshot: Snapshot; setError: (value: string) => void; refresh: () => Promise<void> }) {
-  const { messages, loadOlder, hasOlder, loadingOlder } = useMessageHistory(project.id, undefined, false);
+  const history = useMessageHistory(project.id, undefined, false);
+  const { messages, loadOlder, hasOlder, loadingOlder, olderError } = history;
   const [observedMessages, setObservedMessages] = useState<Message[]>([]);
   useEffect(() => {
     const incoming = snapshot.messages.filter(message => message.projectId === project.id && !message.workId);
@@ -293,14 +295,16 @@ function ProjectCard({ project, snapshot, setError, refresh }: { project: Projec
     // Keep snapshot updates for this mounted card even after global snapshot eviction.
     setObservedMessages(current => [...new Map([...current, ...incoming].map(message => [message.id, message])).values()]);
   }, [snapshot.messages, project.id]);
-  const byId = new Map(messages.map(message => [message.id, message]));
+  const byId = new Map([...messages, ...snapshot.messages.filter(message => message.projectId === project.id && !message.workId)].map(message => [message.id, message]));
   observedMessages.forEach(message => byId.set(message.id, message));
   const visibleMessages = [...byId.values()].sort(messageOrder);
   return <section className="flex h-[min(70vh,46rem)] min-h-[26rem] min-w-0 flex-col rounded-xl border bg-background p-4 md:p-5">
     <header className="mb-3 flex items-center justify-between gap-3"><div className="flex min-w-0 items-center gap-3"><span className="grid size-9 shrink-0 place-items-center rounded-lg bg-accent font-semibold text-accent-foreground">{project.name.slice(0, 1).toUpperCase()}</span><div className="min-w-0"><h2 className="truncate font-semibold">{project.name}</h2><a className="text-xs text-muted-foreground no-underline hover:underline" href={href('master', project.id)}>Open Master</a></div></div><Badge variant="outline">Project</Badge></header>
     <div className="min-h-0 flex-1 space-y-5 overflow-y-auto pr-1" aria-label={`${project.name} conversation`} aria-live="polite">
-      {hasOlder && <Button variant="ghost" size="sm" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading…' : 'Load earlier messages'}</Button>}
-      {visibleMessages.length ? visibleMessages.map(message => <MessageRow key={message.id} message={message} userName={snapshot.member.name} />) : <p className="py-8 text-center text-sm text-muted-foreground">No messages yet. Start with the project Master.</p>}
+      <MessageHistoryStatus history={history} onRetry={() => void history.retry()} />
+      {olderError && <p className="text-sm text-destructive" role="alert">Could not load earlier messages: {olderError}</p>}
+      {hasOlder && <Button variant="ghost" size="sm" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? 'Loading…' : olderError ? 'Retry loading earlier messages' : 'Load earlier messages'}</Button>}
+      {visibleMessages.length ? visibleMessages.map(message => <MessageRow key={message.id} message={message} userName={snapshot.member.name} />) : history.initialState === 'loading' ? <p className="py-8 text-center text-sm text-muted-foreground" role="status">Loading messages…</p> : history.initialState === 'loaded' ? <p className="py-8 text-center text-sm text-muted-foreground">No messages yet. Start with the project Master.</p> : null}
     </div>
     <MessageComposer memberId={snapshot.member.id} project={project} refresh={refresh} setError={setError} bootstrapConnections={canBootstrapMaster(snapshot, project.id, visibleMessages) ? masterBootstrapConnections(snapshot, project.id) : []} />
   </section>;
@@ -316,7 +320,7 @@ function ConversationPage({ title, messages, project, snapshot, work, refresh, s
   const handoffSource = latestImplementation && handoffConnection && latestImplementation.threadId && latestImplementation.execution && latestImplementation.execution.model === latestImplementation.model && (['completed', 'failed'].includes(latestImplementation.status) || latestImplementation.status === 'cancelled' && Boolean(latestImplementation.stoppedAt)) && !handoffReserved ? latestImplementation : undefined;
   const canManageProject = useProjectAdmin(project.id, snapshot.member, snapshot.projectRoles?.[project.id]);
   const history = useMessageHistory(project.id, work?.id);
-  const displayedMessages = history.messages.length ? history.messages : messages;
+  const displayedMessages = [...new Map([...messages, ...history.messages].map(message => [message.id, message])).values()].sort(messageOrder);
   const firstImplementation = work ? snapshot.runs.filter(run => run.projectId === project.id && run.workId === work.id && run.kind === 'implementation')
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))[0] : undefined;
   const frozenProfileId = firstImplementation?.execution?.profileId ?? firstImplementation?.execution?.profile?.id ?? work?.profileId;
@@ -326,7 +330,8 @@ function ConversationPage({ title, messages, project, snapshot, work, refresh, s
   return <div className={`${work ? 'flex min-h-0 flex-1 flex-col' : 'flex h-[calc(100dvh-7.5rem)] flex-col'}`}>
     {title && <div className="mb-5 flex items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{work ? 'Conversation with the responsible Agent, Master, and subagents.' : `Project conversation · ${project.name}`}</p></div>{work && <Badge variant="outline">{work.status.replace('_', ' ')}</Badge>}</div>}
     {workRuns.map(run => <RunNotice key={run.id} run={run} canManageProject={canManageProject} refresh={refresh} setError={setError} />)}
-    <div className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4" aria-live="polite">{history.hasOlder && <Button variant="ghost" size="sm" disabled={history.loadingOlder} onClick={() => void history.loadOlder()}>{history.loadingOlder ? 'Loading…' : 'Load earlier messages'}</Button>}{displayedMessages.length ? [...displayedMessages].sort(messageOrder).map(message => <MessageRow key={message.id} message={message} multiParticipant={!!work} userName={snapshot.member.name} />) : <p className="py-16 text-center text-sm text-muted-foreground">No messages yet. Send a message to begin.</p>}</div>
+    <MessageHistoryStatus history={history} onRetry={() => void history.retry()} />
+    <div className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4" aria-live="polite">{history.olderError && <p className="text-sm text-destructive" role="alert">Could not load earlier messages: {history.olderError}</p>}{history.hasOlder && <Button variant="ghost" size="sm" disabled={history.loadingOlder} onClick={() => void history.loadOlder()}>{history.loadingOlder ? 'Loading…' : history.olderError ? 'Retry loading earlier messages' : 'Load earlier messages'}</Button>}{displayedMessages.length ? displayedMessages.map(message => <MessageRow key={message.id} message={message} multiParticipant={!!work} userName={snapshot.member.name} />) : history.initialState === 'loading' ? <p className="py-16 text-center text-sm text-muted-foreground" role="status">Loading messages…</p> : history.initialState === 'loaded' ? <p className="py-16 text-center text-sm text-muted-foreground">No messages yet. Send a message to begin.</p> : null}</div>
     <MessageComposer key={`composer-${project.id}-${work?.id ?? 'master'}`} memberId={snapshot.member.id} project={project} work={work} agentName={agentName} handoffSource={handoffSource} handoffConnection={handoffSource ? handoffConnection : undefined} refresh={refresh} setError={setError} initialDraft={initialDraft} bootstrapConnections={!work && canBootstrapMaster(snapshot, project.id, displayedMessages) ? masterBootstrapConnections(snapshot, project.id) : []} />
   </div>;
 }
@@ -337,6 +342,13 @@ function useMessageHistory(projectId: string, workId?: string, poll = true) {
   const generationRef = useRef(0);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const olderPendingRef = useRef(false);
+  const initialPendingRef = useRef(false);
+  const historyPendingRef = useRef(false);
+  const initialLoadedRef = useRef(false);
+  const [initialState, setInitialState] = useState<'loading' | 'loaded' | 'error'>('loading');
+  const [error, setError] = useState('');
+  const [olderError, setOlderError] = useState('');
   const query = workId ? { workId } : {};
   const merge = useCallback((incoming: Message[]) => setMessages(current => {
     const byId = new Map(current.map(message => [message.id, message]));
@@ -347,27 +359,57 @@ function useMessageHistory(projectId: string, workId?: string, poll = true) {
   }), []);
   useEffect(() => {
     let active = true;
-    let pending = true;
-    ++generationRef.current;
-    messagesRef.current = []; setMessages([]); setNextBefore(null); setLoadingOlder(false);
-    void workbenchApi.projectMessages(projectId, query).then(result => { if (active) { merge(result.messages); setNextBefore(result.nextBefore); } }).catch(() => undefined).finally(() => { pending = false; });
+    const generation = ++generationRef.current;
+    initialPendingRef.current = true; historyPendingRef.current = true; initialLoadedRef.current = false;
+    messagesRef.current = []; olderPendingRef.current = false;
+    setMessages([]); setNextBefore(null); setLoadingOlder(false); setInitialState('loading'); setError(''); setOlderError('');
+    const request = (after?: string) => workbenchApi.projectMessages(projectId, { ...query, ...(after ? { after } : {}) });
+    void request().then(result => { if (active && generation === generationRef.current) { merge(result.messages); setNextBefore(result.nextBefore); initialLoadedRef.current = true; setInitialState('loaded'); setError(''); } }).catch(cause => { if (active && generation === generationRef.current) { setInitialState('error'); setError(errorMessage(cause)); } }).finally(() => { if (generation === generationRef.current) { initialPendingRef.current = false; historyPendingRef.current = false; } });
     const timer = poll ? window.setInterval(() => {
-      if (!active || pending || document.hidden || !canAutoPoll()) return;
-      pending = true;
+      if (!active || historyPendingRef.current || !initialLoadedRef.current || document.hidden || !canAutoPoll()) return;
+      historyPendingRef.current = true;
       const last = messagesRef.current.at(-1)?.createdAt;
       const after = last ? new Date(new Date(last).getTime() - 2_000).toISOString() : undefined;
-      void workbenchApi.projectMessages(projectId, { ...query, ...(after ? { after } : {}) }).then(result => { if (active && result.messages.length) merge(result.messages); }).catch(() => undefined).finally(() => { pending = false; });
+      void request(after).then(result => { if (active && generation === generationRef.current) { if (result.messages.length) merge(result.messages); setError(''); } }).catch(cause => { if (active && generation === generationRef.current) setError(errorMessage(cause)); }).finally(() => { if (generation === generationRef.current) historyPendingRef.current = false; });
     }, 2_000) : undefined;
-    return () => { active = false; ++generationRef.current; window.clearInterval(timer); };
+    return () => { active = false; ++generationRef.current; initialPendingRef.current = false; historyPendingRef.current = false; olderPendingRef.current = false; initialLoadedRef.current = false; window.clearInterval(timer); };
   }, [projectId, workId, merge, poll]);
-  const loadOlder = useCallback(async () => {
-    if (!nextBefore || loadingOlder) return;
+  const retry = useCallback(async () => {
     const generation = generationRef.current;
+    if (initialState === 'error') {
+      if (initialState !== 'error' || initialPendingRef.current) return;
+      initialPendingRef.current = true;
+      setInitialState('loading'); setError('');
+      try { const result = await workbenchApi.projectMessages(projectId, query); if (generation === generationRef.current) { merge(result.messages); setNextBefore(result.nextBefore); initialLoadedRef.current = true; setInitialState('loaded'); } }
+      catch (cause) { if (generation === generationRef.current) { setInitialState('error'); setError(errorMessage(cause)); } }
+      finally { if (generation === generationRef.current) initialPendingRef.current = false; }
+      return;
+    }
+    if (!error || initialState !== 'loaded' || historyPendingRef.current) return;
+    historyPendingRef.current = true;
+    const last = messagesRef.current.at(-1)?.createdAt;
+    const after = last ? new Date(new Date(last).getTime() - 2_000).toISOString() : undefined;
+    setError('');
+    try { const result = await workbenchApi.projectMessages(projectId, { ...query, ...(after ? { after } : {}) }); if (generation === generationRef.current) { if (result.messages.length) merge(result.messages); } }
+    catch (cause) { if (generation === generationRef.current) setError(errorMessage(cause)); }
+    finally { if (generation === generationRef.current) historyPendingRef.current = false; }
+  }, [error, initialState, merge, projectId, workId]);
+  const loadOlder = useCallback(async () => {
+    if (!nextBefore || olderPendingRef.current) return;
+    const generation = generationRef.current;
+    olderPendingRef.current = true;
     setLoadingOlder(true);
+    setOlderError('');
     try { const result = await workbenchApi.projectMessages(projectId, { ...query, before: nextBefore }); if (generation === generationRef.current) { merge(result.messages); setNextBefore(result.nextBefore); } }
-    finally { if (generation === generationRef.current) setLoadingOlder(false); }
-  }, [loadingOlder, merge, nextBefore, projectId, workId]);
-  return { messages, loadOlder, hasOlder: Boolean(nextBefore), loadingOlder };
+    catch (cause) { if (generation === generationRef.current) setOlderError(errorMessage(cause)); }
+    finally { if (generation === generationRef.current) { olderPendingRef.current = false; setLoadingOlder(false); } }
+  }, [merge, nextBefore, projectId, workId]);
+  return { messages, loadOlder, retry, hasOlder: Boolean(nextBefore), loadingOlder, initialState, error, olderError };
+}
+
+function MessageHistoryStatus({ history, onRetry }: { history: ReturnType<typeof useMessageHistory>; onRetry: () => void }) {
+  if (!history.error) return null;
+  return <div className="mb-3 flex flex-wrap items-center gap-2 text-sm" role="alert"><span>Could not load messages: {history.error}</span><Button type="button" variant="outline" size="sm" disabled={history.initialState === 'loading'} onClick={onRetry}>{history.initialState === 'loading' ? 'Retrying…' : 'Retry'}</Button></div>;
 }
 
 function MessageRow({ message, multiParticipant = false, userName = 'You' }: { message: Message; multiParticipant?: boolean; userName?: string }) {
@@ -405,12 +447,10 @@ function MessageComposer({ memberId, project, work, agentName, handoffSource, ha
     {!work && (bootstrapConnections.length > 0 || connectionId) && <select aria-label="Master provider connection" className="h-9 max-w-48 rounded-md border bg-background px-2 text-xs" value={connectionId} onChange={event => setConnectionId(event.target.value)}><option value="">Workspace default</option>{connectionId && !bootstrapConnections.some(item => item.id === connectionId) && <option value={connectionId} disabled>Previously selected connection unavailable</option>}{bootstrapConnections.map(connection => <option key={connection.id} value={connection.id}>{connection.name}</option>)}</select>}
     {work && !handoffMode && <Input autoFocus={new URL(window.location.href).searchParams.has('draft')} aria-label={`Message ${agentName || 'Agent'}`} className="col-span-full row-start-1 h-10 min-w-0 w-full border-0 bg-transparent shadow-none focus-visible:ring-0" placeholder={`Message ${agentName || 'Agent'}…`} value={text} onChange={event => setText(event.target.value)} />}
     <div className={work && !handoffMode ? 'col-span-full flex min-w-0 items-center gap-2 border-t border-border pt-2' : 'contents'}>
-      <Button type="button" variant="ghost" size="icon-sm" className="shrink-0" aria-label="Attachments not available yet" disabled>＋</Button>
       {!(work && !handoffMode) && <Input autoFocus={new URL(window.location.href).searchParams.has('draft')} aria-label={`Message ${work ? agentName || 'Agent' : 'Master'}`} className="h-10 min-w-0 flex-1 border-0 bg-transparent shadow-none focus-visible:ring-0" placeholder={`Message ${work ? agentName || 'Agent' : 'Master'}…`} value={text} onChange={event => setText(event.target.value)} />}
-      <Button type="button" variant="ghost" size="icon-sm" className="shrink-0" aria-label="Voice input not available yet" disabled>🎙</Button>
       {!handoffMode && handoffSource && handoffConnection && handoffModels.length > 0 && <Button type="button" size="sm" variant="outline" className="shrink-0 whitespace-nowrap" disabled={busy} onClick={() => setHandoffMode(true)}>Switch model</Button>}
       {connectionId && !bootstrapConnections.some(item => item.id === connectionId) && <span role="alert" className="text-xs text-destructive">Selected connection unavailable; no default will be substituted.</span>}
-      <Button className={handoffMode ? 'sm:min-w-48' : 'size-9 shrink-0 rounded-full'} disabled={busy || !text.trim() || Boolean(connectionId && !bootstrapConnections.some(item => item.id === connectionId)) || handoffMode && !handoffReady} aria-label={handoffMode ? 'Switch model and continue' : 'Send message'}>{handoffMode ? busy ? 'Switching…' : 'Switch model and continue' : '↑'}</Button>
+      <Button className={handoffMode ? 'sm:min-w-48' : 'size-9 shrink-0 rounded-full'} disabled={busy || !text.trim() || Boolean(connectionId && !bootstrapConnections.some(item => item.id === connectionId)) || handoffMode && !handoffReady} aria-label={handoffMode ? 'Switch model and continue' : 'Send message'}>{handoffMode ? busy ? 'Switching…' : 'Switch model and continue' : <Send aria-hidden="true" className="size-4" />}</Button>
     </div>
   </form>;
 }
@@ -442,7 +482,7 @@ function WorkList({ project, works, snapshot }: { project: Project; works: Work[
     if (query) next.searchParams.set('q', query);
     return `${next.pathname}${next.search}`;
   };
-  return <><header className="mb-5 flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-semibold">Work</h1><p className="mt-1 text-sm text-muted-foreground">{project.name}</p></div><a href={newWorkHref}><Button>＋ New work</Button></a></header>
+  return <><header className="mb-5 flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-semibold">Work</h1><p className="mt-1 text-sm text-muted-foreground">{project.name}</p></div><a href={newWorkHref}><Button><Plus aria-hidden="true" className="mr-1 size-4" />New work</Button></a></header>
     <nav className="mb-4 flex gap-5 border-b" aria-label="Filter work">{['All', 'In progress', 'Paused', 'Done'].map(status => <a key={status} aria-current={selectedStatus === status ? 'page' : undefined} className={`border-b-2 px-1 py-3 text-sm no-underline ${selectedStatus === status ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground'}`} href={workListHref(status)}>{status}</a>)}</nav>
     <div className="mb-5 max-w-xl"><Label htmlFor="work-search">Search Work</Label><Input id="work-search" type="search" value={query} onChange={event => updateQuery(event.target.value)} placeholder="Search titles and overviews" /></div>
     {visibleWorks.length ? <div className="overflow-hidden rounded-xl border bg-background">{visibleWorks.map(work => { const connection = snapshot.providerConnections?.find(item => item.id === work.connectionId); return <a key={work.id} className="grid min-h-20 grid-cols-[minmax(0,1fr)_auto] items-center gap-4 border-b px-4 py-3 text-foreground no-underline last:border-b-0 hover:bg-muted/40" href={href('work-detail', project.id, work.id)}><span className="min-w-0"><strong className="block truncate text-sm">{work.title}</strong><span className="mt-1 line-clamp-2 text-sm text-muted-foreground">{work.overview}</span><span className="mt-2 block text-xs text-muted-foreground">Provider · {connection?.name ?? (work.connectionId ? 'Unavailable connection' : 'Historical execution')}</span></span><span className="flex flex-col items-end gap-2"><Badge variant="outline" className="capitalize">{work.status.replace('_', ' ')}</Badge>{connection && <Badge variant={connection.status === 'available' ? 'secondary' : 'outline'}>{connection.status}</Badge>}</span></a>; })}</div> : query.trim() ? <EmptyState title="No matching Work" detail={`No Work matches “${query.trim()}” in ${selectedStatus}. Clear the search to see this status again.`} action={<Button variant="outline" onClick={() => updateQuery('')}>Clear search</Button>} /> : <EmptyState title={selectedStatus === 'All' ? 'No Work yet' : `No ${selectedStatus.toLowerCase()} Work`} detail="Start a conversation with Master to define a new Work." action={<a href={newWorkHref}><Button>Start with Master</Button></a>} />}
@@ -965,7 +1005,7 @@ function Instructions({ project, member, refresh, setError }: { project: Project
     ['Definition of done', 'Summarize what changed and how it was checked before closing the work.'],
   ];
   const save = async () => { const submittedDraft = draft; setBusy(true); setError(''); try { await workbenchApi.updateProject(project.id, { instructions: submittedDraft, expectedInstructions: baseInstructions }); await refresh(); const completion = completeInstructionsSave({ draft: draftRef.current, base: baseInstructions }, submittedDraft); setDraftState(completion.state); if (completion.closeEditor) setEditing(false); } catch (cause) { if (cause instanceof ApiError && cause.status === 409) await refresh().catch(() => undefined); setError(errorMessage(cause)); } finally { setBusy(false); } };
-  return <section className="w-full"><ProjectSettingsNav project={project} active="instructions"/><header className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-2xl font-semibold">Instructions</h1><p className="mt-1 text-sm text-muted-foreground">Project context that Master and Agents can use.</p></div>{editing ? <div className="flex gap-2"><Button variant="outline" disabled={busy} onClick={() => { const next = cancelInstructionsDraft(project.instructions); draftRef.current = next.draft; setDraftState(next); setEditing(false); }}>Cancel</Button><Button disabled={busy || draft === baseInstructions} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</Button></div> : canEdit && <Button variant="outline" onClick={() => { const next = startInstructionsDraft(project.instructions); draftRef.current = next.draft; setDraftState(next); setEditing(true); }}>Edit</Button>}</header>{hasRemoteUpdate && <div role="status" className="mb-4 grid gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm"><p><strong>Instructions changed elsewhere.</strong> Your draft is preserved. The latest saved version is shown below.</p><pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 font-sans">{project.instructions || 'No project instructions yet.'}</pre><div className="flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { const next = useLatestInstructions(project.instructions); draftRef.current = next.draft; setDraftState(next); }}>Use latest version</Button><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { const next = keepInstructionsDraft({ draft: draftRef.current, base: baseInstructions }, project.instructions); draftRef.current = next.draft; setDraftState(next); }}>Keep editing my draft</Button></div></div>}{editing && canEdit ? <><Textarea className="min-h-[40vh] resize-y" value={draft} onChange={event => { draftRef.current = event.target.value; setDraftState(current => editInstructionsDraft(current, event.target.value)); }} placeholder="Add project context, working preferences, or quality expectations…" /><div className="mt-4 flex flex-wrap items-center gap-2"><span className="mr-1 text-sm text-muted-foreground">Optional starting points</span>{suggestions.map(([label, text]) => <Button key={label} type="button" variant="outline" size="sm" onClick={() => { const nextDraft = `${draftRef.current}${draftRef.current && !draftRef.current.endsWith('\n') ? '\n\n' : ''}${text}`; draftRef.current = nextDraft; setDraftState(current => editInstructionsDraft(current, nextDraft)); }}>{label} ＋</Button>)}</div></> : <p className="min-h-32 whitespace-pre-wrap rounded-lg border bg-muted/20 p-4 text-sm leading-relaxed">{project.instructions || 'No project instructions yet.'}</p>}</section>;
+  return <section className="w-full"><ProjectSettingsNav project={project} active="instructions"/><header className="mb-5 flex flex-wrap items-center justify-between gap-3"><div><h1 className="text-2xl font-semibold">Instructions</h1><p className="mt-1 text-sm text-muted-foreground">Project context that Master and Agents can use.</p></div>{editing ? <div className="flex gap-2"><Button variant="outline" disabled={busy} onClick={() => { const next = cancelInstructionsDraft(project.instructions); draftRef.current = next.draft; setDraftState(next); setEditing(false); }}>Cancel</Button><Button disabled={busy || draft === baseInstructions} onClick={() => void save()}>{busy ? 'Saving…' : 'Save'}</Button></div> : canEdit && <Button variant="outline" onClick={() => { const next = startInstructionsDraft(project.instructions); draftRef.current = next.draft; setDraftState(next); setEditing(true); }}>Edit</Button>}</header>{hasRemoteUpdate && <div role="status" className="mb-4 grid gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm"><p><strong>Instructions changed elsewhere.</strong> Your draft is preserved. The latest saved version is shown below.</p><pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-background p-3 font-sans">{project.instructions || 'No project instructions yet.'}</pre><div className="flex flex-wrap gap-2"><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { const next = useLatestInstructions(project.instructions); draftRef.current = next.draft; setDraftState(next); }}>Use latest version</Button><Button type="button" variant="outline" size="sm" disabled={busy} onClick={() => { const next = keepInstructionsDraft({ draft: draftRef.current, base: baseInstructions }, project.instructions); draftRef.current = next.draft; setDraftState(next); }}>Keep editing my draft</Button></div></div>}{editing && canEdit ? <><Textarea className="min-h-[40vh] resize-y" value={draft} onChange={event => { draftRef.current = event.target.value; setDraftState(current => editInstructionsDraft(current, event.target.value)); }} placeholder="Add project context, working preferences, or quality expectations…" /><div className="mt-4 flex flex-wrap items-center gap-2"><span className="mr-1 text-sm text-muted-foreground">Optional starting points</span>{suggestions.map(([label, text]) => <Button key={label} type="button" variant="outline" size="sm" onClick={() => { const nextDraft = `${draftRef.current}${draftRef.current && !draftRef.current.endsWith('\n') ? '\n\n' : ''}${text}`; draftRef.current = nextDraft; setDraftState(current => editInstructionsDraft(current, nextDraft)); }}><Plus aria-hidden="true" className="mr-1 size-4" />{label}</Button>)}</div></> : <p className="min-h-32 whitespace-pre-wrap rounded-lg border bg-muted/20 p-4 text-sm leading-relaxed">{project.instructions || 'No project instructions yet.'}</p>}</section>;
 }
 
 function Members({ project, snapshot, refresh, setError }: { project: Project; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {
