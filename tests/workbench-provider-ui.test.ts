@@ -34,10 +34,10 @@ function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) 
 let root: Root;
 let host: HTMLDivElement;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
-async function mount(current: Snapshot, strictMode = false) {
+async function mount(current: Snapshot, strictMode = false, projectMessagesImplementation?: typeof workbenchApi.projectMessages) {
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(current.member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(current);
-  vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [], nextBefore: null });
+  vi.spyOn(workbenchApi, 'projectMessages').mockImplementation(projectMessagesImplementation ?? (async () => ({ messages: [], nextBefore: null })));
   vi.spyOn(workbenchApi, 'projectMembers').mockResolvedValue({ members: [current.member] });
   await flush(() => root.render(strictMode ? createElement(StrictMode, null, createElement(App)) : createElement(App)));
 }
@@ -66,16 +66,18 @@ describe('mounted message history recovery', () => {
 
   it('distinguishes first-load failure from a genuinely empty conversation and retries the failed request', async () => {
     const current = masterRoute();
-    const history = vi.spyOn(workbenchApi, 'projectMessages')
+    const history = vi.fn<typeof workbenchApi.projectMessages>()
       .mockRejectedValueOnce(new Error('History unavailable'))
       .mockResolvedValueOnce({ messages: [], nextBefore: null });
-    await mount(current);
+    await mount(current, false, history);
     await flush();
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('History unavailable');
     expect(host.textContent).not.toContain('No messages yet. Send a message to begin.');
     expect(history).toHaveBeenCalledTimes(1);
+    await type('input[aria-label="Message Master"]', 'Draft survives history failure');
     await flush(() => button('Retry').click());
     expect(history).toHaveBeenCalledTimes(2);
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe('Draft survives history failure');
     expect(host.textContent).toContain('No messages yet. Send a message to begin.');
     expect(host.querySelector('[role="alert"]')).toBeNull();
   });
@@ -84,11 +86,11 @@ describe('mounted message history recovery', () => {
     const original = { id: 'loaded', projectId: project.id, speaker: 'Master', role: 'agent' as const, text: 'Already loaded', createdAt: '2026-10-19T10:00:00.000Z' };
     const added = { ...original, id: 'incremental', text: 'Recovered update', createdAt: '2026-10-19T10:00:03.000Z' };
     const current = masterRoute();
-    const history = vi.spyOn(workbenchApi, 'projectMessages')
+    const history = vi.fn<typeof workbenchApi.projectMessages>()
       .mockResolvedValueOnce({ messages: [original], nextBefore: null })
       .mockRejectedValueOnce(new Error('Incremental request failed'))
       .mockResolvedValueOnce({ messages: [added], nextBefore: null });
-    await mount(current);
+    await mount(current, false, history);
     await flush();
     await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
     expect(host.textContent).toContain('Already loaded');
@@ -96,7 +98,7 @@ describe('mounted message history recovery', () => {
     expect(host.textContent).not.toContain('No messages yet. Send a message to begin.');
     await flush(() => button('Retry').click());
     expect(history).toHaveBeenCalledTimes(3);
-    expect(history.mock.calls[2]?.[1]).toEqual({ workId: undefined, after: '2026-10-19T09:59:58.000Z' });
+    expect(history.mock.calls[2]?.[1]).toEqual({ after: '2026-10-19T09:59:58.000Z' });
     expect(host.textContent).toContain('Already loaded');
     expect(host.textContent).toContain('Recovered update');
   });
@@ -105,11 +107,11 @@ describe('mounted message history recovery', () => {
     const current = masterRoute();
     const first = { id: 'newest', projectId: project.id, speaker: 'Master', role: 'agent' as const, text: 'Newest message', createdAt: '2026-10-19T10:00:00.000Z' };
     const older = { ...first, id: 'older', text: 'Older message', createdAt: '2026-10-18T10:00:00.000Z' };
-    const history = vi.spyOn(workbenchApi, 'projectMessages')
+    const history = vi.fn<typeof workbenchApi.projectMessages>()
       .mockResolvedValueOnce({ messages: [first], nextBefore: 'cursor-older' })
       .mockRejectedValueOnce(new Error('Older page failed'))
       .mockResolvedValueOnce({ messages: [older], nextBefore: null });
-    await mount(current);
+    await mount(current, false, history);
     await flush();
     await flush(() => { button('Load earlier messages').click(); button('Load earlier messages').click(); });
     expect(history).toHaveBeenCalledTimes(2);
@@ -117,7 +119,7 @@ describe('mounted message history recovery', () => {
     expect(button('Retry loading earlier messages').disabled).toBe(false);
     await flush(() => button('Retry loading earlier messages').click());
     expect(history).toHaveBeenCalledTimes(3);
-    expect(history.mock.calls[2]?.[1]).toEqual({ workId: undefined, before: 'cursor-older' });
+    expect(history.mock.calls[2]?.[1]).toEqual({ before: 'cursor-older' });
     expect(host.textContent).toContain('Newest message');
     expect(host.textContent).toContain('Older message');
   });
@@ -129,8 +131,8 @@ describe('mounted message history recovery', () => {
     current.works = [work, nextWork];
     window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
     const oldResponse = deferred<{ messages: typeof current.messages; nextBefore: string | null }>();
-    vi.spyOn(workbenchApi, 'projectMessages').mockReturnValueOnce(oldResponse.promise).mockResolvedValueOnce({ messages: [], nextBefore: null });
-    await mount(current);
+    const history = vi.fn<typeof workbenchApi.projectMessages>().mockReturnValueOnce(oldResponse.promise).mockResolvedValueOnce({ messages: [], nextBefore: null });
+    await mount(current, false, history);
     window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${nextWork.id}`);
     await flush(() => root.render(createElement(App)));
     oldResponse.resolve({ messages: [{ id: 'private-old', projectId: project.id, workId: work.id, speaker: 'Agent', role: 'agent', text: 'Old Work private message', createdAt: '' }], nextBefore: null });
@@ -145,9 +147,9 @@ describe('mounted message history recovery', () => {
     current.works = [work];
     window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
     const pending = deferred<{ messages: typeof current.messages; nextBefore: string | null }>();
-    vi.spyOn(workbenchApi, 'projectMessages').mockReturnValueOnce(pending.promise);
+    const history = vi.fn<typeof workbenchApi.projectMessages>().mockReturnValueOnce(pending.promise);
     vi.spyOn(workbenchApi, 'logout').mockResolvedValue(undefined);
-    await mount(current);
+    await mount(current, false, history);
     await flush(() => button('Sign out').click());
     expect(host.textContent).toContain('Sign in');
     pending.resolve({ messages: [{ id: 'old-session', projectId: project.id, workId: work.id, speaker: 'Agent', role: 'agent', text: 'Old session private message', createdAt: '' }], nextBefore: null });
@@ -170,6 +172,9 @@ describe('mounted message history recovery', () => {
     expect(host.textContent).not.toContain('Voice input not available yet');
     expect([...host.querySelectorAll('button[aria-label]')].some(item => item.getAttribute('aria-label') === 'Send message')).toBe(true);
     expect(host.querySelectorAll('button[aria-label="Send message"] svg[aria-hidden="true"]')).toHaveLength(1);
+    const composer = host.querySelector('form');
+    expect(composer?.querySelectorAll('svg[aria-hidden="true"]')).toHaveLength(3);
+    expect(composer?.querySelectorAll('button')).toHaveLength(1);
     expect([...host.querySelectorAll('article > span')].map(item => item.textContent)).toEqual(['M', 'C', 'Q', 'O']);
   });
 });

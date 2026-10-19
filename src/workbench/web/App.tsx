@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ChevronRight, LogOut, Menu, Plus, Send } from 'lucide-react';
+import { ChevronRight, LogOut, Menu, Mic, Plus, Send } from 'lucide-react';
 import { Badge } from '../../local/web/src/components/ui/badge';
 import { Button } from '../../local/web/src/components/ui/button';
 import { Input } from '../../local/web/src/components/ui/input';
@@ -447,7 +447,9 @@ function MessageComposer({ memberId, project, work, agentName, handoffSource, ha
     {!work && (bootstrapConnections.length > 0 || connectionId) && <select aria-label="Master provider connection" className="h-9 max-w-48 rounded-md border bg-background px-2 text-xs" value={connectionId} onChange={event => setConnectionId(event.target.value)}><option value="">Workspace default</option>{connectionId && !bootstrapConnections.some(item => item.id === connectionId) && <option value={connectionId} disabled>Previously selected connection unavailable</option>}{bootstrapConnections.map(connection => <option key={connection.id} value={connection.id}>{connection.name}</option>)}</select>}
     {work && !handoffMode && <Input autoFocus={new URL(window.location.href).searchParams.has('draft')} aria-label={`Message ${agentName || 'Agent'}`} className="col-span-full row-start-1 h-10 min-w-0 w-full border-0 bg-transparent shadow-none focus-visible:ring-0" placeholder={`Message ${agentName || 'Agent'}…`} value={text} onChange={event => setText(event.target.value)} />}
     <div className={work && !handoffMode ? 'col-span-full flex min-w-0 items-center gap-2 border-t border-border pt-2' : 'contents'}>
+      {!handoffMode && <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center text-muted-foreground"><Plus className="size-4" /></span>}
       {!(work && !handoffMode) && <Input autoFocus={new URL(window.location.href).searchParams.has('draft')} aria-label={`Message ${work ? agentName || 'Agent' : 'Master'}`} className="h-10 min-w-0 flex-1 border-0 bg-transparent shadow-none focus-visible:ring-0" placeholder={`Message ${work ? agentName || 'Agent' : 'Master'}…`} value={text} onChange={event => setText(event.target.value)} />}
+      {!handoffMode && <span aria-hidden="true" className="grid size-9 shrink-0 place-items-center text-muted-foreground"><Mic className="size-4" /></span>}
       {!handoffMode && handoffSource && handoffConnection && handoffModels.length > 0 && <Button type="button" size="sm" variant="outline" className="shrink-0 whitespace-nowrap" disabled={busy} onClick={() => setHandoffMode(true)}>Switch model</Button>}
       {connectionId && !bootstrapConnections.some(item => item.id === connectionId) && <span role="alert" className="text-xs text-destructive">Selected connection unavailable; no default will be substituted.</span>}
       <Button className={handoffMode ? 'sm:min-w-48' : 'size-9 shrink-0 rounded-full'} disabled={busy || !text.trim() || Boolean(connectionId && !bootstrapConnections.some(item => item.id === connectionId)) || handoffMode && !handoffReady} aria-label={handoffMode ? 'Switch model and continue' : 'Send message'}>{handoffMode ? busy ? 'Switching…' : 'Switch model and continue' : <Send aria-hidden="true" className="size-4" />}</Button>
