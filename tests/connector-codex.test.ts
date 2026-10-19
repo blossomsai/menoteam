@@ -169,7 +169,16 @@ it.each(['failed','interrupted','inProgress','unknown'])('never accepts provider
  await expect(protocolTurn([agentNotification('final','answer','final_answer'),turnNotification(status)],true)).rejects.toThrow(`Codex turn ${status}`);
 });
 
-it.skipIf(process.platform === 'win32')('keeps Connector delivery credentials out of the real Codex app-server child environment', async () => {
+it.skipIf(process.platform === 'win32')('keeps Connector delivery credentials out of the real Codex app-server child environment', async ({ onTestFailed }) => {
+ const startedAt = process.hrtime.bigint();
+ let phase = 'mkdtemp';
+ let appServer: CodexAppServer | undefined;
+ onTestFailed(({ task }) => {
+  const internals = appServer as unknown as { child?: import('node:child_process').ChildProcess; childClosed?: boolean } | undefined;
+  const child = internals?.child;
+  const summary = `Codex credentials test diagnostics: ${JSON.stringify({ phase, elapsedMs: Number((process.hrtime.bigint() - startedAt) / 1_000_000n), childExists: Boolean(child), exitCode: child?.exitCode ?? null, signalCode: child?.signalCode ?? null, childClosed: typeof internals?.childClosed === 'boolean' ? internals.childClosed : null })}`;
+  for (const error of task.result?.errors ?? []) error.stack = `${summary}\n${error.stack ?? ''}`;
+ });
  const directory = await mkdtemp(path.join(os.tmpdir(), 'menoteam-codex-env-'));
  const executable = path.join(directory, 'fake-codex-app-server.mjs');
  const capture = path.join(directory, 'child-env.json');
@@ -192,7 +201,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   }
 }
 `;
- const appServer = new CodexAppServer(executable);
+ appServer = new CodexAppServer(executable);
  try {
   process.env.MENOTEAM_GITHUB_TOKEN = 'synthetic-delivery-token-for-test';
   process.env.MENOTEAM_CONNECTOR_CONFIG = '/private/connector-config-with-credential.json';
@@ -200,13 +209,19 @@ for await (const line of createInterface({ input: process.stdin })) {
   process.env.WORKBENCH_SLACK_SIGNING_SECRET = 'synthetic-slack-signing-secret-for-test';
   process.env.OPENAI_API_KEY = 'synthetic-codex-auth-for-test';
   process.env.MENOTEAM_TEST_CAPTURE = capture;
+  phase = 'write';
   await writeFile(executable, source, { mode: 0o700 });
   await chmod(executable, 0o700);
+  phase = 'native-start';
   expect(await appServer.start(directory)).toEqual(['gpt-6-luna']);
+  phase = 'assert';
   expect(appServer.modelReasoningEfforts).toEqual({ 'gpt-6-luna': ['catalog-effort'] });
   const child = (appServer as unknown as { child: import('node:child_process').ChildProcess }).child;
+  phase = 'wait-close';
   await new Promise<void>(resolve => child.once('close', () => resolve()));
+  phase = 'read-capture';
   const childEnvironment = JSON.parse(await readFile(capture, 'utf8')) as Record<string, string | undefined>;
+  phase = 'assert';
   expect(childEnvironment.githubToken).toBeUndefined();
   expect(childEnvironment.connectorConfig).toBeUndefined();
   expect(childEnvironment.slackBotToken).toBeUndefined();
@@ -214,11 +229,15 @@ for await (const line of createInterface({ input: process.stdin })) {
   expect(childEnvironment.openAiAuth).toBe('synthetic-codex-auth-for-test');
   expect(process.env.MENOTEAM_GITHUB_TOKEN).toBe('synthetic-delivery-token-for-test');
  } finally {
+  phase = 'stop';
   try { await appServer.stop(); } finally {
+   phase = 'restore';
    restore();
+   phase = 'remove';
    await rm(directory, { recursive: true, force: true });
   }
  }
+ phase = 'done';
 });
 
 it('retains an unconfirmed native stop result across concurrent and repeated calls and refuses restart', async () => {
