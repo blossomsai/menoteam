@@ -947,6 +947,11 @@ describe('mounted provider connection settings', () => {
     expect(host.textContent).toContain('Typed review');
     expect(host.textContent).toContain('No review is recorded.');
     expect(host.textContent).toContain('Missing');
+    const details=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent==='Evidence details')!;
+    await flush(()=>{details.open=true;});
+    expect(details.textContent).toContain('This evidence contains no recorded checks.');
+    expect(details.textContent).not.toContain('QA has not been run for this Work.');
+    expect(host.querySelector('[aria-label="Command checks"]')?.textContent).toContain('Unknown');
   });
 
   it('does not present typed review QA with a candidate fingerprint mismatch as current', async () => {
@@ -1152,7 +1157,8 @@ describe('mounted provider connection settings', () => {
     await mount(fixture.snapshot);await flush();await act(async()=>{await vi.advanceTimersByTimeAsync(2_000);});
     await flush(()=>button('Retry failed evidence').click());await flush();
     expect(host.textContent).toContain('Some evidence could not be loaded');
-    expect(host.textContent).not.toContain(`Current candidate · candidate-run · ${wrongSha}`);
+    expect(host.textContent).toContain(`Current candidate · commit ${'c'.repeat(12)}`);
+    expect(host.textContent).not.toContain(wrongSha);
     await flush(()=>button('Retry failed evidence').click());await flush();
     expect(host.textContent).not.toContain('Some evidence could not be loaded');expect(host.textContent).toContain(sha);expect(attempts).toBe(3);
   });
@@ -1303,6 +1309,21 @@ it.each(['matching','fingerprint mismatch','binding fingerprint mismatch','revis
   const reviewSection=[...host.querySelectorAll('h3')].find(item=>item.textContent==='Typed review')!.closest('section')!;
   if(kind.endsWith('mismatch')){expect(reviewSection.textContent).toContain('Stale');expect(reviewSection.textContent).not.toContain('approved');}
   else {expect(reviewSection.textContent).toContain('Current evidence');expect(reviewSection.textContent).toContain('approved');}
+  if(kind==='matching'){
+    const details=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent==='Evidence details')!;
+    expect(details.open).toBe(false);
+    await flush(()=>{details.open=true;});
+    const reviewCard=[...details.querySelectorAll('section')].find(item=>item.querySelector('strong')?.textContent==='Verification'&&item.querySelector('h3')?.textContent==='Typed review')!;
+    expect(reviewCard.textContent).toContain('No checks were recorded');
+    expect(reviewCard.textContent).toContain('approved');
+    expect(reviewCard.textContent).toContain(commit);
+    expect(reviewCard.textContent).not.toContain('This evidence contains no recorded checks.');
+    expect(host.textContent).not.toContain('QA has not been run for this Work.');
+    expect(requiredSection.textContent).toContain('Current evidence');
+    expect(requiredSection.textContent).toContain('4 required checks recorded · requirements met');
+    expect(reviewSection.textContent).toContain('Current evidence');
+    expect(reviewSection.textContent).toContain('approved');
+  }
 });
 
 
@@ -1597,11 +1618,27 @@ describe('long evidence text wrapping',()=>{
     vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id===diff.id?diff:qa);
     await mount(current);await flush();
     const panel=[...host.querySelectorAll('section')].find(item=>item.querySelector('h3')?.textContent==='Typed review')!;
-    expect(panel.textContent).toContain(reviewRunId);expect(panel.textContent).toContain(commitSha);expect(panel.textContent).toContain(candidateFingerprint);expect(panel.textContent).toContain(finding);
+    const compactReview=[...panel.querySelectorAll('p')].find(item=>item.textContent==='approved')!;
+    const compactCandidate=[...host.querySelectorAll('p')].find(item=>item.textContent?.startsWith('Current candidate ·'))!;
+    expect(compactReview.textContent).toBe('approved');
+    expect(compactCandidate.textContent).toBe(`Current candidate · commit ${commitSha.slice(0,12)}`);
+    expect(compactCandidate.textContent).not.toContain(candidateId);
+    expect(compactReview.textContent).not.toContain(reviewRunId);
+    expect(host.querySelector('[aria-label="Required checks"]')?.textContent).toContain('Not configured');
+    expect(host.querySelector('[aria-label="Command checks"]')?.textContent).toContain('Missing');
+    expect(compactReview.textContent).not.toContain(commitSha);
+    expect(panel.textContent).toContain(finding);
     expect(panel.className).toContain('min-w-0');
     const evidence=[...panel.querySelectorAll('p')].find(item=>item.textContent===`Blocking · ${finding}`)!;
     expect(evidence.textContent).toBe(`Blocking · ${finding}`);expect(evidence.className).toContain('min-w-0');expect(evidence.className).toContain('wrap-anywhere');
     expect(evidence.className).not.toMatch(/line-clamp|truncate/u);
+    const details=[...host.querySelectorAll('details')].find(item=>item.querySelector('summary')?.textContent==='Evidence details')!;
+    expect(details.open).toBe(false);
+    await flush(()=>{details.open=true;});
+    for(const value of [candidateId,reviewRunId,diffArtifactId,diffRevision,commitSha,candidateFingerprint]){
+      const node=[...details.querySelectorAll('dd')].find(item=>item.textContent===value)!;
+      expect(node.textContent).toBe(value);expect(node.className).toContain('wrap-anywhere');
+    }
     expect([...host.querySelectorAll('section.min-w-0.space-y-4')].some(item=>item.querySelector('h2')?.textContent==='QA')).toBe(true);
   });
 
