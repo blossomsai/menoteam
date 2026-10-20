@@ -36,7 +36,7 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{advanceRecoveryClock?:boolean;stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{advanceRecoveryClock?:boolean;stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>;awaitCompletion?:boolean;lifecycleWatchdogMs?:number;onIdleClaim?:()=>void;cleanup?:()=>void|Promise<void>}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
@@ -48,8 +48,19 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
   const stoppedAcks:number[]=[];
   const buildStatuses:string[]=[];
   const buildReceipts:StagingBuildReceipt[]=[];
+  let finishLifecycle!:()=>void;
+  const lifecycleFinished=new Promise<void>(resolve=>{finishLifecycle=resolve;});
+  let lifecycleStopped=false;
+  let watchdog:NodeJS.Timeout|undefined;
+  let runnerTask:Promise<void>|undefined;
   const client = {
-    claim: async () => { if (!claimed&&!options.recovery) { claimed = true; return claim; } if(options.advanceRecoveryClock&&recoveryPolls++===0){expect(receipts.length+stoppedAcks.length).toBe(1);recoveryOffset+=30_000;return undefined;} await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
+    claim: async () => {
+      if (!claimed&&!options.recovery) { claimed = true; return claim; }
+      options.onIdleClaim?.();
+      if(options.advanceRecoveryClock&&recoveryPolls++===0){expect(receipts.length+stoppedAcks.length).toBe(1);recoveryOffset+=30_000;return undefined;}
+      if(options.awaitCompletion){await lifecycleFinished;return undefined;}
+      await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop();return undefined;
+    },
     renew: async (_id:string,generation:number) => { renewals.push(generation);await options.renew?.(renewals.length);if(options.pauseOnHeartbeat&&renewals.length>1){claim.run.status='paused';throw new Error('lease rejected after pause');}return claim.run; },
     authorizeStagingEffect: async (_id: string, generation: number, effect: 'discovery' | 'provenance' | 'transport' | 'status') => {
       expect(generation).toBe(claim.run.generation);
@@ -58,8 +69,19 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
     stagingProgress: async (_id: string, _generation: number, receipt: StagingReceipt) => { receipts.push(receipt);await options.receiptAck?.(receipt,receipts.length); },
     stagingBuildStatus:async(_id:string,_generation:number,status:string)=>{buildStatuses.push(status);return{run:claim.run};},
     stagingBuildReceipt:async(_id:string,_generation:number,receipt:StagingBuildReceipt)=>{await options.onBuildReceipt?.(receipt);buildReceipts.push(receipt);claim.run.operation!.buildReceipt={...receipt,verifiedAt:new Date().toISOString(),verifiedGeneration:claim.run.generation};claim.run.operation!.buildStatus='verified';claim.run.operation!.imageDigest=receipt.imageDigest;return{run:claim.run};},
-    stopped: async (_id:string,generation:number)=>{expect(_id).toBe(runId);expect(generation).toBe(1);stoppedAcks.push(generation);await options.stopAck?.(stoppedAcks.length,await readJson<Record<string,unknown>>(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`)));claim.run.stoppedAt=new Date().toISOString();return claim.run;},
-    complete: async (_id: string, _generation: number, completion: { error?: string }) => { completions.push(completion);await options.completeAck?.(); await runner.stop(); return claim.run; },
+    stopped: async (_id:string,generation:number)=>{expect(_id).toBe(runId);expect(generation).toBe(claim.run.generation);stoppedAcks.push(generation);await options.stopAck?.(stoppedAcks.length,await readJson<Record<string,unknown>>(path.join(dataDir,'spool',`${stateKey(runId,String(generation))}.json`)));claim.run.stoppedAt=new Date().toISOString();return claim.run;},
+    complete: async (_id: string, _generation: number, completion: { error?: string }) => {
+      completions.push(completion);
+      try { await options.completeAck?.(); }
+      finally {
+        if(options.awaitCompletion){
+          try { await runner.stop();lifecycleStopped=true; }
+          finally { finishLifecycle(); }
+        }
+      }
+      if(!options.awaitCompletion)await runner.stop();
+      return claim.run;
+    },
     readRun: async () => claim.run,
   } as unknown as WorkbenchConnectorClient;
   const native = { start: async () => ['gpt-6.1-sol'], stop: async () => {} } as unknown as CodexAppServer;
@@ -76,13 +98,33 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
     staging: { transport: fakeTransport as never, provenanceVerifier: options.provenanceVerifier??attestation, targetValidator: async () => {}, ...(options.stopProcess?{stopProcess:options.stopProcess as never}:{}),...(options.buildDiscovery?{buildDiscovery:options.buildDiscovery}:{}) },
   });
   if(options.recovery)await writeSecureJson(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`),{runId,generation:1,events:[],artifacts:[],stagingIntent:{targetId:'staging',commitSha,imageDigest,expectedCurrentDeploymentId:claim.run.operation!.expectedCurrentDeploymentId??null,...(claim.run.operation!.previousDeploymentId?{previousDeploymentId:claim.run.operation!.previousDeploymentId}:{})},stagingTransportStarted:true,stagingTransportStopped:!options.recoveryIdentity,...(options.recoveryIdentity?{stagingProcessIdentity:identity}:{}),deliveryExecutor:{pid:process.pid,executionId:'crashed-fixture',stage:'staging'}});
-  options.onRunner?.(runner);
   try {
-    await runner.run();await options.afterRun?.();
+    options.onRunner?.(runner);
+    runnerTask=runner.run();
+    if(options.awaitCompletion){
+      await Promise.race([runnerTask,new Promise<never>((_resolve,reject)=>{
+        watchdog=setTimeout(()=>reject(new Error('Fixture did not observe staging completion before its lifecycle watchdog')),options.lifecycleWatchdogMs??2_500);
+      })]);
+    }else await runnerTask;
+    await options.afterRun?.();
     const spools=await Promise.all((await readdir(path.join(dataDir,'spool'))).map(file=>readJson<Record<string,unknown>>(path.join(dataDir,'spool',file))));
     return { receipts, completions, renewals, stoppedAcks, spools,buildStatuses,buildReceipts };
   }
-  finally { recoveryClock?.mockRestore();await rm(dataDir, { recursive: true, force: true }); }
+  finally {
+    clearTimeout(watchdog);
+    const stopping=options.awaitCompletion&&!lifecycleStopped?runner.stop():undefined;
+    void stopping?.catch(()=>{}); // Join below even if releasing the fixture barrier fails.
+    try {
+      try { await options.cleanup?.(); }
+      finally {
+        if(options.awaitCompletion){
+          finishLifecycle();
+          try { await stopping; }
+          finally { await runnerTask; }
+        }
+      }
+    }finally { recoveryClock?.mockRestore();await rm(dataDir, { recursive: true, force: true }); }
+  }
 }
 
 describe('staging delivery Connector integration', () => {
@@ -132,17 +174,103 @@ describe('staging delivery Connector integration', () => {
     expect(result.completions[0]?.error).toContain('reservation remains held');
   });
 
-  it('an existing intent after a generation change can only perform read-only status', async () => {
-    const effects: string[] = [], transportActions: string[] = [];
-    const claim = stagingClaim('deploy_intent'); claim.run.generation = 2;
-    const result = await execute(claim, async effect => { effects.push(effect); return { authorized: true, action: 'status' }; }, async request => {
+  it.each([false,true])('an existing intent after a generation change can only perform read-only status (event completion: %s)', async awaitCompletion => {
+    const effects:string[]=[],transportActions:string[]=[],terminal:string[]=[];
+    const claim=stagingClaim('deploy_intent');claim.run.generation=2;
+    let releaseRenew!:()=>void,renewEntered!:()=>void,idleClaim!:()=>void,stopEntered!:()=>void;
+    const renewGate=new Promise<void>(resolve=>{releaseRenew=resolve;});
+    const renewing=new Promise<void>(resolve=>{renewEntered=resolve;});
+    const idle=new Promise<void>(resolve=>{idleClaim=resolve;});
+    const stopping=new Promise<void>(resolve=>{stopEntered=resolve;});
+    let stopCalls=0,runSettled=false;
+    const resultPromise=execute(claim,async effect=>{effects.push(effect);return{authorized:true,action:'status'};},async request=>{
       transportActions.push(request.action);
-      return { operationId: request.operationId, targetId: request.targetId, phase: 'unknown', commitSha: request.commitSha, imageDigest: request.imageDigest, checkedAt: new Date().toISOString() };
+      return{operationId:request.operationId,targetId:request.targetId,phase:'unknown',commitSha:request.commitSha,imageDigest:request.imageDigest,checkedAt:new Date().toISOString()};
+    },{
+      awaitCompletion,cleanup:releaseRenew,onIdleClaim:idleClaim,
+      renew:async count=>{if(count===1){renewEntered();await renewGate;}},
+      receiptAck:async()=>{terminal.push('receipt');},completeAck:async()=>{terminal.push('complete');},stopAck:async()=>{terminal.push('stopped');},
+      onRunner:runner=>{
+        const stop=runner.stop.bind(runner),run=runner.run.bind(runner);
+        vi.spyOn(runner,'stop').mockImplementation(async()=>{stopCalls++;stopEntered();await stop();});
+        vi.spyOn(runner,'run').mockImplementation(async()=>{try{await run();}finally{runSettled=true;}});
+      }
     });
+    void resultPromise.catch(()=>{}); // Joined below even if observing the held phase fails.
+    let observationTimer:NodeJS.Timeout|undefined;
+    const observationDeadline=new Promise<never>((_resolve,reject)=>{
+      observationTimer=setTimeout(()=>reject(new Error('Fixture did not reach the preauthorization hold/stop signal')),2_500);
+    });
+    try {
+      await Promise.race([Promise.all([renewing,idle]),observationDeadline]);
+      if(awaitCompletion){
+        await new Promise(resolve=>setTimeout(resolve,75));
+        expect(stopCalls).toBe(0);
+      }else await Promise.race([stopping,observationDeadline]);
+      expect(effects).toEqual([]);expect(transportActions).toEqual([]);expect(terminal).toEqual([]);
+    }finally {
+      clearTimeout(observationTimer);releaseRenew();
+      await resultPromise;
+    }
+    const result=await resultPromise;
+    expect(runSettled).toBe(true);expect(stopCalls).toBe(1);
+    if(!awaitCompletion){
+      expect(effects).toEqual([]);expect(transportActions).toEqual([]);
+      expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);expect(result.stoppedAcks).toEqual([2]);
+      // The original status assertion really fails under the old 50ms fixture.
+      let statusAssertionError:unknown;
+      try { expect(effects).toEqual(['status']); } catch(error) { statusAssertionError=error; }
+      expect(statusAssertionError).toBeInstanceOf(Error);
+      console.info('Controlled OLD50 expected assertion failure:',(statusAssertionError as Error).message);
+      return;
+    }
     expect(effects).toEqual(['status']);
     expect(transportActions).toEqual(['status']);
     expect(result.receipts[0]?.phase).toBe('unknown');
     expect(result.completions[0]?.error).toBeTruthy();
+    expect(result.receipts).toEqual([{operationId:runId,targetId:'staging',phase:'unknown',commitSha,imageDigest,checkedAt:expect.any(String)}]);
+    expect(result.completions).toEqual([{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'}]);
+    expect(terminal).toEqual(['receipt','complete']);expect(result.stoppedAcks).toEqual([]);expect(result.spools).toEqual([]);
+    console.info('Controlled NEW completion: exact status, receipt and error completion; runner settled');
+  });
+
+  it('rejects a missing-progress watchdog outside the runner and settles the held task',async()=>{
+    let releaseRenew!:()=>void;
+    const gate=new Promise<void>(resolve=>{releaseRenew=resolve;});
+    let released=false,renewHeld=false,runSettled=false,stopCalls=0;
+    const effects:string[]=[];
+    const timers=vi.spyOn(globalThis,'setTimeout'),cleared=vi.spyOn(globalThis,'clearTimeout');
+    try {
+      await expect(execute(stagingClaim(),async effect=>{effects.push(effect);return{authorized:true,action:'deploy'};},async()=>{throw new Error('transport must not start');},{
+        awaitCompletion:true,
+        renew:async count=>{if(count===1){renewHeld=true;await gate;}},
+        cleanup:()=>{released=true;releaseRenew();},
+        onRunner:runner=>{
+          const run=runner.run.bind(runner),stop=runner.stop.bind(runner);
+          vi.spyOn(runner,'run').mockImplementation(async()=>{try{await run();}finally{runSettled=true;}});
+          vi.spyOn(runner,'stop').mockImplementation(async()=>{stopCalls++;await stop();});
+        }
+      })).rejects.toThrow('Fixture did not observe staging completion before its lifecycle watchdog');
+      expect(renewHeld).toBe(true);expect(released).toBe(true);expect(runSettled).toBe(true);expect(stopCalls).toBe(1);expect(effects).toEqual([]);
+      const index=timers.mock.calls.findIndex(([,ms])=>ms===2_500);
+      expect(index).toBeGreaterThanOrEqual(0);expect(cleared).toHaveBeenCalledWith(timers.mock.results[index]!.value);
+    }finally {releaseRenew();timers.mockRestore();cleared.mockRestore();}
+  });
+
+  it('settles the runner and clears its watchdog even when fixture cleanup throws',async()=>{
+    let runSettled=false;
+    const timers=vi.spyOn(globalThis,'setTimeout'),cleared=vi.spyOn(globalThis,'clearTimeout');
+    try {
+      await expect(execute(stagingClaim('deploy_intent'),async()=>({authorized:true,action:'status'}),async request=>({
+        operationId:request.operationId,targetId:request.targetId,phase:'unknown',commitSha,imageDigest,checkedAt:new Date().toISOString()
+      }),{awaitCompletion:true,cleanup:()=>{throw new Error('fixture cleanup failed');},onRunner:runner=>{
+        const run=runner.run.bind(runner);
+        vi.spyOn(runner,'run').mockImplementation(async()=>{try{await run();}finally{runSettled=true;}});
+      }})).rejects.toThrow('fixture cleanup failed');
+      expect(runSettled).toBe(true);
+      const index=timers.mock.calls.findIndex(([,ms])=>ms===2_500);
+      expect(index).toBeGreaterThanOrEqual(0);expect(cleared).toHaveBeenCalledWith(timers.mock.results[index]!.value);
+    }finally {timers.mockRestore();cleared.mockRestore();}
   });
 
   it('renews the staging lease while a bounded remote operation is still running', async () => {
@@ -303,11 +431,11 @@ describe('staging delivery Connector integration', () => {
     expect(stops).toEqual([identity]);expect(result.spools).toEqual([]);
   });
 
-  it('keeps an unknown receipt completion in the outbox until the server acknowledges it',async()=>{
+  it.each([false,true])('keeps an unknown receipt completion in the outbox until the server acknowledges it (event completion: %s)',async awaitCompletion=>{
     let tracking!:StagingTracking;
     const result=await execute(stagingClaim('deploy_intent'),async()=>({authorized:true,action:'status'}),async(request,value)=>{
       tracking=value!;return{operationId:request.operationId,targetId:request.targetId,phase:'unknown',commitSha,imageDigest,checkedAt:new Date().toISOString()};
-    },{completeAck:async()=>{throw new Error('completion response lost');},stopProcess:async()=>true,afterRun:async()=>{
+    },{awaitCompletion,completeAck:async()=>{throw new Error('completion response lost');},stopProcess:async()=>true,afterRun:async()=>{
       await expect(tracking.started(identity)).rejects.toThrow(/lifecycle has ended/u);await tracking.stopped();
     }});
     expect(result.receipts).toHaveLength(1);expect(result.completions.length).toBeGreaterThan(0);
@@ -326,10 +454,10 @@ describe('staging delivery Connector integration', () => {
     expect(result.buildStatuses).toEqual(['discovering']);expect(result.buildReceipts).toEqual([]);expect(result.receipts).toEqual([]);expect(result.completions).toEqual([]);expect(result.stoppedAcks).toEqual([1]);expect(result.spools).toEqual([]);
   });
 
-  it('acknowledges a failed pre-effect discovery only after its local cleanup has joined',async()=>{
+  it.each([false,true])('acknowledges a failed pre-effect discovery only after its local cleanup has joined (event completion: %s)',async awaitCompletion=>{
     const claim=stagingClaim();claim.run.operation!.phase='build_discovery';claim.run.operation!.imageDigest=undefined;
     let cleanup=false;
-    const result=await execute(claim,async()=>({authorized:true,action:'discover'}),async()=>{throw new Error('SSH must not start');},{buildDiscovery:async()=>{try{throw new Error('build unavailable');}finally{cleanup=true;}},stopAck:async(_attempt,spool)=>{expect(cleanup).toBe(true);expect(spool).toMatchObject({stagingDiscoveryStopped:true,completion:{error:expect.any(String)}});}});
+    const result=await execute(claim,async()=>({authorized:true,action:'discover'}),async()=>{throw new Error('SSH must not start');},{awaitCompletion,buildDiscovery:async()=>{try{throw new Error('build unavailable');}finally{cleanup=true;}},stopAck:async(_attempt,spool)=>{expect(cleanup).toBe(true);expect(spool).toMatchObject({stagingDiscoveryStopped:true,completion:{error:expect.any(String)}});}});
     expect(result.completions).toHaveLength(1);expect(result.stoppedAcks).toEqual([1]);expect(result.receipts).toEqual([]);expect(result.spools).toEqual([]);
   });
 

@@ -12,6 +12,10 @@ import * as processes from '../src/connector/codex.js';
 import {ConnectorRunner} from '../src/connector/runner.js';
 import type {WorkbenchConnectorClient} from '../src/connector/client.js';
 import type {CodexAppServer} from '../src/connector/codex.js';
+import * as qaProcesses from '../src/connector/qa-process.js';
+import * as connectorGit from '../src/connector/git.js';
+import * as qaPolicies from '../src/workbench/local-qa.js';
+import type {ClaimedRun} from '../src/connector/types.js';
 async function fixture(action:(directory:string)=>Promise<void>){const directory=await mkdtemp(path.join(os.tmpdir(),'qa-resource-proof-'));try{await action(directory);}finally{await rm(directory,{recursive:true,force:true});}}
 function state(directory:string):QaExecution{return {directory:path.join(directory,randomUUID()),nonce:randomUUID(),phase:'stopped'};}
 function resource(){const policy=qaPolicyFixture();policy.resource!.database=`controlled_${randomUUID().replaceAll('-','')}_test`;return policy;}
@@ -19,6 +23,92 @@ const executor={pid:process.pid,processGroupId:process.pid,startedAt:'fixture-ex
 describe('QA resource authorization and conservative startup recovery',()=>{
   beforeEach(()=>{vi.spyOn(processes,'readProcessIdentity').mockResolvedValue(executor);});
   afterEach(()=>vi.restoreAllMocks());
+  it.each(['released','ack-retry','live','reused','denied','missing','empty-locks','missing-expectation','running','unknown-child'])('handles the persisted two-resource release window conservatively: %s',async mode=>fixture(async directory=>{
+    const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
+    const execution=state(directory);await acquireQaResource(execution,policy);await claimQaResource(execution,policy);
+    const locks=[...execution.resourceLocks!];
+    await releaseQaResource(execution);execution.phase='stopped';
+    expect(execution.resourceLock).toBeUndefined();expect(execution.resourceLocks).toBeUndefined();expect(execution.expectedResourceDirectories).toEqual([]);
+    for(const lock of locks)await expect(readFile(path.join(lock.directory,'owner.json'))).rejects.toMatchObject({code:'ENOENT'});
+    // Another authorized synthetic owner can now acquire both reservations. Recovery must not touch it.
+    const next=state(directory);await acquireQaResource(next,policy);await claimQaResource(next,policy);
+    const owners=await Promise.all(locks.map(lock=>readFile(path.join(lock.directory,'owner.json'),'utf8')));
+    const dead={...executor,pid:424242,processGroupId:424242};execution.executor=dead;
+    if(mode==='missing')delete execution.executor;
+    if(mode==='empty-locks')execution.resourceLocks=[];
+    if(mode==='missing-expectation')delete execution.expectedResourceDirectories;
+    if(mode==='running')execution.phase='running';
+    if(mode==='unknown-child')execution.identity={pid:123456,processGroupId:123456,startedAt:'unknown',command:'untrusted child'};
+    if(mode==='reused')vi.mocked(processes.readProcessIdentity).mockResolvedValue({...dead,startedAt:'reused-start'});
+    const kill=vi.spyOn(process,'kill').mockImplementation(()=>{
+      if(mode==='denied')throw Object.assign(Error('denied'),{code:'EPERM'});
+      if(mode==='live'||mode==='reused')return true;
+      throw Object.assign(Error('gone'),{code:'ESRCH'});
+    });
+    const spool={runId:'released-qa',generation:1,events:[],artifacts:[],qaInFlight:true,qaExecution:execution};
+    const file=path.join(directory,'spool',`${stateKey(spool.runId,'1')}.json`);await writeSecureJson(file,spool);const original=await readFile(file,'utf8');
+    const stopped=vi.fn(async()=>{if(mode==='ack-retry'&&stopped.mock.calls.length===1)throw Error('ACK lost');});
+    const recover=async()=>{
+      let runner:ConnectorRunner;
+      const client={readRun:async()=>({id:spool.runId,generation:1,status:'interrupted',qaPolicySnapshot:policy}),stopped,claim:async()=>{await runner.stop();return undefined;}} as unknown as WorkbenchConnectorClient;
+      runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},pollIntervalMs:1},{client:()=>withRecoveryState(client),native:()=>({start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer)});
+      await runner.run();
+    };
+    try{
+      await recover();
+      if(mode==='ack-retry'){
+        expect(stopped).toHaveBeenCalledTimes(1);expect(JSON.parse(await readFile(file,'utf8'))).toMatchObject({qaInFlight:false,stopped:true,qaExecution:{phase:'stopped',expectedResourceDirectories:[]}});
+        await recover();expect(stopped.mock.calls).toEqual([[spool.runId,1,undefined],[spool.runId,1,undefined]]);
+      }
+      if(mode==='released'||mode==='ack-retry')await expect(readFile(file)).rejects.toMatchObject({code:'ENOENT'});
+      else{expect(stopped).not.toHaveBeenCalled();expect(await readFile(file,'utf8')).toBe(original);}
+      expect(await Promise.all(locks.map(lock=>readFile(path.join(lock.directory,'owner.json'),'utf8')))).toEqual(owners);
+    }finally{kill.mockRestore();vi.mocked(processes.readProcessIdentity).mockResolvedValue(executor);await releaseQaResource(next);}
+  }));
+  it.each(['owned','missing','reused','foreign','empty-locks','missing-expectation','running'])('handles exception cleanup after actual local-QA release with %s executor/state',async mode=>fixture(async directory=>{
+    const policy=resource();policy.coverage='menoteam-full/v3';policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
+    vi.spyOn(connectorGit,'ensureWorktree').mockResolvedValue({path:directory,revision:'base',baseRevision:'base'});
+    vi.spyOn(connectorGit,'checkpoint').mockResolvedValue('candidate');
+    vi.spyOn(connectorGit,'createDiff').mockResolvedValue({source:'git',baseRevision:'base',candidateRevision:'candidate',files:[],additions:0,deletions:0,totalFiles:0,patch:'',truncated:false});
+    vi.spyOn(connectorGit,'readWorktreeMap').mockResolvedValue(undefined);
+    vi.spyOn(connectorGit,'persistWorktreeMap').mockResolvedValue(undefined);
+    vi.spyOn(connectorGit,'fingerprint').mockResolvedValue('synthetic-fingerprint');
+    vi.spyOn(qaPolicies,'savedQaPolicy').mockReturnValue(policy);
+    const failure=Error('Synthetic QA command failure');
+    vi.spyOn(qaProcesses,'runQaCommand').mockRejectedValue(failure);
+    let released:QaExecution|undefined;let locks:NonNullable<QaExecution['resourceLocks']>=[];
+    const write=stateFiles.writeSecureJson;
+    vi.spyOn(stateFiles,'writeSecureJson').mockImplementation(async(file,value)=>{
+      if(file.includes('/spool/')){
+        const spool=value as {qaInFlight?:boolean;qaExecution?:QaExecution};
+        if(spool.qaExecution?.resourceLocks)locks=[...spool.qaExecution.resourceLocks];
+        if(!released&&spool.qaInFlight&&spool.qaExecution?.expectedResourceDirectories?.length===0){
+          released=spool.qaExecution;
+          if(mode==='missing')delete released.executor;
+          if(mode==='reused')released.executor={...executor,startedAt:'reused-start'};
+          if(mode==='foreign')released.executor={...executor,pid:424242,processGroupId:424242};
+          if(mode==='empty-locks')released.resourceLocks=[];
+          if(mode==='missing-expectation')delete released.expectedResourceDirectories;
+          if(mode==='running')released.phase='running';
+        }
+      }
+      await write(file,value);
+    });
+    const c={run:{id:'catch-qa',connectorId:'fixture',projectId:'project',workId:'work',kind:'implementation',model:'gpt-6.1-sol',reasoning:'medium',status:'running',generation:1,qaPolicySnapshot:policy,execution:{provider:'openai',method:'codex-host',skills:[],tools:[]}},project:{id:'project',name:'Fixture',repositoryUrl:'fixture.invalid'},messages:[],settings:[]} as unknown as ClaimedRun;
+    const stopped=vi.fn(),complete=vi.fn();
+    const client={readRun:async()=>({...c.run,status:released?'interrupted':'running'}),authorizeQaEffect:async()=>{},stopped,complete} as unknown as WorkbenchConnectorClient;
+    const native={start:async()=>['gpt-6.1-sol'],stop:async()=>{},processIdentity:async()=>executor,run:async()=>({threadId:'fixture-thread',text:'synthetic',checks:[]})} as unknown as CodexAppServer;
+    const qaResources=Object.fromEntries([policy.resource!,policy.providerResource].map(r=>[r.id,{url:`postgres://fixture-only@${r.hostname}:${r.port}/${r.database}`} ]));
+    const runner=new ConnectorRunner({serverUrl:'http://fixture.invalid',token:'fixture-only',connectorId:'fixture',dataDir:directory,projects:{},qaResources},{client:()=>client,native:()=>native});
+    (runner as unknown as {client:WorkbenchConnectorClient}).client=client;
+    await expect(runner.execute(c)).rejects.toThrow(mode==='owned'?failure.message:mode==='empty-locks'?'resource ownership set':mode==='missing-expectation'?'frozen policy':mode==='running'?'Fixed QA stop is unconfirmed':'executor ownership');
+    expect(released).toBeDefined();expect(locks).toHaveLength(2);
+    for(const lock of locks)await expect(readFile(path.join(lock.directory,'owner.json'))).rejects.toMatchObject({code:'ENOENT'});
+    expect(complete).not.toHaveBeenCalled();
+    const file=path.join(directory,'spool',`${stateKey(c.run.id,'1')}.json`);
+    if(mode==='owned'){expect(stopped).toHaveBeenCalledTimes(1);await expect(readFile(file)).rejects.toMatchObject({code:'ENOENT'});}
+    else{expect(stopped).not.toHaveBeenCalled();expect(JSON.parse(await readFile(file,'utf8')).qaInFlight).toBe(true);}
+  }));
   it.each(['empty','missing','mismatched','missing-expectation','duplicate','reversed','empty-single-fallback'])('rejects %s resource state without GO, claim or releasing either reservation',async mode=>fixture(async directory=>{
     const policy=resource();policy.providerResource={...policy.resource!,id:'provider',database:`controlled_${randomUUID().replaceAll('-','')}_test`};
     const execution=state(directory);await acquireQaResource(execution,policy);await claimQaResource(execution,policy);

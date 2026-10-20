@@ -66,7 +66,7 @@ it('delivery settings render only the supported merge method and save merge by d
   const save=vi.spyOn(workbenchApi,'saveSetting').mockResolvedValue({id:'delivery',kind:'connection',projectId:'project',name:'GitHub delivery',data:{},updatedAt:''});
   await mount();
   const form=host.querySelector<HTMLInputElement>('#delivery-base-branch')!.closest('form')!;
-  await flush(()=>form.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+  await flush(()=>form.querySelector<HTMLButtonElement>('button[role="checkbox"]')!.click());
   const method=host.querySelector<HTMLSelectElement>('#delivery-merge-method')!;
   expect(method.disabled).toBe(true);expect(method.value).toBe('merge');
   expect([...method.options].map(option=>option.value)).toEqual(['merge']);

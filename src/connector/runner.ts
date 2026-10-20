@@ -13,7 +13,7 @@ import { isPreEffectStagingRun } from '../workbench/types.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
 import { createDraftPullRequest } from './github-draft-pr.js';
 import { captureRequiredLocalQa } from './local-qa.js';
-import { assertQaResourcePolicy,bindQaExecutor,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
+import { assertQaOwnership,assertQaResourcePolicy,bindQaExecutor,isQaResourceReleased,qaExecutorStopped,stopQaExecution,releaseQaResource,type QaExecution } from './qa-process.js';
 import { savedQaPolicy,sameQaPolicy } from '../workbench/local-qa.js';
 import { mergePullRequest } from './github-merge-pr.js';
 import { runStagingOperation, stopStagingProcess, verifyStagingImage, type StagingReceipt, type StagingRequest } from './staging-deploy.js';
@@ -312,7 +312,7 @@ export class ConnectorRunner {
       // PID reuse/permission errors and legacy spools without executor identity fail closed.
       if(spool.qaInFlight){
         if(!spool.qaExecution||!qaExecutorStopped(spool.qaExecution)||!await stopQaExecution(spool.qaExecution))continue;
-        try{assertQaResourcePolicy(spool.qaExecution,remote.qaResourcePolicy);await releaseQaResource(spool.qaExecution);}catch{continue;}
+        try{if(!isQaResourceReleased(spool.qaExecution)){assertQaResourcePolicy(spool.qaExecution,remote.qaResourcePolicy);await releaseQaResource(spool.qaExecution);}}catch{continue;}
         spool.qaExecution.phase='stopped';spool.qaInFlight=false;spool.stopped=true;await this.save(spool);
       }
       if(remote.preEffectStaging&&!spool.stagingIntent&&!spool.stagingDiscoveryStopped)continue;
@@ -518,7 +518,10 @@ export class ConnectorRunner {
       if((error as NodeJS.ErrnoException).code==='EUNCONFIRMEDPROCESS'){spool.gitStopUnconfirmed=true;await this.save(spool);throw error;}
       if(spool.qaInFlight){
         if(!spool.qaExecution||!await stopQaExecution(spool.qaExecution)){await this.save(spool);throw new Error('Fixed QA stop is unconfirmed; preserve the Work reservation for operator reconciliation');}
-        assertQaResourcePolicy(spool.qaExecution,claim.run.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);spool.qaInFlight=false;await this.save(spool);
+        // This catch belongs to the original executor, unlike dead-executor recovery.
+        if(isQaResourceReleased(spool.qaExecution))await assertQaOwnership(spool.qaExecution);
+        else{assertQaResourcePolicy(spool.qaExecution,claim.run.qaPolicySnapshot);await releaseQaResource(spool.qaExecution);}
+        spool.qaInFlight=false;await this.save(spool);
       }
       if (!(error instanceof ConnectorHttpError)) {
         const cause=error as {nativeStage?:string;nativeCategory?:string;nativeCode?:number;message?:string};
