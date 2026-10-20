@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrate } from '../src/db/migrate.js';
-import { createWorkbenchApp } from '../src/workbench/app.js';
+import { createWorkbenchApp, snapshotRun } from '../src/workbench/app.js';
 import { gitBlobHash } from '../src/workbench/skill-bundle.js';
 
 // This destructive-capable integration suite is opt-in. It only writes to a
@@ -485,7 +485,12 @@ describe.skipIf(!enabled)('Provider connection PostgreSQL HTTP contracts', () =>
     checked(await user('PATCH', `/settings/${work.connectionId}`, { data: { enabled: false } }));
     const actualUse = await app.inject({ method: 'GET', url: `/api/workbench/connector/runs/${run.id}`, headers: { authorization: `Bearer ${selected.token}` } });
     expect(actualUse.statusCode).toBe(409);
-    expect((await user('GET', `/works/${racedWork.id}`)).json().runs.find((item: any) => item.id === racedRun.id).execution).toEqual(racedExecution);
+    const scopedRacedRun=(await user('GET', `/works/${racedWork.id}`)).json().runs.find((item: any) => item.id === racedRun.id);
+    expect(scopedRacedRun.execution).toEqual(snapshotRun(racedRun).execution);
+    expect(scopedRacedRun.execution).toMatchObject({ connectionId:racedWork.connectionId,connectorId:racedWork.connectionId===first.id?firstConnector.connectorId:secondConnector.connectorId,provider:'openai',method:'codex-host',model:'gpt-6.1-sol',profileId:profile.id,profile:{id:profile.id,name:'Edited after dispatch',data:{model:'gpt-6.1-sol',reasoning:'high'}} });
+    const storedRacedExecution = await sql<{ execution: typeof racedExecution }[]>`SELECT data->'execution' AS execution FROM wb_records WHERE id=${racedRun.id}`;
+    expect(storedRacedExecution).toHaveLength(1);
+    expect(storedRacedExecution[0]?.execution).toEqual(racedExecution);
   });
 
   it('rejects changing the profile after an implementation is assigned without changing the Work', async () => {

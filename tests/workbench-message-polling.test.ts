@@ -3,7 +3,7 @@ import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
-import { canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot, type WorkEvidence } from '../src/workbench/web/api';
 import type { Message } from '../src/workbench/types';
 
 const member = { id: 'owner', name: 'Owner', email: 'owner@example.test', role: 'owner' as const };
@@ -11,6 +11,12 @@ const project = { id: 'project', name: 'Project', instructions: '', repositoryUr
 const work = { id: 'work', projectId: project.id, title: 'Work', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
 const message = (id: string, overrides: Partial<Message> = {}): Message => ({ id, projectId: project.id, role: 'master', speaker: 'Master', text: id, createdAt: '2026-10-15T00:00:10.000Z', ...overrides });
 const snapshot = (): Snapshot => ({ member, projects: [project], works: [work], messages: [], runs: [], artifacts: [], settings: [], runtimeProviders: [] });
+function scopedWorkFixture(source:Snapshot,workId:string):WorkEvidence|null{
+  const selected=source.works.find(item=>item.id===workId);if(!selected)return null;
+  const runs=source.runs.filter(item=>item.workId===workId).map(run=>{const{prompt:_prompt,...summary}=run;if(!summary.execution)return summary;const{skills:_skills,tools:_tools,...execution}=summary.execution;return{...summary,execution};});
+  const artifacts=source.artifacts.filter(item=>item.workId===workId).map(artifact=>{if(artifact.kind!=='diff'||!artifact.data||typeof artifact.data!=='object'||Array.isArray(artifact.data))return artifact;const{patch:_patch,...data}=artifact.data as Record<string,unknown>;if(Array.isArray(data.files))data.files=data.files.map(file=>{if(!file||typeof file!=='object'||Array.isArray(file))return file;const{hunks:_hunks,...metadata}=file as Record<string,unknown>;return metadata;});return{...artifact,data};});
+  return{work:selected,messages:source.messages.filter(item=>item.projectId===selected.projectId&&item.workId===workId).slice(-500),runs,artifacts};
+}
 type Page = Awaited<ReturnType<typeof workbenchApi.projectMessages>>;
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -20,9 +26,20 @@ function deferred<T>() {
 let hidden = false;
 let root: Root;
 let host: HTMLDivElement;
+let scopedSnapshot:Snapshot;
+let scopedWorkRequests:string[];
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
 async function tick(count = 1) { for (let i = 0; i < count; i++) await flush(() => { vi.advanceTimersByTime(2_000); }); }
 async function render(route = '/workbench/?view=all') {
+  const previousFetch=globalThis.fetch;
+  vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{
+    const request=input instanceof Request?input:null;
+    const method=(init?.method??request?.method??'GET').toUpperCase();
+    const pathname=new URL(String(input),window.location.href).pathname;
+    const match=method==='GET'?pathname.match(/^\/api\/workbench\/works\/([^/]+)$/u):null;
+    if(match){const id=decodeURIComponent(match[1]!);scopedWorkRequests.push(pathname);const value=scopedWorkFixture(scopedSnapshot,id);return value?Response.json(value):new Response(JSON.stringify({message:'Work missing'}),{status:404,headers:{'content-type':'application/json'}});}
+    return previousFetch(input,init);
+  }));
   window.history.replaceState(null, '', route);
   await flush(() => root.render(createElement(App)));
 }
@@ -34,6 +51,7 @@ beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected live fetch'); }));
   hidden = false;
+  scopedSnapshot=snapshot();scopedWorkRequests=[];
   vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden);
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(snapshot());
@@ -43,7 +61,9 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await flush(() => root.unmount()); host.remove();
-  if (host.dataset.realApiTest !== 'true') expect(fetch).not.toHaveBeenCalled();
+  const paths=vi.mocked(fetch).mock.calls.map(([input])=>String(input));
+  expect(paths.filter(path=>path.includes('/api/workbench/works/'))).toEqual(scopedWorkRequests);
+  if (host.dataset.realApiTest !== 'true') expect(paths.filter(path=>!path.includes('/api/workbench/works/'))).toEqual([]);
   resetRateLimitCooldown(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers();
 });
 
@@ -57,6 +77,7 @@ it('shares a real API 429 cooldown between snapshot and focused history pollers'
   const qa={id:'qa-cooldown',projectId:project.id,workId:work.id,runId:review.id,kind:'qa' as const,revision:diff.revision,createdAt:'',data:{typedReview:{...reviewBinding,reviewerRunId:review.id,disposition:'approved',findings:[]}}};
   const qaMetadata={id:qa.id,projectId:qa.projectId,workId:qa.workId,runId:qa.runId,kind:qa.kind,revision:qa.revision,createdAt:qa.createdAt};
   const workSnapshot = { ...snapshot(), works: [work], messages: [message('snapshot retained', { workId: work.id })], runs: [candidate,review], artifacts: [diffMetadata,qaMetadata] };
+  scopedSnapshot=workSnapshot;
   vi.spyOn(workbenchApi, 'me').mockRestore();
   vi.spyOn(workbenchApi, 'snapshot').mockRestore();
   vi.spyOn(workbenchApi, 'projectMessages').mockRestore();
@@ -87,6 +108,7 @@ it('shares a real API 429 cooldown between snapshot and focused history pollers'
   await render(`/workbench/?view=work-detail&project=${project.id}&work=${work.id}&tab=qa`);
   await flush();
   expect(snapshotCalls).toBe(1);
+  expect(scopedWorkRequests).toEqual([`/api/workbench/works/${work.id}`]);
   expect(historyCalls).toBe(1);
   expect(artifactCalls).toBe(2);
   expect(host.textContent).toContain('retained history');
