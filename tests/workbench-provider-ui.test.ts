@@ -1800,4 +1800,54 @@ describe('long evidence text wrapping',()=>{
     expect(outputNode.textContent).toBe(output);expect(outputNode.className).toContain('overflow-auto');expect(outputNode.className).toContain('whitespace-pre-wrap');
     expect(card.textContent).toContain(qaId);expect(card.textContent).toContain(candidateId);expect(card.textContent).toContain(commitSha);expect(card.textContent).toContain(fingerprint);
   });
+
+  it('renders empty-project actions as single navigable anchors', async () => {
+    const current = snapshot();
+    current.projects = [];
+    const send = vi.spyOn(workbenchApi, 'sendMessage');
+    const expectAnchor = (label: string, expectedHref: string) => {
+      const link = [...host.querySelectorAll('a')].find(item => item.textContent?.trim() === label);
+      expect(link).toBeTruthy();
+      expect(link?.tagName).toBe('A');
+      expect(link?.getAttribute('href')).toBe(expectedHref);
+      expect(link?.hasAttribute('data-slot')).toBe(true);
+      expect(link?.querySelector('button')).toBeNull();
+      return link!;
+    };
+
+    window.history.replaceState(null, '', '/workbench/');
+    await mount(current);
+    const globalAction = expectAnchor('Create a project', '/workbench/?view=connect');
+    await flush(() => globalAction.click());
+    expect(new URL(window.location.href).searchParams.get('view')).toBe('connect');
+
+    await flush(() => root.render(createElement(App)));
+    window.history.replaceState(null, '', '/workbench/?view=all');
+    await flush(() => root.render(createElement(App)));
+    const allProjectsAction = expectAnchor('Create a project', '/workbench/?view=connect');
+    await flush(() => allProjectsAction.click());
+    expect(new URL(window.location.href).searchParams.get('view')).toBe('connect');
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(['New work', 'Start with Master'])('renders %s as an anchor and opens its existing unsent Master draft', async label => {
+    const current = snapshot();
+    current.works = [];
+    const send = vi.spyOn(workbenchApi, 'sendMessage');
+    window.history.replaceState(null, '', `/workbench/?view=work&project=${project.id}`);
+    await mount(current);
+
+    const link = [...host.querySelectorAll('a')].find(item => item.textContent?.trim() === label)!;
+    const expectedHref = `/workbench/?view=master&project=${project.id}&draft=${encodeURIComponent('Help me plan a new work: ')}`;
+    expect(link).toBeTruthy();
+    expect(link.tagName).toBe('A');
+    expect(link.getAttribute('href')).toBe(expectedHref);
+    expect(link.getAttribute('data-slot')).toBe('button');
+    expect(link.querySelector('button')).toBeNull();
+
+    await flush(() => link.click());
+    expect(new URL(window.location.href).searchParams.get('view')).toBe('master');
+    expect(host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')?.value).toBe('Help me plan a new work: ');
+    expect(send).not.toHaveBeenCalled();
+  });
 });
