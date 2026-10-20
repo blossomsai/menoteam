@@ -49,6 +49,10 @@ beforeEach(() => {
   requests = [];
   vi.spyOn(workbenchApi, 'me').mockImplementation(async () => current.member);
   vi.spyOn(workbenchApi, 'snapshot').mockImplementation(async () => structuredClone(current));
+  vi.spyOn(workbenchApi, 'workEvidence').mockImplementation(async id => {
+    const work=current.works.find(item=>item.id===id)!;
+    return { work, messages:current.messages.filter(item=>item.workId===id), runs:current.runs.filter(item=>item.workId===id), artifacts:current.artifacts.filter(item=>item.workId===id) };
+  });
   vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [], nextBefore: null });
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
@@ -188,4 +192,57 @@ it('survives StrictMode layout/effect replay and then reuses settled bodies on t
   await tab('qa'); expect(typedStatus()).toContain('Current evidence');
   const before = count(f.typed.id); await tab('overview'); await tab('qa');
   expect(count(f.typed.id)).toBe(before);
+});
+
+it('loads metadata once per Work, fetches the selected full diff once, and retains it on tab return', async () => {
+  const f=fixture();
+  const full={...f.diff,data:{...(f.diff.data as object),files:[{path:'src/a.ts',status:'modified',binary:false,additions:1,deletions:0,hunks:'full legacy hunks'}],patch:'large historical patch'}};
+  f.snapshot.artifacts=f.snapshot.artifacts.map(item=>item.id===f.diff.id?{...item,data:{candidateRevision:commit,totalFiles:1,files:[{path:'src/a.ts',status:'modified',binary:false,additions:1,deletions:0}]}}:item);
+  f.bodies.splice(f.bodies.findIndex(item=>item.id===full.id),1,full);
+  await mount(f,'changes');
+  expect(host.textContent).toContain('src/a.ts');
+  expect(workbenchApi.workEvidence).toHaveBeenCalledTimes(1);
+  expect(count(f.diff.id)).toBe(1);
+  await tab('qa');await tab('changes');
+  expect(workbenchApi.workEvidence).toHaveBeenCalledTimes(1);expect(count(f.diff.id)).toBe(1);
+});
+
+it('shows scoped metadata failure explicitly and retries instead of rendering false empty evidence', async () => {
+  const f=fixture();current=f.snapshot;bodies=new Map(f.bodies.map(body=>[body.id,body]));
+  const evidence=vi.mocked(workbenchApi.workEvidence);
+  evidence.mockRejectedValueOnce(new Error('offline'));
+  await mount(f,'changes');
+  expect(host.textContent).toContain('Could not load this Work’s evidence.');
+  expect(host.textContent).not.toContain('No change evidence has been recorded yet.');
+  await flush(()=>[...host.querySelectorAll('button')].find(button=>button.textContent==='Retry')!.click());
+  expect(host.textContent).toContain('Recorded file changes from this Work.');
+  expect(workbenchApi.workEvidence).toHaveBeenCalledTimes(2);
+});
+
+it('keeps the Work evidence state visibly loading until scoped metadata resolves', async () => {
+  const f=fixture();let finish!:(value:Awaited<ReturnType<typeof workbenchApi.workEvidence>>)=>void;
+  vi.mocked(workbenchApi.workEvidence).mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
+  await mount(f,'changes');
+  expect(host.textContent).toContain('Loading Work evidence…');
+  expect(host.textContent).not.toContain('No change evidence has been recorded yet.');
+  await flush(()=>finish({work:f.work,messages:f.snapshot.messages,runs:f.snapshot.runs,artifacts:f.snapshot.artifacts}));
+  expect(host.textContent).toContain('Recorded file changes from this Work.');
+});
+
+it('does not cache a selected diff 404 or mismatch as success and retries the full artifact', async () => {
+  const f=fixture();current=f.snapshot;bodies=new Map(f.bodies.map(body=>[body.id,body]));
+  const full={...f.diff,data:{...(f.diff.data as object),files:[{path:'src/a.ts',status:'modified',binary:false,additions:1,deletions:0,hunks:'full hunk'}]}};
+  bodies.set(full.id,full);
+  let invalid=true;
+  respond=(id)=>{
+    if(id===f.diff.id&&invalid){invalid=false;return new Response('{}',{status:404});}
+    return Response.json(bodies.get(id));
+  };
+  window.history.replaceState(null,'',`/workbench/?view=work-detail&project=project&work=${f.work.id}&tab=changes`);
+  await flush(()=>root.render(createElement(App)));
+  expect(host.textContent).toContain('Could not load the latest evidence.');
+  expect(host.textContent).not.toContain('No change evidence has been recorded yet.');
+  await flush(()=>{const button=[...host.querySelectorAll('button')].find(item=>item.textContent==='Retry')!;button.click();button.click();});
+  expect(count(f.diff.id)).toBe(2);
+  expect(host.textContent).toContain('src/a.ts');
 });

@@ -3,7 +3,7 @@ import type { Sql } from 'postgres';
 import { createWorkbenchApp, snapshotRun, snapshotSetting } from '../src/workbench/app.js';
 import { WorkbenchStore } from '../src/workbench/store.js';
 import { bytesHash, gitBlobHash, sealBundle, verifyBundle } from '../src/workbench/skill-bundle.js';
-import type { Run, Setting } from '../src/workbench/types.js';
+import type { Artifact, Run, Setting, Work } from '../src/workbench/types.js';
 
 const file = (path: string, content: string) => {
   const bytes = Buffer.from(content);
@@ -58,4 +58,30 @@ it('snapshot route omits bundle while dedicated edit/copy still reads the full s
     expect(copied.json().data.bundle).toEqual(edited.json().data.bundle);
     expect(copied.json().data.content).toBe('# Edited');
   } finally { await app.close(); }
+});
+
+it('scoped Work route projects runs and compact diff references without mutating stored artifacts', async () => {
+  const member = { id:'owner',email:'owner@example.test',name:'Owner',role:'owner' as const };
+  const work:Work={id:'work',projectId:'project',title:'Work',overview:'',status:'in_progress',revision:3,profileId:'',sources:[],createdAt:'t',updatedAt:'t'};
+  const diff:Artifact={id:'diff',projectId:'project',workId:'work',runId:'run',kind:'diff',revision:'diff-rev',createdAt:'t',data:{candidateRevision:'a'.repeat(40),baseRevision:'b'.repeat(40),additions:4,deletions:2,totalFiles:1,truncated:false,source:'git',files:[{path:'src/a.ts',status:'modified',binary:false,additions:4,deletions:2,hunks:'large full hunk'}],patch:'large full patch'}};
+  const inputRun:Run={...run,id:'run',workId:'work',prompt:'private prompt',execution:{...run.execution!,skills:[{id:'s',name:'skill',content:'private skill'}],tools:['private tool']}};
+  const stored=new Map<string,unknown>([['project',{id:'project'}],['work',work],['diff',diff]]);
+  const sql=(async(strings:TemplateStringsArray)=>strings.join('').includes('wb_sessions')?[member]:[]) as unknown as Sql;
+  vi.spyOn(WorkbenchStore.prototype,'get').mockImplementation(async(_kind,id)=>structuredClone(stored.get(id)) as never);
+  vi.spyOn(WorkbenchStore.prototype,'list').mockImplementation(async kind=>(kind==='message'?[{id:'m',projectId:'project',workId:'work',role:'agent',speaker:'Codex',text:'message',createdAt:'t'}]:kind==='run'?[inputRun]:[]) as never);
+  vi.spyOn(WorkbenchStore.prototype,'artifactMetadata').mockResolvedValue([structuredClone(diff)]);
+  const app=await createWorkbenchApp({sql});
+  try{
+    const response=await app.inject({url:'/api/workbench/works/work',headers:{cookie:'menoteam_session=work-dto'}});
+    expect(response.statusCode).toBe(200);
+    const dto=response.json();
+    const sourceBytes=Buffer.byteLength(JSON.stringify({work,messages:[{id:'m',projectId:'project',workId:'work',role:'agent',speaker:'Codex',text:'message',createdAt:'t'}],runs:[inputRun],artifacts:[diff]}));
+    const scopedBytes=Buffer.byteLength(JSON.stringify(dto));
+    console.info('scoped Work evidence fixture JSON bytes before/after:',sourceBytes,scopedBytes);
+    expect(dto.runs[0]).toEqual(snapshotRun(inputRun));
+    expect(dto.runs[0].prompt).toBeUndefined();
+    expect(dto.artifacts[0].data).toEqual({candidateRevision:'a'.repeat(40),baseRevision:'b'.repeat(40),additions:4,deletions:2,totalFiles:1,truncated:false,source:'git',files:[{path:'src/a.ts',status:'modified',binary:false,additions:4,deletions:2}]});
+    expect(scopedBytes).toBeLessThan(sourceBytes);
+    expect(stored.get('diff')).toEqual(diff);
+  }finally{await app.close();}
 });

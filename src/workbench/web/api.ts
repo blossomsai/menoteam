@@ -13,6 +13,13 @@ export interface Snapshot {
   projectRoles?: Record<string, Member['role']>;
 }
 
+export interface WorkEvidence {
+  work: Work;
+  messages: Message[];
+  runs: SnapshotRun[];
+  artifacts: Artifact[];
+}
+
 export interface ProviderConnection {
   id: string;
   name: string;
@@ -76,6 +83,7 @@ export const workbenchApi = {
   logout: () => request<void>('/logout', { method: 'POST' }),
   snapshot: () => request<Snapshot>('/snapshot'),
   artifact: (id: string, signal?: AbortSignal) => request<Artifact>(`/artifacts/${encodeURIComponent(id)}`, { signal }),
+  workEvidence: (id: string) => request<WorkEvidence>(`/works/${encodeURIComponent(id)}`),
   diffFile: (id:string,path:string,revision:string,cursor?:string,signal?:AbortSignal) => { const query=new URLSearchParams({path,revision});if(cursor)query.set('cursor',cursor);return request<{path:string;binary:boolean;encodingUnsupported?:boolean;complete:boolean;verified?:boolean;incomplete?:boolean;integrity?:'pending'|'verified'|'incomplete';chunkIndex:number;chunkCount:number;fileSha256?:string;contentBase64:string;nextCursor:string|null;reason?:string}>(`/artifacts/${encodeURIComponent(id)}/diff-file?${query}`,{signal}); },
   projectMessages: (projectId: string, query: { workId?: string; before?: string; after?: string } = {}) => {
     const params = new URLSearchParams();

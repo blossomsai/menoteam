@@ -514,10 +514,26 @@ function WorkDetail({ work, project, snapshot, refresh, setError }: { work: Work
   const overviewEditor = useWorkOverviewEditor(work, refresh);
   const artifactReader = useArtifactReader();
   const messages = snapshot.messages.filter(message => message.projectId === project.id && message.workId === work.id);
+  const [evidence, setEvidence] = useState<{status:'loading'|'ready'|'error';artifacts:Artifact[];runs:SnapshotRun[]}>({status:'loading',artifacts:[],runs:[]});
+  const [evidenceRetry, setEvidenceRetry] = useState(0);
+  const evidenceSignature = JSON.stringify([snapshot.member.id,project.id,work.id,work.revision,work.updatedAt,
+    snapshot.runs.filter(item=>item.workId===work.id).map(item=>[item.id,item.generation,item.updatedAt,item.status]),
+    snapshot.artifacts.filter(item=>item.workId===work.id).map(item=>artifactKey(item))]);
+  useEffect(()=>{
+    let active=true;
+    setEvidence(current=>({...current,status:'loading'}));
+    void workbenchApi.workEvidence(work.id).then(result=>{
+      if(!active)return;
+      if(result.work.id!==work.id||result.work.projectId!==project.id||result.runs.some(item=>item.workId!==work.id)||result.artifacts.some(item=>item.workId!==work.id))throw new Error('Work evidence response does not match this Work');
+      setEvidence({status:'ready',artifacts:result.artifacts,runs:result.runs});
+    }).catch(()=>{if(active)setEvidence(current=>({...current,status:'error'}));});
+    return()=>{active=false;};
+  },[evidenceSignature,evidenceRetry,work.id,project.id]);
+  const refreshEvidence=async()=>{await refresh();setEvidenceRetry(value=>value+1);};
   const canManageStaging=snapshot.member.role==='owner'||snapshot.member.role==='admin'&&['owner','admin'].includes(snapshot.projectRoles?.[project.id]??'');
   return <div data-testid="work-detail-layout" className="grid min-h-[calc(100dvh-8.5rem)] min-w-0 gap-5 xl:h-[calc(100dvh-8.5rem)] xl:min-h-0 xl:grid-cols-[minmax(0,1.08fr)_minmax(0,0.92fr)] xl:gap-6">
     <section className="max-h-[70dvh] min-w-0 overflow-y-auto border-border pr-1 xl:max-h-none xl:min-h-0 xl:pr-2"><header className="mb-3"><h1 className="text-xl font-semibold tracking-tight text-foreground">{work.title}</h1></header><nav className="mb-5 flex gap-5 border-b border-border" aria-label="Work details">{(['overview', 'changes', 'qa'] as const).map(item => <a key={item} className={`border-b-2 px-1 py-3 text-sm capitalize no-underline ${tab === item ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground'}`} href={`${href('work-detail', project.id, work.id)}&tab=${item}`}>{item === 'qa' ? 'QA' : item}</a>)}</nav>{tab === 'overview' && <WorkProfileSelector work={work} project={project} snapshot={snapshot} refresh={refresh} setError={setError} />}
-      <WorkArtifacts artifactReader={artifactReader} overviewEditor={overviewEditor} sessionKey={snapshot.member.id} tab={tab} work={work} project={project} artifacts={snapshot.artifacts.filter(item => item.workId === work.id)} runs={snapshot.runs.filter(item => item.workId === work.id)} projectRuns={snapshot.runs.filter(item => item.projectId === project.id)} settings={snapshot.settings} providerConnections={snapshot.providerConnections ?? []} runtimeProviders={snapshot.runtimeProviders} canManageStaging={canManageStaging} refresh={refresh} setError={setError} />
+      {evidence.status==='loading'?<p role="status" className="rounded-lg border border-border p-4 text-sm text-muted-foreground">Loading Work evidence…</p>:evidence.status==='error'?<div role="alert" className="space-y-3 rounded-lg border border-destructive/30 p-4 text-sm text-destructive"><p>Could not load this Work’s evidence.</p><Button variant="outline" onClick={()=>setEvidenceRetry(value=>value+1)}>Retry</Button></div>:<WorkArtifacts artifactReader={artifactReader} overviewEditor={overviewEditor} sessionKey={snapshot.member.id} tab={tab} work={work} project={project} artifacts={evidence.artifacts} runs={evidence.runs} projectRuns={snapshot.runs.filter(item => item.projectId === project.id)} settings={snapshot.settings} providerConnections={snapshot.providerConnections ?? []} runtimeProviders={snapshot.runtimeProviders} canManageStaging={canManageStaging} refresh={refreshEvidence} setError={setError} />}
     </section>
     <section className="flex h-[min(70dvh,42rem)] min-h-[28rem] min-w-0 flex-col overflow-hidden border-t border-border pt-5 xl:h-full xl:min-h-0 xl:border-l xl:border-t-0 xl:pl-6 xl:pt-0" aria-label={`${work.title} conversation`}><div className="mb-3 shrink-0"><h2 className="font-semibold">Conversation</h2></div><ConversationPage title="" messages={messages} project={project} snapshot={snapshot} work={work} refresh={refresh} setError={setError} /></section>
   </div>;
@@ -581,28 +597,23 @@ function WorkArtifacts({ artifactReader, overviewEditor, sessionKey,tab, work, p
     return true;
   });
   const latest = [...selected].sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-  const reviewBinding = latest && tab === 'qa' ? runs.find(run => run.id === latest.runId && run.kind === 'review')?.reviewBinding : undefined;
+  const latestKey=latest?artifactKey(latest):null;
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [artifactState, setArtifactState] = useState<'idle' | 'loading' | 'error' | 'mismatch'>('idle');
   const [requestId,setRequestId]=useState(()=>crypto.randomUUID());const [deliveryBusy,setDeliveryBusy]=useState(false);
   const [reviewEvidence,setReviewEvidence]=useState<{scopeKey:string;artifact:Artifact|null}|null>(null);const [mergeRequestId,setMergeRequestId]=useState(()=>crypto.randomUUID());
   useEffect(() => {
-    if(tab==='changes') { setArtifact(latest??null);setArtifactState('idle');return; }
     if (tab === 'overview' || tab === 'qa' || !latest) { setArtifact(null); setArtifactState('idle'); return; }
     let active = true; setArtifactState('loading'); setArtifact(null);
     void artifactReader.read(latest).then(result => {
       if (!active) return;
-      const typedReview = isRecord(result.data) && isRecord(result.data.typedReview) ? result.data.typedReview : null;
-      const matchesBinding = !reviewBinding || Boolean(typedReview && reviewBinding.diffRevision === latestDiff?.revision &&
-        typedReview.candidateRunId === reviewBinding.candidateRunId && typedReview.commitSha === reviewBinding.commitSha &&
-        typedReview.candidateFingerprint === reviewBinding.candidateFingerprint && typedReview.diffRevision === reviewBinding.diffRevision);
-      if (result.id !== latest.id || result.kind !== latest.kind || result.workId !== work.id || result.runId !== latest.runId || result.revision !== latest.revision || !matchesBinding) {
+      if (result.id !== latest.id || result.projectId !== project.id || result.kind !== latest.kind || result.workId !== work.id || result.runId !== latest.runId || result.revision !== latest.revision) {
         setArtifact(null); setArtifactState('mismatch'); return;
       }
       setArtifact(result); setArtifactState('idle');
     }).catch(() => { if (active) setArtifactState('error'); });
     return () => { active = false; };
-  }, [latest?.id, latest?.runId, latest?.revision, latestDiff?.revision, reviewBinding?.candidateRunId, reviewBinding?.commitSha, reviewBinding?.candidateFingerprint, reviewBinding?.diffRevision, work.id, tab]);
+  }, [latestKey, latestDiff?.revision, work.id, project.id, tab]);
   const relatedRuns = runs.filter(run => tab === 'changes' ? run.kind === 'implementation' : run.kind === 'review');
   const deliveries=[...artifacts.filter(item=>item.kind==='delivery')].sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
   const deliveryRuns=[...runs.filter(run=>run.kind==='delivery')].sort((a,b)=>b.createdAt.localeCompare(a.createdAt));
@@ -649,7 +660,7 @@ function WorkArtifacts({ artifactReader, overviewEditor, sessionKey,tab, work, p
   const deliveryLabel=retryable?'Retry Draft PR':existing?.status==='queued'?'Queued':existing?.status==='running'?'In progress':existing?.status==='paused'?'Paused':existing?.status==='completed'&&existing.operation?.phase==='pr_created'?'Draft PR created':existing?'Delivery status unavailable':'Create Draft PR';
   return <section className="space-y-4"><header><h2 className="font-semibold">Changes</h2><p className="mt-1 text-sm text-muted-foreground">Recorded file changes from this Work.</p></header>
     {artifactState==='loading'&&selected.length>0&&<p role="status" className="rounded-lg border border-border p-4 text-sm text-muted-foreground">Loading latest evidence…</p>}
-    {artifactState==='error'&&<p role="alert" className="rounded-lg border border-destructive/30 p-4 text-sm text-destructive">Could not load the latest evidence.</p>}
+    {(artifactState==='error'||artifactState==='mismatch')&&selected.length>0&&<div role="alert" className="space-y-2 rounded-lg border border-destructive/30 p-4 text-sm text-destructive"><p>{artifactState==='mismatch'?'The latest evidence did not match this Work.':'Could not load the latest evidence.'}</p><Button variant="outline" onClick={()=>{if(!latest)return;artifactReader.forget(latest);setArtifact(null);setArtifactState('loading');void artifactReader.read(latest,undefined,true).then(result=>{if(result.id===latest.id&&result.projectId===project.id&&result.workId===work.id&&result.runId===latest.runId&&result.revision===latest.revision){setArtifact(result);setArtifactState('idle');}else setArtifactState('mismatch');}).catch(()=>setArtifactState('error'));}}>Retry</Button></div>}
     {artifact&&<ArtifactCard key={`${sessionKey}:${artifact.id}:${artifact.revision}`} sessionKey={sessionKey} artifact={artifact}/>}
     {candidate&&<DeliverySummary run={latestCandidateDelivery(runs,candidate.id)} receiptCount={deliveries.length}/>}
     {(deliveries.length>0||candidate)&&<details className="rounded-lg border border-border p-3"><summary className="cursor-pointer text-sm font-medium">Delivery history and details · {deliveryRuns.length} runs · {deliveries.length} receipts</summary><div className="mt-3 space-y-3">{latestDiff&&candidate&&<section className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border p-3"><div><strong className="text-sm">Draft pull request</strong><p className="text-xs text-muted-foreground">{existing?`Delivery ${existing.status}${existing.operation?.phase?` · ${existing.operation.phase}`:''}`:project.repositoryUrl?'Create a reviewable draft from this exact candidate.':'Connect a repository to enable delivery.'}</p></div><Button disabled={deliveryBusy||(!retryable&&!!existing)||!project.repositoryUrl} onClick={async()=>{setDeliveryBusy(true);setError('');try{await workbenchApi.requestDraftPr(work.id,{candidateRunId:candidate.id,candidateRevision:latestDiff.revision,action:'create_draft_pr',requestId});setRequestId(crypto.randomUUID());await refresh();}catch(error){setError(errorMessage(error));}finally{setDeliveryBusy(false);}}}>{deliveryBusy?'Queueing…':deliveryLabel}</Button></section>}{deliveries.map(item=><FullArtifactCard artifactReader={artifactReader} key={item.id} artifact={item}/>)}</div></details>}
