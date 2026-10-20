@@ -458,7 +458,7 @@ describe('mounted marketplace skill selection', () => {
     await choose('#marketplace-plugin-project', 'alpha');
   }
   async function inspectPlugin() { await flush(() => button('Inspect plugin').click()); }
-  async function selectFirstSkill() { await flush(() => host.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click()); }
+  async function selectFirstSkill() { await flush(() => host.querySelector<HTMLButtonElement>('button[role="checkbox"]')!.click()); }
 
   it('drops hydration results after the selection, plugin or project changes', async () => {
     const pending = deferred<Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>>();
@@ -467,7 +467,7 @@ describe('mounted marketplace skill selection', () => {
     await openMarketplace({ ...snapshot(), projects });
     await inspectPlugin(); await selectFirstSkill(); await flush(() => button('Load selected skill details').click());
     expect(previewCall.mock.calls.at(-1)?.[0].selectedPaths).toEqual(['skills/one/SKILL.md']);
-    await flush(() => host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[1]!.click());
+    await flush(() => host.querySelectorAll<HTMLButtonElement>('button[role="checkbox"]')[1]!.click());
     pending.resolve(hydratedPreview() as Awaited<ReturnType<typeof workbenchApi.previewCatalogPlugin>>);
     await flush();
     expect(host.textContent).not.toContain('Inspect verified SKILL.md');

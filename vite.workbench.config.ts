@@ -13,6 +13,7 @@ export default defineConfig({
   build: {
     outDir: resolve('dist/workbench/web'),
     emptyOutDir: true,
+    manifest: true,
     rollupOptions: { output: {
       entryFileNames: 'assets/[name]-[hash].js',
       chunkFileNames: 'assets/[name]-[hash].js',

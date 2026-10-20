@@ -11,6 +11,10 @@ import type { QaPolicy } from '../workbench/local-qa.js';
 export type QaExecution = { directory:string; nonce:string; executor?:CodexProcessIdentity; phase:'starting'|'running'|'stopped'; identity?:CodexProcessIdentity; identityFile?:string; resourceLock?:{directory:string;owner:string};resourceLocks?:{directory:string;owner:string}[];expectedResourceDirectories?:string[] };
 export type QaResourceConfig = {url:string};
 export class QaResourceContention extends Error {}
+/** Release completion only; this does not prove executor or child death. */
+export function isQaResourceReleased(state:QaExecution):boolean {
+  return state.phase==='stopped'&&state.resourceLock===undefined&&state.resourceLocks===undefined&&Array.isArray(state.expectedResourceDirectories)&&state.expectedResourceDirectories.length===0;
+}
 const RESOURCE_ROOT=path.join('/tmp','menoteam-qa-resources');
 function assertResourceSet(state:QaExecution):void {
   const validDirectory=(value:unknown):value is string=>typeof value==='string'&&path.dirname(value)===RESOURCE_ROOT&&/^[a-f0-9]{64}$/u.test(path.basename(value));

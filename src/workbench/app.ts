@@ -118,6 +118,10 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (origin && origin !== (options.allowedOrigin ?? `${req.protocol}://${req.headers.host}`))
             fail(403, "Origin denied");
     });
+    app.addHook('onSend', async (req, reply, payload) => {
+        if (req.url.startsWith('/api/workbench/')) reply.header('Cache-Control', 'no-store');
+        return payload;
+    });
     async function member(req: FastifyRequest, tx: Sql = sql): Promise<Member> {
         const raw = req.headers.cookie?.split(";").map(s => s.trim()).find(s => s.startsWith("menoteam_session="))?.slice(17);
         if (!raw)
@@ -283,10 +287,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 ...(evidence[0]?{verifiedRunId:evidence[0].id,verifiedAt:evidence[0].verified_at}:{})};
         }));
     }
-    async function providerConnections(projectIds:string[]) {
-        const runtime=await runtimeProviders(projectIds);
-        return (await store.list<Setting>('setting')).filter(s=>s.kind==='provider'&&!s.projectId).map(s=>{
-            const endpoint=runtime.find(c=>c.connectorId===s.data.connectorId);
+    async function providerConnections(projectIds:string[], runtime?:Awaited<ReturnType<typeof runtimeProviders>>, settings?:Setting[]) {
+        const providers=runtime??await runtimeProviders(projectIds);
+        const availableSettings=settings??await store.list<Setting>('setting');
+        return availableSettings.filter(s=>s.kind==='provider'&&!s.projectId).map(s=>{
+            const endpoint=providers.find(c=>c.connectorId===s.data.connectorId);
             const reason=!endpoint?undefined:endpoint.codexAppServer!==true?'Codex capability unavailable':endpoint.localWorktrees!==true?'Local Worktree capability unavailable':!endpoint.models.length?'Connector models have not been discovered':undefined;
             const status=s.data.enabled===false?'disabled':!s.data.connectorId?'unbound':!endpoint?'disconnected':!endpoint.available?'offline':reason?'capability_unavailable':'available';
             return {id:s.id,name:s.name,connectorId:s.data.connectorId,default:s.data.default===true,enabled:s.data.enabled!==false,status,reason,localWorktrees:endpoint?.localWorktrees,models:endpoint?.models??[],modelReasoningEfforts:endpoint?.modelReasoningEfforts??{},projectIds:endpoint?.projectIds??[],runKinds:endpoint?.runKinds};
@@ -342,17 +347,31 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const scoped = <T extends {
             projectId?: string;
         }>(items: T[]) => items.filter(x => !x.projectId ? true : ids.includes(x.projectId));
+        const [projectRoles,projectRecords,works,messages,rawRuns]=await Promise.all([
+            user.role==='owner' ? Promise.resolve(Object.fromEntries(ids.map(pid=>[pid,'owner']))) : sql`SELECT project_id,role FROM wb_memberships WHERE user_id=${user.id}`.then(rows=>Object.fromEntries(rows.map(row=>[String(row.project_id),String(row.role)]))),
+            store.list<Project>("project"),
+            store.scopedList<Work>("work",ids),
+            store.scopedList<Message>("message",ids),
+            store.scopedList<Run>('run',ids)
+        ]);
+        const projects=projectRecords.filter(project=>ids.includes(project.id));
+        const runs=rawRuns.map(run=>run.status==='queued'&&run.kind!=='delivery'&&!run.execution?.connectorId&&!run.targetConnectorId&&!run.connectorId?{...run,error:run.error??'Historical Connector identity is unresolved; this queued run cannot be dispatched or silently migrated'}:run);
+        const [artifacts,settings,providers]=await Promise.all([
+            store.artifactMetadata(ids),
+            store.list<Setting>("setting"),
+            runtimeProviders(ids)
+        ]);
         return {
             member: user,
-            projectRoles: user.role==='owner' ? Object.fromEntries(ids.map(pid=>[pid,'owner'])) : Object.fromEntries((await sql`SELECT project_id,role FROM wb_memberships WHERE user_id=${user.id}`).map(row=>[String(row.project_id),String(row.role)])),
-            projects: (await store.list<Project>("project")).filter(p => ids.includes(p.id)),
-            works: await store.scopedList<Work>("work", ids),
-            messages: await store.scopedList<Message>("message", ids),
-            runs: (await store.scopedList<Run>('run',ids)).map(run=>run.status==='queued'&&run.kind!=='delivery'&&!run.execution?.connectorId&&!run.targetConnectorId&&!run.connectorId?{...run,error:run.error??'Historical Connector identity is unresolved; this queued run cannot be dispatched or silently migrated'}:run),
-            artifacts: await store.artifactMetadata(ids),
-            settings: scoped(await store.list<Setting>("setting")),
-            runtimeProviders: await runtimeProviders(ids),
-            providerConnections: await providerConnections(ids)
+            projectRoles,
+            projects,
+            works,
+            messages,
+            runs,
+            artifacts,
+            settings: scoped(settings),
+            runtimeProviders: providers,
+            providerConnections: await providerConnections(ids,providers,settings)
         };
     });
     app.post("/api/workbench/projects", async (req) => {
