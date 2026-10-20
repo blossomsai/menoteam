@@ -1,6 +1,6 @@
 import postgres from 'postgres';
-import { writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const databaseUrl = process.env.WORK_MAP_TEST_DATABASE_URL;
@@ -211,6 +211,7 @@ describe.skipIf(!databaseUrl)('Snapshot evidence index PostgreSQL regression', (
       before: { artifacts: explainMetrics(beforePlans.artifacts), evidenceByConnector: Object.fromEntries([...beforePlans.evidence].map(([id, plan]) => [id, explainMetrics(plan)])) },
       after: { artifacts: explainMetrics(afterPlans.artifacts), evidenceByConnector: Object.fromEntries([...afterPlans.evidence].map(([id, plan]) => [id, explainMetrics(plan)])) }
     };
+    await mkdir(dirname(measurementPath), { recursive: true });
     await writeFile(measurementPath, `${JSON.stringify(report, null, 2)}\n`);
     console.info('snapshot index fixture aggregate plans', JSON.stringify(report));
 
