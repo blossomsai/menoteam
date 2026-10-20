@@ -5,6 +5,7 @@ import { act, createElement } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
+import { Button } from '../src/local/web/src/components/ui/button';
 import { ProviderConnections } from '../src/workbench/web/ProviderConnections';
 import { ApiError, workbenchApi, type Snapshot } from '../src/workbench/web/api';
 
@@ -14,7 +15,7 @@ beforeAll(async () => {
   const { compile } = createRequire(require.resolve('@tailwindcss/vite'))('@tailwindcss/node');
   const postcss = createRequire(require.resolve('vite'))('postcss');
   const compiler = await compile(await readFile('src/workbench/web/style.css', 'utf8'), { base: process.cwd() + '/src/workbench/web', onDependency: () => {} });
-  const ast = postcss.parse(compiler.build(['border', 'border-border', 'border-input', 'border-primary', 'text-foreground']));
+  const ast = postcss.parse(compiler.build(['border', 'border-border', 'border-input', 'border-primary', 'border-destructive', 'text-foreground']));
   // happy-dom does not implement cascade layers. Flatten the generated rules only
   // in this test renderer. This verifies computed token colors, not browser layout.
   ast.walkAtRules('layer', (rule: any) => rule.replaceWith(rule.nodes ?? []));
@@ -50,4 +51,18 @@ it('computes ProviderConnections neutral containers without overriding its input
   expect(border(host.querySelector('form')!)).toBe('#e5e5e8');
   expect(border(host.querySelector('section > p')!)).toBe('#e5e5e8');
   expect(border(host.querySelector('select')!)).toBe('#dedfe2');
+});
+
+it('computes outline border-input while preserving caller primary/destructive overrides and focus hooks', async () => {
+  await act(async () => root.render(createElement('div', null,
+    createElement(Button, { variant: 'outline' }, 'Outline'),
+    createElement(Button, { variant: 'outline', className: 'border-primary' }, 'Primary override'),
+    createElement(Button, { variant: 'outline', className: 'border-destructive' }, 'Destructive override'),
+  )));
+  const [outline, primary, destructive] = [...host.querySelectorAll('button')];
+  expect(border(outline!)).toBe('#dedfe2');
+  expect(border(primary!)).toBe('#454d40');
+  expect(border(destructive!)).toBe('#b95651');
+  expect(outline!.classList.contains('focus-visible:border-ring')).toBe(true);
+  expect(outline!.classList.contains('aria-invalid:border-destructive')).toBe(true);
 });

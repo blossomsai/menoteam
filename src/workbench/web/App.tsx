@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight, LogOut, Menu, Mic, Plus, Send } from 'lucide-react';
 import { Badge } from '../../local/web/src/components/ui/badge';
 import { Button } from '../../local/web/src/components/ui/button';
@@ -187,16 +187,15 @@ function WorkbenchShell({ member, snapshot, route, error, refresh, onLogout }: {
   const selectedView = route.view;
   const [mobileNav, setMobileNav] = useState(false);
   const scope = JSON.stringify([member.id, route.view, route.projectId, route.workId, new URL(window.location.href).searchParams.get('tab')]);
-  const scopeRef = useRef({ key: scope });
-  if (scopeRef.current.key !== scope) scopeRef.current = { key: scope };
-  const pageScope = scopeRef.current;
+  const pageScope = useMemo(() => ({ key: scope }), [scope]);
+  const scopeRef = useRef<typeof pageScope | null>(null);
   const [localError, storeLocalError] = useState({ scope: pageScope, value: '' });
   const setLocalError = useCallback((value: string) => {
     if (scopeRef.current === pageScope) storeLocalError({ scope: pageScope, value });
   }, [pageScope]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     scopeRef.current = pageScope;
-    return () => { if (scopeRef.current === pageScope) scopeRef.current = { key: '' }; };
+    return () => { if (scopeRef.current === pageScope) scopeRef.current = null; };
   }, [pageScope]);
   const report = error || (localError.scope === pageScope ? localError.value : '');
   const workForProject = project ? snapshot.works.filter(item => item.projectId === project.id) : [];
