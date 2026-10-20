@@ -14,8 +14,21 @@ import { registerSourceRoutes } from "./sources.js";
 import { WorkbenchStore } from "./store.js";
 import { requiresLocalWorktree } from "./execution-capabilities.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
-import { isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
+import { isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type SnapshotRun, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
+
+export function snapshotRun({ prompt: _prompt, execution, ...run }: Run): SnapshotRun {
+    if (!execution) return run;
+    const { skills: _skills, tools: _tools, ...summary } = execution;
+    return { ...run, execution: summary };
+}
+
+export function snapshotSetting(setting: Setting): Setting {
+    if (setting.kind !== 'skill') return setting;
+    const { bundle: _bundle, ...data } = setting.data;
+    return { ...setting, data };
+}
+
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID()}`;
 const text = z.string().trim().min(1).max(12000);
@@ -367,9 +380,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             projects,
             works,
             messages,
-            runs,
+            runs: runs.map(snapshotRun),
             artifacts,
-            settings: scoped(settings),
+            settings: scoped(settings).map(snapshotSetting),
             runtimeProviders: providers,
             providerConnections: await providerConnections(ids,providers,settings)
         };

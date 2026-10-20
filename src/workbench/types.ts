@@ -150,7 +150,11 @@ export interface Run {
     updatedAt: string;
     error?: string;
 }
-export function isCausalMasterWake(run: Run): boolean {
+export type SnapshotRun = Omit<Run, 'prompt' | 'execution'> & {
+    execution?: Omit<ExecutionContext, 'skills' | 'tools'>;
+};
+
+export function isCausalMasterWake(run: Pick<Run, 'kind' | 'status' | 'generation' | 'threadId' | 'causedByRunId' | 'error'>): boolean {
     return run.kind === 'master' && run.status === 'failed' && run.generation === 0 && !run.threadId &&
         (Boolean(run.causedByRunId) || run.error?.startsWith('Master wake was not dispatched:') === true);
 }
