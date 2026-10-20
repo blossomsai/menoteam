@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyReply } from 'fastify';
 
 const assetPattern = /\.(js|css|svg|png|woff2)$/u;
 
@@ -47,7 +47,16 @@ function mimeType(path: string): string {
 }
 
 function matchesEtag(header: string | undefined, etag: string): boolean {
-    return header?.split(',').some(value => value.trim() === '*' || value.trim().replace(/^W\//u, '') === etag) ?? false;
+    // GET validators cover the same resource across identity, gzip, and Brotli representations.
+    const opaque = (value: string) => value.trim().replace(/^W\//u, '');
+    return header?.split(',').some(value => value.trim() === '*' || opaque(value) === opaque(etag)) ?? false;
+}
+
+function addAcceptEncodingVary(reply: FastifyReply): void {
+    const current = reply.getHeader('vary');
+    const values = (Array.isArray(current) ? current.join(',') : String(current ?? '')).split(',').map(value => value.trim()).filter(Boolean);
+    if (!values.some(value => value === '*' || value.toLowerCase() === 'accept-encoding')) values.push('Accept-Encoding');
+    reply.header('Vary', values.join(', '));
 }
 
 export async function registerWorkbenchAssets(app: FastifyInstance, root: string): Promise<void> {
@@ -58,7 +67,8 @@ export async function registerWorkbenchAssets(app: FastifyInstance, root: string
     app.get('/workbench/', async (req, reply) => {
         const html = await readFile(resolve(webRoot, 'index.html'));
         const htmlEtag = `"${createHash('sha256').update(html).digest('hex')}"`;
-        reply.header('Cache-Control', 'no-cache').header('ETag', htmlEtag);
+        reply.header('Cache-Control', 'no-cache').header('ETag', `W/${htmlEtag}`);
+        addAcceptEncodingVary(reply);
         if (matchesEtag(req.headers['if-none-match'], htmlEtag)) return reply.code(304).send();
         return reply.type('text/html').send(html);
     });
@@ -79,7 +89,12 @@ export async function registerWorkbenchAssets(app: FastifyInstance, root: string
             catch { return reply.code(404).send(); }
         }
         reply.header('Cache-Control', hashed ? 'public, max-age=31536000, immutable' : 'no-cache');
-        if (hashed) reply.header('ETag', `"${createHash('sha256').update(body).digest('hex')}"`);
+        addAcceptEncodingVary(reply);
+        if (hashed) {
+            const etag = `W/"${createHash('sha256').update(body).digest('hex')}"`;
+            reply.header('ETag', etag);
+            if (matchesEtag(req.headers['if-none-match'], etag)) return reply.code(304).send();
+        }
         return reply.type(mimeType(path)).send(body);
     });
 }
