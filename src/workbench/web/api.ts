@@ -1,11 +1,11 @@
-import type { Artifact, Member, Message, Project, Run, RuntimeProvider, Setting, Work } from '../types';
+import type { Artifact, Member, Message, Project, Run, SnapshotRun, RuntimeProvider, Setting, Work } from '../types';
 
 export interface Snapshot {
   member: Member;
   projects: Project[];
   works: Work[];
   messages: Message[];
-  runs: Run[];
+  runs: SnapshotRun[];
   artifacts: Artifact[];
   settings: Setting[];
   runtimeProviders: RuntimeProvider[];
