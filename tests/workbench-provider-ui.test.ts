@@ -5,7 +5,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { Blob as NodeBlob } from 'node:buffer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../src/workbench/web/App';
-import { ApiError, canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { ApiError, canAutoPoll, resetRateLimitCooldown, workbenchApi, type Snapshot, type WorkEvidence } from '../src/workbench/web/api';
 
 const owner = { id: 'owner', email: 'owner@example.test', name: 'Owner', role: 'owner' as const };
 const admin = { ...owner, id: 'admin', email: 'admin@example.test', role: 'admin' as const };
@@ -16,6 +16,14 @@ const providerSetting = { id: 'provider-1', kind: 'provider' as const, name: 'Te
 const profileSetting = { id: 'profile-1', kind: 'profile' as const, name: 'Builder', data: { model: 'gpt-6.1-sol', reasoning: 'medium', skillIds: [] }, updatedAt: '2026-10-06T10:00:00.000Z' };
 function snapshot(currentMember = owner, settings = [] as Snapshot['settings'], runtimes = [runtime]): Snapshot {
   return { member: currentMember, projects: [project], works: [], messages: [], runs: [], artifacts: [], settings, runtimeProviders: runtimes, providerConnections: settings.filter(item => item.kind === 'provider').map(item => ({ id: item.id, name: item.name, connectorId: String(item.data.connectorId ?? ''), enabled: item.data.enabled !== false, default: item.data.default === true, status: item.data.enabled === false ? 'disabled' : 'available', models: runtime.models, projectIds: ['project'], localWorktrees: true })) };
+}
+const scopedEvidenceSnapshots=new Map<string,Snapshot>();
+function rememberScopedEvidence(snapshot:Snapshot){for(const work of snapshot.works)scopedEvidenceSnapshots.set(work.id,snapshot);}
+function scopedWorkFixture(workId:string):WorkEvidence|null{
+  const source=scopedEvidenceSnapshots.get(workId);const work=source?.works.find(item=>item.id===workId);if(!source||!work)return null;
+  const runs=source.runs.filter(item=>item.workId===workId).map(run=>{const{prompt:_prompt,...summary}=run;if(!summary.execution)return summary;const{skills:_skills,tools:_tools,...execution}=summary.execution;return{...summary,execution};});
+  const artifacts=source.artifacts.filter(item=>item.workId===workId).map(artifact=>{if(artifact.kind!=='diff'||!artifact.data||typeof artifact.data!=='object'||Array.isArray(artifact.data))return artifact;const{patch:_patch,...data}=artifact.data as Record<string,unknown>;if(Array.isArray(data.files))data.files=data.files.map(file=>{if(!file||typeof file!=='object'||Array.isArray(file))return file;const{hunks:_hunks,...metadata}=file as Record<string,unknown>;return metadata;});return{...artifact,data};});
+  return{work,messages:source.messages.filter(item=>item.projectId===work.projectId&&item.workId===workId).slice(-500),runs,artifacts};
 }
 function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) {
   const version = new Date(Date.now() - 60_000).toISOString();
@@ -33,8 +41,20 @@ function localQaFixture(projectId: string, fingerprint: string, checkCount = 2) 
 
 let root: Root;
 let host: HTMLDivElement;
+let defaultUiFetch:typeof fetch;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
 async function mount(current: Snapshot, strictMode = false, projectMessagesImplementation?: typeof workbenchApi.projectMessages) {
+  rememberScopedEvidence(current);
+  const previousFetch=globalThis.fetch;
+  vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{
+    const request=input instanceof Request?input:null;
+    const method=(init?.method??request?.method??'GET').toUpperCase();
+    const pathname=new URL(String(input),window.location.href).pathname;
+    const match=method==='GET'?pathname.match(/^\/api\/workbench\/works\/([^/]+)$/u):null;
+    if(match){const value=scopedWorkFixture(decodeURIComponent(match[1]!));return value?Response.json(value):new Response(JSON.stringify({message:'Work missing'}),{status:404,headers:{'content-type':'application/json'}});}
+    if(previousFetch===defaultUiFetch&&method==='GET'){const artifactMatch=pathname.match(/^\/api\/workbench\/artifacts\/([^/]+)$/u);if(artifactMatch){const id=decodeURIComponent(artifactMatch[1]!);const artifact=[...scopedEvidenceSnapshots.values()].map(source=>source.artifacts.find(item=>item.id===id)).find(Boolean);return artifact?Response.json(artifact):new Response(JSON.stringify({message:'Artifact missing'}),{status:404,headers:{'content-type':'application/json'}});}}
+    return previousFetch(input,init);
+  }));
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(current.member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(current);
   vi.spyOn(workbenchApi, 'projectMessages').mockImplementation(projectMessagesImplementation ?? (async () => ({ messages: [], nextBefore: null })));
@@ -181,7 +201,8 @@ describe('mounted message history recovery', () => {
 
 beforeEach(() => {
   resetRateLimitCooldown();
-  vi.useFakeTimers(); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('Unexpected live fetch in mounted UI test'))));
+  scopedEvidenceSnapshots.clear();
+  vi.useFakeTimers(); vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('Unexpected live fetch in mounted UI test'))));defaultUiFetch=globalThis.fetch;
   sessionStorage.clear();
   window.history.replaceState(null, '', '/workbench/?view=model-providers');
   host = document.createElement('div'); document.body.append(host); root = createRoot(host);
@@ -977,7 +998,7 @@ describe('mounted provider connection settings', () => {
     const firstReceipt={id:'receipt-pr',projectId:project.id,workId:work.id,runId:delivery.id,kind:'delivery' as const,revision:'receipt-revision-pr',createdAt:'2026-10-06T10:00:00.000Z',data:{action:'create_draft_pr',phase:'pr_created',pullRequestUrl:'https://github.com/blossomsai/menoteam/pull/42',commitSha:'candidate-sha'}};
     const secondReceipt={...firstReceipt,id:'receipt-merge',revision:'receipt-revision-merge',createdAt:'2026-10-06T11:00:00.000Z',data:{action:'merge_pr',phase:'merge_intent',commitSha:'candidate-sha',operationId:'merge-operation-exact'}};
     const current=snapshot();current.works=[work];current.runs=[candidate,delivery];current.artifacts=[diff,firstReceipt,secondReceipt];
-    vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id==='receipt-pr'?firstReceipt as never:secondReceipt as never);
+    vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id===diff.id?diff as never:id==='receipt-pr'?firstReceipt as never:secondReceipt as never);
     await mount(current);await flush();
     const changes=[...host.querySelectorAll('section')].find(section=>section.querySelector('h2')?.textContent==='Changes')!;
     expect(changes.textContent).toContain('Showing 2 of 2 changed files');expect(changes.textContent).toContain('+5');expect(changes.textContent).toContain('−2');
@@ -1004,6 +1025,7 @@ describe('mounted provider connection settings', () => {
     const message=[...host.querySelectorAll('article')].find(item=>item.textContent?.includes('Stable message node'))!;
     const next=freshClone(current);next.runs=[{id:'implementation-update',projectId:project.id,workId:work.id,kind:'implementation',prompt:'',model:'gpt-6-luna',reasoning:'medium',status:'completed',generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06'},{id:'delivery-update',projectId:project.id,workId:work.id,targetRunId:'implementation-update',kind:'delivery',prompt:'',model:'internal',reasoning:'none',status:'failed',generation:1,createdAt:'2026-10-06',updatedAt:'2026-10-06',operation:{action:'create_draft_pr',actorId:owner.id,candidateRunId:'implementation-update',candidateRevision:'revision',artifactRevision:'revision',commitSha:'sha',candidateFingerprint:'fingerprint',repositoryUrl:'',baseRevision:'base',baseBranch:'main',remoteBranch:'branch',workTitle:work.title,changeSummary:'',qaStatus:'unknown',phase:'published'}}];
     next.artifacts=[{id:'change-update',projectId:project.id,workId:work.id,runId:'implementation-update',kind:'diff',revision:'revision',createdAt:'2026-10-06',data:{baseRevision:'base',candidateRevision:'revision',files:[],totalFiles:0,truncated:false}}];
+    rememberScopedEvidence(next);
     vi.mocked(workbenchApi.snapshot).mockResolvedValue(next);
     window.history.replaceState(null,'',`/workbench/?view=work-detail&project=${project.id}&work=${work.id}&tab=changes`);
     await flush(()=>root.render(createElement(App)));
@@ -1617,7 +1639,7 @@ describe('overview typed-review polling identity',()=>{
     const pending=deferred<Awaited<ReturnType<typeof workbenchApi.artifact>>>();
     const evidence=vi.spyOn(workbenchApi,'artifact').mockImplementation(async id=>id==='review-qa'?first.qa as never:pending.promise);
     await mount(first.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);expect(reviewButton()).not.toBeNull();
-    current=second.snapshot;const snapshotRequest=vi.mocked(workbenchApi.snapshot);snapshotRequest.mockImplementation(async()=>freshClone(current));
+    current=second.snapshot;rememberScopedEvidence(current);const snapshotRequest=vi.mocked(workbenchApi.snapshot);snapshotRequest.mockImplementation(async()=>freshClone(current));
     await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(evidence.mock.calls[1]?.[0]).toBe('review-qa-new');expect(reviewButton()).toBeNull();
     pending.resolve(second.qa as never);await flush();expect(reviewButton()).not.toBeNull();
   });
@@ -1627,7 +1649,7 @@ describe('overview typed-review polling identity',()=>{
     const evidence=vi.spyOn(workbenchApi,'artifact').mockImplementation(()=>evidence.mock.calls.length===1?oldResult.promise:newResult.promise);
     await mount(fixture.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);
     const changedSession=freshClone(fixture.snapshot);changedSession.member=member;let current=changedSession;
-    vi.mocked(workbenchApi.snapshot).mockImplementation(async()=>freshClone(current));
+    rememberScopedEvidence(current);vi.mocked(workbenchApi.snapshot).mockImplementation(async()=>freshClone(current));
     await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(reviewButton()).toBeNull();
     oldResult.resolve(fixture.qa as never);await flush();expect(reviewButton()).toBeNull();
     newResult.resolve(fixture.qa as never);await flush();expect(reviewButton()).not.toBeNull();
@@ -1639,7 +1661,7 @@ describe('overview typed-review polling identity',()=>{
     const evidence=vi.spyOn(workbenchApi,'artifact').mockImplementation(id=>id==='review-qa'?oldResult.promise:newResult.promise);
     await mount(first.snapshot);await flush();expect(evidence).toHaveBeenCalledTimes(1);
     const next=freshClone(first.snapshot);next.works=[first.work,second.work];next.runs=[...next.runs,...second.snapshot.runs];next.artifacts=[...next.artifacts,...second.snapshot.artifacts];
-    vi.mocked(workbenchApi.snapshot).mockImplementation(async()=>freshClone(next));
+    rememberScopedEvidence(next);vi.mocked(workbenchApi.snapshot).mockImplementation(async()=>freshClone(next));
     window.history.replaceState(null,'',`/workbench/?view=work-detail&project=project&work=work-2`);
     await advanceSnapshotPoll();expect(evidence).toHaveBeenCalledTimes(2);expect(evidence.mock.calls[1]?.[0]).toBe('review-qa-work-2');expect(reviewButton()).toBeNull();
     oldResult.resolve(first.qa as never);await flush();expect(reviewButton()).toBeNull();

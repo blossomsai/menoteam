@@ -883,8 +883,17 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         return {
             work: w,
             messages: (await store.list<Message>("message", w!.projectId)).filter(m => m.workId === w!.id).slice(-500),
-            runs: (await store.list<Run>("run", w!.projectId)).filter(r => r.workId === w!.id),
-            artifacts: (await store.artifactMetadata([w!.projectId],sql,w!.id)).filter(a => a.workId === w!.id)
+            runs: (await store.list<Run>("run", w!.projectId)).filter(r => r.workId === w!.id).map(snapshotRun),
+            artifacts: (await store.artifactMetadata([w!.projectId],sql,w!.id)).filter(a => a.workId === w!.id).map(artifact => {
+                if (artifact.kind !== 'diff' || !artifact.data || typeof artifact.data !== 'object' || Array.isArray(artifact.data)) return artifact;
+                const { patch: _patch, ...data } = artifact.data as Record<string, unknown>;
+                if (Array.isArray(data.files)) data.files = data.files.map(file => {
+                    if (!file || typeof file !== 'object' || Array.isArray(file)) return file;
+                    const { hunks: _hunks, ...manifest } = file as Record<string, unknown>;
+                    return manifest;
+                });
+                return { ...artifact, data };
+            })
         };
     });
     async function updateWork(wid: string, input: unknown, projectId: string, tx = sql) {

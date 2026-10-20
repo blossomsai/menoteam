@@ -3,7 +3,7 @@ import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import App from '../src/workbench/web/App';
-import { ApiError, workbenchApi, type Snapshot } from '../src/workbench/web/api';
+import { ApiError, workbenchApi, type Snapshot, type WorkEvidence } from '../src/workbench/web/api';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -14,6 +14,23 @@ function deferred<T>() {
 const member = { id: 'owner', email: 'owner@example.test', name: 'Owner', role: 'owner' as const };
 function snapshot(instructions: string, name = 'Project'): Snapshot {
   return { member, projects: [{ id: 'project', name, instructions, repositoryUrl: '', deliveryAuthorization: '', createdAt: '2026-10-06' }], works: [], messages: [], runs: [], artifacts: [], settings: [], runtimeProviders: [] };
+}
+function scopedWorkFixture(source: Snapshot, workId: string): WorkEvidence | null {
+  const work=source.works.find(item=>item.id===workId);
+  if(!work)return null;
+  const runs=source.runs.filter(item=>item.workId===workId).map(run=>{
+    const {prompt:_prompt,...summary}=run;
+    if(!summary.execution)return summary;
+    const {skills:_skills,tools:_tools,...execution}=summary.execution;
+    return {...summary,execution};
+  });
+  const artifacts=source.artifacts.filter(item=>item.workId===workId).map(artifact=>{
+    if(artifact.kind!=='diff'||!artifact.data||typeof artifact.data!=='object'||Array.isArray(artifact.data))return artifact;
+    const {patch:_patch,...data}=artifact.data as Record<string,unknown>;
+    if(Array.isArray(data.files))data.files=data.files.map(file=>{if(!file||typeof file!=='object'||Array.isArray(file))return file;const {hunks:_hunks,...metadata}=file as Record<string,unknown>;return metadata;});
+    return {...artifact,data};
+  });
+  return {work,messages:source.messages.filter(item=>item.projectId===work.projectId&&item.workId===workId).slice(-500),runs,artifacts};
 }
 function healthyStagingRun(id = 'stage-run', workId = 'work'): Snapshot['runs'][number] {
   return { id, projectId: 'project', workId, prompt: '', requestedBy: 'owner', kind: 'delivery', model: 'internal', reasoning: 'none', status: 'completed', generation: 1, createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z', operation: { action: 'deploy_staging', actorId: 'owner', candidateRunId: 'candidate', candidateRevision: 'revision', artifactRevision: 'revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/org/repo', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/test', workTitle: 'Review delivery', changeSummary: 'staging change', qaStatus: 'current', phase: 'health_passed', targetId: 'stage-safe', imageDigest: `sha256:${'d'.repeat(64)}`, stagingReceipt: { operationId: id, targetId: 'stage-safe', phase: 'health_passed', deploymentId: 'deploy-2', commitSha: 'a'.repeat(40), imageDigest: `sha256:${'d'.repeat(64)}`, activeCommitSha: 'a'.repeat(40), activeImageDigest: `sha256:${'d'.repeat(64)}`, previousDeploymentId: 'deploy-1', previousImageDigest: `sha256:${'e'.repeat(64)}`, checkedAt: '2026-10-07T00:00:00.000Z' } } } as Snapshot['runs'][number];
@@ -36,6 +53,8 @@ let root: Root;
 let host: HTMLDivElement;
 let responses: Array<Promise<Snapshot>>;
 let snapshotSpy: MockInstance<typeof workbenchApi.snapshot>;
+let evidenceSnapshot: Snapshot;
+let snapshotRequestId=0,latestSnapshotRequestId=0;
 async function flush(action: () => void = () => undefined) { await act(async () => { action(); }); }
 function button(text: string) {
   const found = [...host.querySelectorAll('button')].find(item => item.textContent?.trim() === text);
@@ -53,7 +72,18 @@ async function type(value: string, selector = 'textarea') {
 }
 function draft() { return host.querySelector('textarea')?.value; }
 async function poll() { await flush(() => vi.advanceTimersByTime(2_000)); }
-async function mount() { await flush(() => root.render(createElement(App))); }
+async function mount() {
+  const previousFetch=globalThis.fetch;
+  vi.stubGlobal('fetch',vi.fn(async(input:RequestInfo|URL,init?:RequestInit)=>{
+    const request=input instanceof Request?input:null;
+    const method=(init?.method??request?.method??'GET').toUpperCase();
+    const pathname=new URL(String(input),window.location.href).pathname;
+    const match=method==='GET'?pathname.match(/^\/api\/workbench\/works\/([^/]+)$/u):null;
+    if(match){const value=scopedWorkFixture(evidenceSnapshot,decodeURIComponent(match[1]!));return value?Response.json(value):new Response(JSON.stringify({message:'Work missing'}),{status:404,headers:{'content-type':'application/json'}});}
+    return previousFetch(input,init);
+  }));
+  await flush(() => root.render(createElement(App)));
+}
 async function logout() {
   const control = host.querySelector<HTMLButtonElement>('aside > button')!;
   await flush(() => control.click());
@@ -521,10 +551,12 @@ beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   window.history.replaceState(null, '', '/workbench/?view=instructions&project=project');
   responses = [Promise.resolve(snapshot('A'))];
+  evidenceSnapshot=snapshot('A');snapshotRequestId=0;latestSnapshotRequestId=0;
   snapshotSpy = vi.spyOn(workbenchApi, 'snapshot').mockImplementation(() => {
     const response = responses.shift();
     if (!response) throw new Error('Unexpected snapshot request');
-    return response;
+    const requestId=++snapshotRequestId;
+    return response.then(value=>{if(requestId>=latestSnapshotRequestId){latestSnapshotRequestId=requestId;evidenceSnapshot=value;}return value;});
   });
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(member);
   vi.spyOn(workbenchApi, 'login').mockResolvedValue({ authenticated: true });
