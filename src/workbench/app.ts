@@ -3,6 +3,7 @@ import { freezeRunSkills } from './run-skills.js';
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
 import Fastify, { type FastifyRequest, type FastifyInstance } from "fastify";
+import compress from "@fastify/compress";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { rateLimitKey } from "./rate-limit.js";
@@ -102,6 +103,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         routerOptions: { maxParamLength: 320 },
         bodyLimit: 1048576
     });
+    await app.register(compress, { globalDecompression: false, encodings: ['br', 'gzip', 'identity'] });
     await app.register(helmet);
     await app.register(rateLimit, {
         max: 180,
