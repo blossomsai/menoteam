@@ -14,6 +14,7 @@ it('negotiates compressed Workbench JSON and static assets without changing thei
   const root = await mkdtemp(join(tmpdir(), 'workbench-http-compress-'));
   const sql = (async () => []) as unknown as Sql;
   const snapshot = { runs: Array.from({ length: 100 }, (_, index) => ({ id: `run-${index}`, text: 'repeated snapshot content '.repeat(30) })) };
+  const eventStreamBody = 'data: unchanged\n\n'.repeat(80);
   await mkdir(join(root, 'assets'), { recursive: true });
   await mkdir(join(root, '.vite'), { recursive: true });
   await writeFile(join(root, 'index.html'), '<html><body>'.concat('Workbench content '.repeat(100), '</body></html>'));
@@ -31,7 +32,7 @@ it('negotiates compressed Workbench JSON and static assets without changing thei
     const bytes = gzipSync(Buffer.from('already encoded bytes'));
     return reply.type('application/json').header('Content-Encoding', 'gzip').send(bytes);
   });
-  app.get('/api/workbench/compression-events', async (_request, reply) => reply.type('text/event-stream').send('data: unchanged\n\n'));
+  app.get('/api/workbench/compression-events', async (_request, reply) => reply.type('text/event-stream').send(eventStreamBody));
   app.get('/api/workbench/compression-stream', async (_request, reply) => {
     reply.type('text/plain');
     return Readable.from(['first streamed chunk '.repeat(3000), 'second streamed chunk']);
@@ -54,13 +55,25 @@ it('negotiates compressed Workbench JSON and static assets without changing thei
       expect(compressed.rawPayload.length).toBeLessThan(decoded.length);
       expect(JSON.parse(decoded.toString('utf8'))).toEqual(snapshot);
     }
-    const weighted = await app.inject({ url: '/api/workbench/compression-fixture', headers: { 'accept-encoding': 'gzip;q=0.4, br;q=0.8' } });
-    expect(weighted.headers['content-encoding']).toBe('br');
-    expect(JSON.parse(brotliDecompressSync(weighted.rawPayload).toString('utf8'))).toEqual(snapshot);
+    const gzipPreferred = await app.inject({ url: '/api/workbench/compression-fixture', headers: { 'accept-encoding': 'gzip;q=0.8, br;q=0.4, identity;q=0.1' } });
+    expect(gzipPreferred.headers['content-encoding']).toBe('gzip');
+    expect(JSON.parse(gunzipSync(gzipPreferred.rawPayload).toString('utf8'))).toEqual(snapshot);
+    const brPreferred = await app.inject({ url: '/api/workbench/compression-fixture', headers: { 'accept-encoding': 'gzip;q=0.4, br;q=0.8, identity;q=0.1' } });
+    expect(brPreferred.headers['content-encoding']).toBe('br');
+    expect(JSON.parse(brotliDecompressSync(brPreferred.rawPayload).toString('utf8'))).toEqual(snapshot);
+
+    for (const encoding of ['gzip;q=0.4, identity;q=1', 'br;q=0.4, identity;q=1']) {
+      const response = await app.inject({ url: '/api/workbench/compression-fixture', headers: { 'accept-encoding': encoding } });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-encoding']).toBeUndefined();
+      expect(response.rawPayload.equals(identity.rawPayload)).toBe(true);
+      expect(response.json()).toEqual(snapshot);
+    }
 
     for (const headers of [
       { 'accept-encoding': 'gzip;q=0, br;q=0, identity;q=1' },
       { 'accept-encoding': 'gzip;q=0, br;q=0' },
+      { 'accept-encoding': 'zstd' },
       {}
     ]) {
       const response = await app.inject({ url: '/api/workbench/compression-fixture', headers });
@@ -89,9 +102,10 @@ it('negotiates compressed Workbench JSON and static assets without changing thei
     const preencoded = await app.inject({ url: '/api/workbench/compression-preencoded', headers: { 'accept-encoding': 'gzip' } });
     expect(preencoded.headers['content-encoding']).toBe('gzip');
     expect(preencoded.rawPayload.equals(preencodedBytes)).toBe(true);
-    const eventStream = await app.inject({ url: '/api/workbench/compression-events', headers: { 'accept-encoding': 'gzip' } });
+    const eventStream = await app.inject({ url: '/api/workbench/compression-events', headers: { 'accept-encoding': 'gzip, br' } });
+    expect(eventStream.rawPayload.length).toBeGreaterThan(1024);
     expect(eventStream.headers['content-encoding']).toBeUndefined();
-    expect(eventStream.body).toBe('data: unchanged\n\n');
+    expect(eventStream.rawPayload.equals(Buffer.from(eventStreamBody))).toBe(true);
     const streamed = await app.inject({ url: '/api/workbench/compression-stream', headers: { 'accept-encoding': 'gzip' } });
     expect(streamed.headers['content-encoding']).toBe('gzip');
     expect(gunzipSync(streamed.rawPayload).toString('utf8')).toBe('first streamed chunk '.repeat(3000) + 'second streamed chunk');

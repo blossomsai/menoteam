@@ -103,7 +103,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         routerOptions: { maxParamLength: 320 },
         bodyLimit: 1048576
     });
-    await app.register(compress, { globalDecompression: false, encodings: ['br', 'gzip'] });
+    await app.register(compress, { globalDecompression: false, encodings: ['br', 'gzip', 'identity'] });
     await app.register(helmet);
     await app.register(rateLimit, {
         max: 180,
