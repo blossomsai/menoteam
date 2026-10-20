@@ -28,6 +28,7 @@ beforeEach(() => {
   current = { member, projects: [project], works: [work], messages: [message], runs: [], artifacts: [], settings: [], runtimeProviders: [], providerConnections: [] };
   vi.spyOn(workbenchApi, 'me').mockResolvedValue(member);
   vi.spyOn(workbenchApi, 'snapshot').mockResolvedValue(current);
+  vi.spyOn(workbenchApi, 'workEvidence').mockImplementation(async id=>({work:current.works.find(item=>item.id===id)!,messages:current.messages.filter(item=>item.workId===id),runs:current.runs.filter(item=>item.workId===id),artifacts:current.artifacts.filter(item=>item.workId===id)}));
   vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [message], nextBefore: null });
 });
 
@@ -174,7 +175,8 @@ it('shows latest implementation/handoff model separately from later review and f
   const value = (label: string) => [...selection().querySelectorAll('dt')].find(dt => dt.textContent === label)?.nextElementSibling?.textContent;
   expect(value('Model')).toBe('gpt-6-luna');
   const handoff = { ...implementation, id: 'handoff', model: 'gpt-6.1-sol', handoffFromRunId: 'impl', execution: { ...implementation.execution, model: 'gpt-6.1-sol' }, createdAt: '2026-01-02' };
-  vi.mocked(workbenchApi.snapshot).mockResolvedValue({ ...current, runs: [implementation, handoff, review] });
+  current={...current,runs:[implementation,handoff,review]};
+  vi.mocked(workbenchApi.snapshot).mockResolvedValue(current);
   await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
   expect(value('Effective model')).toBe('gpt-6.1-sol');
   expect(value('Profile model')).toBe('gpt-6-luna · unchanged');
