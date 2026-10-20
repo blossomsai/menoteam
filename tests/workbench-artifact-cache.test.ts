@@ -31,7 +31,10 @@ function fixture(workId = 'work') {
 let host: HTMLDivElement, root: Root, current: Snapshot, bodies: Map<string, Artifact>;
 let requests: Array<{ id: string; signal?: AbortSignal | null }>;
 let respond: (id: string, count: number) => Response | Promise<Response>;
+let evidenceRequests: Array<{ id: string; signal?: AbortSignal | null }>;
+let respondEvidence: (id: string, count: number) => Response | Promise<Response>;
 const count = (id: string) => requests.filter(request => request.id === id).length;
+const evidenceCount = (id: string) => evidenceRequests.filter(request => request.id === id).length;
 async function flush(action: () => void = () => {}) { await act(async () => { action(); }); }
 async function tab(name: string) { await flush(() => host.querySelector<HTMLAnchorElement>(`[aria-label="Work details"] a[href$="tab=${name}"]`)!.click()); }
 async function tick() { await act(async () => { await vi.advanceTimersByTimeAsync(2000); }); }
@@ -54,8 +57,20 @@ beforeEach(() => {
     return { work, messages:current.messages.filter(item=>item.workId===id), runs:current.runs.filter(item=>item.workId===id), artifacts:current.artifacts.filter(item=>item.workId===id) };
   });
   vi.spyOn(workbenchApi, 'projectMessages').mockResolvedValue({ messages: [], nextBefore: null });
+  evidenceRequests = [];
+  respondEvidence = id => {
+    const work = current.works.find(item => item.id === id);
+    return work ? Response.json({ work, messages: current.messages.filter(item => item.workId === id && item.projectId === work.projectId), runs: current.runs.filter(item => item.workId === id), artifacts: current.artifacts.filter(item => item.workId === id) }) : new Response('{}', { status: 404 });
+  };
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
+    const workMatch = path.match(/^\/api\/workbench\/works\/([^/?]+)$/u);
+    if (workMatch) {
+      if ((init?.method ?? 'GET').toUpperCase() !== 'GET') throw new Error(`Unexpected work evidence method: ${init?.method}`);
+      const id = decodeURIComponent(workMatch[1]!);
+      evidenceRequests.push({ id, signal: init?.signal });
+      return respondEvidence(id, evidenceCount(id));
+    }
     if (!path.startsWith('/api/workbench/artifacts/')) throw new Error(`Unexpected fetch: ${path}`);
     const id = decodeURIComponent(path.split('/artifacts/')[1]!);
     requests.push({ id, signal: init?.signal });
@@ -274,6 +289,68 @@ it('shows scoped metadata failure explicitly and retries instead of rendering fa
   await flush(()=>[...host.querySelectorAll('button')].find(button=>button.textContent==='Retry')!.click());
   expect(host.textContent).toContain('Recorded file changes from this Work.');
   expect(workbenchApi.workEvidence).toHaveBeenCalledTimes(2);
+});
+
+it.each(['Work', 'project', 'member'] as const)('aborts old %s metadata so a late real-API 429 cannot pause the new scope', async scope => {
+  const f = fixture(), other = fixture('next-work'), nextProject = { ...project, id: 'next-project', name: 'Next project' };
+  const otherWork = scope === 'project' ? { ...other.work, projectId: nextProject.id } : other.work;
+  const otherRuns = other.snapshot.runs.map(run => scope === 'project' ? { ...run, projectId: nextProject.id } : run);
+  const otherArtifacts = other.snapshot.artifacts.map(artifact => scope === 'project' ? { ...artifact, projectId: nextProject.id } : artifact);
+  current = { ...f.snapshot, projects: scope === 'project' ? [project, nextProject] : [project], works: [f.work, otherWork], runs: [...f.snapshot.runs, ...otherRuns], artifacts: [...f.snapshot.artifacts, ...otherArtifacts] };
+  const otherBodies = other.bodies.map(body => scope === 'project' ? { ...body, projectId: nextProject.id } : body);
+  bodies = new Map([...f.bodies, ...otherBodies].map(body => [body.id, body]));
+  let finishOld!: (response: Response) => void;
+  respondEvidence = (id, attempt) => id === f.work.id && attempt === 1
+    ? new Promise<Response>(resolve => { finishOld = resolve; })
+    : (() => { const work = current.works.find(item => item.id === id)!; return Response.json({ work, messages: current.messages.filter(item => item.workId === id && item.projectId === work.projectId), runs: current.runs.filter(item => item.workId === id), artifacts: current.artifacts.filter(item => item.workId === id) }); })();
+  vi.mocked(workbenchApi.workEvidence).mockRestore();
+  window.history.replaceState(null, '', `/workbench/?view=work-detail&project=project&work=${f.work.id}&tab=qa`);
+  await flush(() => root.render(createElement(App)));
+  const oldRequest = evidenceRequests.find(request => request.id === f.work.id)!;
+  expect(oldRequest.signal?.aborted).toBe(false);
+
+  if (scope === 'member') {
+    current = { ...current, member: { ...member, id: 'next-member' } };
+    await tick();
+  } else {
+    await flush(() => navigate(`/workbench/?view=work-detail&project=${scope === 'project' ? nextProject.id : project.id}&work=${otherWork.id}&tab=qa`));
+  }
+  expect(oldRequest.signal?.aborted).toBe(true);
+  expect(host.querySelector('h1')?.textContent).toBe(scope === 'member' ? f.work.title : otherWork.title);
+  expect(typedStatus()).toContain('Current evidence');
+
+  await flush(() => finishOld(new Response('{}', { status: 429, headers: { 'Retry-After': '120' } })));
+  expect(canAutoPoll()).toBe(true);
+  expect(host.querySelector('h1')?.textContent).toBe(scope === 'member' ? f.work.title : otherWork.title);
+  expect(typedStatus()).toContain('Current evidence');
+  expect(host.textContent).not.toContain('limited');
+});
+
+it('keeps current-scope metadata 429 cooldown and explicit retry without claiming empty evidence', async () => {
+  const f = fixture(); current = f.snapshot; bodies = new Map(f.bodies.map(body => [body.id, body]));
+  let metadataRequests = 0;
+  respondEvidence = id => {
+    metadataRequests++;
+    if (metadataRequests === 1) return new Response(JSON.stringify({ message: 'Rate limited' }), { status: 429, headers: { 'Retry-After': '120' } });
+    const work = current.works.find(item => item.id === id)!;
+    return Response.json({ work, messages: current.messages.filter(item => item.workId === id), runs: current.runs.filter(item => item.workId === id), artifacts: current.artifacts.filter(item => item.workId === id) });
+  };
+  vi.mocked(workbenchApi.workEvidence).mockRestore();
+  window.history.replaceState(null, '', `/workbench/?view=work-detail&project=project&work=${f.work.id}&tab=changes`);
+  await flush(() => root.render(createElement(App)));
+  expect(evidenceCount(f.work.id)).toBe(1);
+  expect(canAutoPoll()).toBe(false);
+  expect(host.textContent).toContain('Could not load this Work’s evidence.');
+  expect(host.textContent).not.toContain('No change evidence has been recorded yet.');
+  const retryButton = [...host.querySelectorAll('button')].find(button => button.textContent === 'Retry')!;
+  expect(retryButton).toBeDefined();
+
+  await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+  expect(canAutoPoll()).toBe(true);
+  await flush(() => retryButton.click());
+  expect(evidenceCount(f.work.id)).toBe(2);
+  expect(host.textContent).toContain('Recorded file changes from this Work.');
+  expect(host.textContent).not.toContain('Could not load this Work’s evidence.');
 });
 
 it('keeps the Work evidence state visibly loading until scoped metadata resolves', async () => {

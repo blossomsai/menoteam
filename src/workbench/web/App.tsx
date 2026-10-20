@@ -529,13 +529,14 @@ function WorkDetail({ work, project, snapshot, refresh, setError }: { work: Work
   const overviewEditor = useWorkOverviewEditor(work, refreshEvidence);
   useEffect(()=>{
     let active=true;
+    const controller=new AbortController();
     setEvidence(current=>({...current,status:'loading'}));
-    void workbenchApi.workEvidence(work.id).then(result=>{
+    void workbenchApi.workEvidence(work.id,controller.signal).then(result=>{
       if(!active)return;
       if(result.work.id!==work.id||result.work.projectId!==project.id||result.runs.some(item=>item.workId!==work.id)||result.artifacts.some(item=>item.workId!==work.id))throw new Error('Work evidence response does not match this Work');
       setEvidence({status:'ready',data:result,authoritative:true});
     }).catch(()=>{if(active)setEvidence(current=>({...current,status:'error'}));});
-    return()=>{active=false;};
+    return()=>{active=false;controller.abort();};
   },[evidenceSignature,evidenceRetry,work.id,project.id]);
   const canManageStaging=snapshot.member.role==='owner'||snapshot.member.role==='admin'&&['owner','admin'].includes(snapshot.projectRoles?.[project.id]??'');
   return <div data-testid="work-detail-layout" className="grid min-h-[calc(100dvh-8.5rem)] min-w-0 gap-5 xl:h-[calc(100dvh-8.5rem)] xl:min-h-0 xl:grid-cols-[minmax(0,1.08fr)_minmax(0,0.92fr)] xl:gap-6">
