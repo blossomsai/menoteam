@@ -14,7 +14,7 @@ import { migrate } from "../src/db/migrate.js";
 import { createWorkbenchApp } from "../src/workbench/app.js";
 import { WorkbenchStore } from "../src/workbench/store.js";
 import { WorkbenchConnectorClient } from "../src/connector/client.js";
-import type { Artifact, Project, Run, Setting, Work } from "../src/workbench/types.js";
+import type { Artifact, Project, Run, SnapshotRun, Setting, Work } from "../src/workbench/types.js";
 import { enqueueSlackReply, processSlackReplies, type SlackTransport } from '../src/workbench/slack-replies.js';
 const url = process.env.WORK_MAP_TEST_DATABASE_URL;
 
@@ -437,13 +437,31 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(acceptedArtifact.statusCode).toBe(200);
         const stoppedAt='2026-10-14T02:00:00.000Z';
         await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(data,'{status}','"interrupted"'),'{stoppedAt}',${sql.json(stoppedAt)}) WHERE id=${first.id}`;
-        const initialRun=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===first.id)!;
+        const canonicalRun=async(runId:string):Promise<Run>=>{
+            const rows=await sql`SELECT data FROM wb_records WHERE kind='run' AND id=${runId}`;
+            expect(rows).toHaveLength(1);
+            return rows[0]!.data as Run;
+        };
+        // Independent endpoint contract: remove only the three designated Run fields.
+        const projectedRun=({prompt:_prompt,execution,...run}:Run):SnapshotRun=>{
+            if(!execution)return run;
+            const {skills:_skills,tools:_tools,...summary}=execution;
+            return {...run,execution:summary};
+        };
+        const initialCanonical=await canonicalRun(first.id);
+        expect(initialCanonical).toHaveProperty('prompt');
+        expect(initialCanonical.execution).toHaveProperty('skills');expect(initialCanonical.execution).toHaveProperty('tools');
+        expect(initialCanonical.prompt).toBe(first.prompt);expect(initialCanonical.execution).toEqual(first.execution);
+        const initialRun=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===first.id)!;
+        expect(initialRun).toEqual(projectedRun(initialCanonical));
+        expect(initialRun).not.toHaveProperty('prompt');
+        expect(initialRun.execution).not.toHaveProperty('skills');expect(initialRun.execution).not.toHaveProperty('tools');
         const actorId=(await actorRequest('GET','/me')).json().id as string;
         expect(initialRun.requestedBy).toBe(actorId);
         expect(initialRun.id).toBeTruthy();expect(initialRun.projectId).toBe(p.id);expect(initialRun.workId).toBe(work.id);
         expect(initialRun.model).toBeTruthy();expect(initialRun.generation).toBeGreaterThan(0);expect(initialRun.connectorId).toBe(enrolled.id);
         expect(initialRun.threadId).toBe('actual-cancel-thread');expect(initialRun.execution).toBeDefined();expect(initialRun.stoppedAt).toBe(stoppedAt);
-        const withoutMutableRunFields=({status:_status,updatedAt:_updatedAt,...run}:Run)=>run;
+        const withoutMutableRunFields=({status:_status,updatedAt:_updatedAt,...run}:Run|SnapshotRun)=>run;
         const eventRowsBefore=await sql`SELECT data FROM wb_records WHERE kind='event' AND project_id=${p.id} AND data->>'runId'=${first.id} ORDER BY (data->>'sequence')::int`;
         const artifactRowsBefore=await sql`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${p.id} AND data->>'runId'=${first.id} ORDER BY id`;
         const evidenceHash=(rows:unknown[])=>createHash('sha256').update(JSON.stringify(rows)).digest('hex');
@@ -452,14 +470,24 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect((await user('DELETE',`/projects/${p.id}/members/${actorId}`)).statusCode).toBe(200);
         const remainingMembers=checkedJson(await user('GET',`/projects/${p.id}/members`)).members as Array<{id:string}>;
         expect(remainingMembers.some(item=>item.id===actorId)).toBe(false);
-        const revokedRun=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===first.id)!;
+        const revokedRun=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===first.id)!;
+        expect(await canonicalRun(first.id)).toEqual(initialCanonical);expect(revokedRun).toEqual(projectedRun(initialCanonical));
         expect(revokedRun.requestedBy).toBe(actorId);
-        expect((await user('POST',`/runs/${first.id}/cancel`,{})).statusCode).toBe(200);
-        const after=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===first.id)!;
+        const cancelled=checkedJson(await user('POST',`/runs/${first.id}/cancel`,{})) as Run;
+        const afterCanonical=await canonicalRun(first.id);
+        // The dedicated response and DB retain the entire record, including prompt,
+        // execution skills/tools, frozen profile/provenance, actor, thread and stop evidence.
+        expect(cancelled).toEqual(afterCanonical);
+        expect(withoutMutableRunFields(afterCanonical)).toEqual(withoutMutableRunFields(initialCanonical));
+        expect(afterCanonical.status).toBe('cancelled');
+        const after=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===first.id)!;
+        expect(after).toEqual(projectedRun(afterCanonical));
         expect(after.status).toBe('cancelled');expect(withoutMutableRunFields(after)).toEqual(withoutMutableRunFields(initialRun));
         const repeat=checkedJson(await user('POST',`/runs/${first.id}/cancel`,{}));
-        expect(repeat).toEqual(after);
-        const afterRepeat=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===first.id)!;
+        expect(repeat).toEqual(afterCanonical);
+        expect(await canonicalRun(first.id)).toEqual(afterCanonical);
+        const afterRepeat=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===first.id)!;
+        expect(afterRepeat).toEqual(after);expect(afterRepeat).toEqual(projectedRun(afterCanonical));
         expect(afterRepeat.status).toBe('cancelled');expect(withoutMutableRunFields(afterRepeat)).toEqual(withoutMutableRunFields(initialRun));
         const eventRowsAfter=await sql`SELECT data FROM wb_records WHERE kind='event' AND project_id=${p.id} AND data->>'runId'=${first.id} ORDER BY (data->>'sequence')::int`;
         const artifactRowsAfter=await sql`SELECT data FROM wb_records WHERE kind='artifact' AND project_id=${p.id} AND data->>'runId'=${first.id} ORDER BY id`;
@@ -482,7 +510,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(claimed.id).toBe(second.id);
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"')-'stoppedAt' WHERE id=${claimed.id}`;
         checkedJson(await user('POST',`/runs/${claimed.id}/cancel`,{}));
-        const held=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===claimed.id)!;
+        const held=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===claimed.id)!;
         expect(held.status).toBe('cancelled');expect(held.stoppedAt).toBeUndefined();
         const third=(await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Must wait',requestId:randomUUID()})).json().run;
         expect((await connector('/claim',{})).statusCode).toBe(204);
@@ -494,7 +522,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(thirdClaim.id).toBe(third.id);
         await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"paused"')-'stoppedAt' WHERE id=${thirdClaim.id}`;
         checkedJson(await user('POST',`/runs/${thirdClaim.id}/cancel`,{}));
-        const pausedPending=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===thirdClaim.id)!;
+        const pausedPending=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===thirdClaim.id)!;
         expect(pausedPending.status).toBe('cancelled');expect(pausedPending.stoppedAt).toBeUndefined();
         checkedJson(await connector(`/runs/${thirdClaim.id}/stopped`,{generation:thirdClaim.generation}));
         const fourth=(await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text:'Proven paused writer',requestId:randomUUID()})).json().run as Run;
@@ -503,7 +531,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const pausedStoppedAt='2026-10-14T03:00:00.000Z';
         await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(data,'{status}','"paused"'),'{stoppedAt}',${sql.json(pausedStoppedAt)}) WHERE id=${fourthClaim.id}`;
         checkedJson(await user('POST',`/runs/${fourthClaim.id}/cancel`,{}));
-        const pausedProven=((await user('GET','/snapshot')).json().runs as Run[]).find(run=>run.id===fourthClaim.id)!;
+        const pausedProven=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===fourthClaim.id)!;
         expect(pausedProven.status).toBe('cancelled');expect(pausedProven.stoppedAt).toBe(pausedStoppedAt);
     });
     it("signed inbound sources are scoped, deduplicated and never directly execute", async () => {
