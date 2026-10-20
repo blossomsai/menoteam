@@ -36,7 +36,7 @@ function stagingClaim(phase: 'queued' | 'deploy_intent' = 'queued'): ClaimedRun 
   return { run, project: { id: run.projectId, name: 'Project', instructions: '', repositoryUrl: run.operation!.repositoryUrl, deliveryAuthorization: '', createdAt: run.createdAt }, messages: [], settings: [] };
 }
 
-async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{advanceRecoveryClock?:boolean;stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>}={}) {
+async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'provenance' | 'transport' | 'status') => Promise<{ authorized: true; action: 'discover' | 'deploy' | 'rollback' | 'status' }>, transport: (request: StagingRequest, tracking?:StagingTracking) => Promise<StagingReceipt>, options:{advanceRecoveryClock?:boolean;stopAfterMs?:number;stopProcess?:(identity:typeof identity)=>Promise<boolean>;pauseOnHeartbeat?:boolean;recovery?:boolean;recoveryIdentity?:boolean;afterRun?:()=>Promise<void>;renew?:(count:number)=>Promise<void>;onRunner?:(runner:ConnectorRunner)=>void;stopAck?:(attempt:number,spool:Record<string,unknown>|undefined)=>Promise<void>;buildDiscovery?:typeof discoverStagingBuild;onBuildReceipt?:(receipt:StagingBuildReceipt)=>Promise<void>;provenanceVerifier?:(args:string[],signal?:AbortSignal)=>Promise<string>;completeAck?:()=>Promise<void>;receiptAck?:(receipt:StagingReceipt,attempt:number)=>Promise<void>;awaitCompletion?:boolean;lifecycleWatchdogMs?:number}={}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'menoteam-staging-runner-'));
   let runner: ConnectorRunner;
   let claimed = false;
@@ -48,8 +48,11 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
   const stoppedAcks:number[]=[];
   const buildStatuses:string[]=[];
   const buildReceipts:StagingBuildReceipt[]=[];
+  let finishLifecycle!:()=>void;
+  const lifecycleFinished=new Promise<void>(resolve=>{finishLifecycle=resolve;});
+  let lifecycleWatchdogExpired=false;
   const client = {
-    claim: async () => { if (!claimed&&!options.recovery) { claimed = true; return claim; } if(options.advanceRecoveryClock&&recoveryPolls++===0){expect(receipts.length+stoppedAcks.length).toBe(1);recoveryOffset+=30_000;return undefined;} await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
+    claim: async () => { if (!claimed&&!options.recovery) { claimed = true; return claim; } if(options.advanceRecoveryClock&&recoveryPolls++===0){expect(receipts.length+stoppedAcks.length).toBe(1);recoveryOffset+=30_000;return undefined;} if(options.awaitCompletion){let watchdog!:NodeJS.Timeout;await Promise.race([lifecycleFinished,new Promise<void>(resolve=>{watchdog=setTimeout(()=>{lifecycleWatchdogExpired=true;void runner.stop().then(resolve,resolve);},options.lifecycleWatchdogMs??2_500);})]);clearTimeout(watchdog);return undefined;} await new Promise(resolve=>setTimeout(resolve,options.stopAfterMs??50));await runner.stop(); return undefined; },
     renew: async (_id:string,generation:number) => { renewals.push(generation);await options.renew?.(renewals.length);if(options.pauseOnHeartbeat&&renewals.length>1){claim.run.status='paused';throw new Error('lease rejected after pause');}return claim.run; },
     authorizeStagingEffect: async (_id: string, generation: number, effect: 'discovery' | 'provenance' | 'transport' | 'status') => {
       expect(generation).toBe(claim.run.generation);
@@ -59,7 +62,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
     stagingBuildStatus:async(_id:string,_generation:number,status:string)=>{buildStatuses.push(status);return{run:claim.run};},
     stagingBuildReceipt:async(_id:string,_generation:number,receipt:StagingBuildReceipt)=>{await options.onBuildReceipt?.(receipt);buildReceipts.push(receipt);claim.run.operation!.buildReceipt={...receipt,verifiedAt:new Date().toISOString(),verifiedGeneration:claim.run.generation};claim.run.operation!.buildStatus='verified';claim.run.operation!.imageDigest=receipt.imageDigest;return{run:claim.run};},
     stopped: async (_id:string,generation:number)=>{expect(_id).toBe(runId);expect(generation).toBe(1);stoppedAcks.push(generation);await options.stopAck?.(stoppedAcks.length,await readJson<Record<string,unknown>>(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`)));claim.run.stoppedAt=new Date().toISOString();return claim.run;},
-    complete: async (_id: string, _generation: number, completion: { error?: string }) => { completions.push(completion);await options.completeAck?.(); await runner.stop(); return claim.run; },
+    complete: async (_id: string, _generation: number, completion: { error?: string }) => { completions.push(completion);await options.completeAck?.(); await runner.stop();finishLifecycle(); return claim.run; },
     readRun: async () => claim.run,
   } as unknown as WorkbenchConnectorClient;
   const native = { start: async () => ['gpt-6.1-sol'], stop: async () => {} } as unknown as CodexAppServer;
@@ -78,7 +81,7 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
   if(options.recovery)await writeSecureJson(path.join(dataDir,'spool',`${stateKey(runId,'1')}.json`),{runId,generation:1,events:[],artifacts:[],stagingIntent:{targetId:'staging',commitSha,imageDigest,expectedCurrentDeploymentId:claim.run.operation!.expectedCurrentDeploymentId??null,...(claim.run.operation!.previousDeploymentId?{previousDeploymentId:claim.run.operation!.previousDeploymentId}:{})},stagingTransportStarted:true,stagingTransportStopped:!options.recoveryIdentity,...(options.recoveryIdentity?{stagingProcessIdentity:identity}:{}),deliveryExecutor:{pid:process.pid,executionId:'crashed-fixture',stage:'staging'}});
   options.onRunner?.(runner);
   try {
-    await runner.run();await options.afterRun?.();
+    await runner.run();if(lifecycleWatchdogExpired)throw new Error('Fixture did not observe staging completion before its lifecycle watchdog');await options.afterRun?.();
     const spools=await Promise.all((await readdir(path.join(dataDir,'spool'))).map(file=>readJson<Record<string,unknown>>(path.join(dataDir,'spool',file))));
     return { receipts, completions, renewals, stoppedAcks, spools,buildStatuses,buildReceipts };
   }
@@ -135,14 +138,32 @@ describe('staging delivery Connector integration', () => {
   it('an existing intent after a generation change can only perform read-only status', async () => {
     const effects: string[] = [], transportActions: string[] = [];
     const claim = stagingClaim('deploy_intent'); claim.run.generation = 2;
-    const result = await execute(claim, async effect => { effects.push(effect); return { authorized: true, action: 'status' }; }, async request => {
+    let releaseAuthorization!:()=>void;
+    let authorizationStarted!:()=>void;
+    const authorizationGate=new Promise<void>(resolve=>{releaseAuthorization=resolve;});
+    const authorized=new Promise<void>(resolve=>{authorizationStarted=resolve;});
+    let stopCalls=0;
+    const resultPromise = execute(claim, async effect => { effects.push(effect);authorizationStarted();await authorizationGate;return { authorized: true, action: 'status' }; }, async request => {
       transportActions.push(request.action);
       return { operationId: request.operationId, targetId: request.targetId, phase: 'unknown', commitSha: request.commitSha, imageDigest: request.imageDigest, checkedAt: new Date().toISOString() };
-    });
+    }, { awaitCompletion:true, lifecycleWatchdogMs:2_500, onRunner:runner=>{const stop=runner.stop.bind(runner);vi.spyOn(runner,'stop').mockImplementation(async()=>{stopCalls++;await stop();});} });
+    let observationError:unknown;
+    try {
+      const authorizationReached=await Promise.race([authorized.then(()=>true),resultPromise.then(()=>false)]);
+      expect(authorizationReached).toBe(true);
+      await new Promise(resolve=>setTimeout(resolve,75));
+      expect(stopCalls).toBe(0);
+      expect(transportActions).toEqual([]);
+    } catch(error) { observationError=error; }
+    finally { releaseAuthorization(); }
+    let result:Awaited<typeof resultPromise>|undefined;
+    try { result=await resultPromise; } catch(error) { if(observationError===undefined)observationError=error; }
+    if(observationError!==undefined)throw observationError;
+    expect(stopCalls).toBe(1);
     expect(effects).toEqual(['status']);
     expect(transportActions).toEqual(['status']);
-    expect(result.receipts[0]?.phase).toBe('unknown');
-    expect(result.completions[0]?.error).toBeTruthy();
+    expect(result!.receipts[0]?.phase).toBe('unknown');
+    expect(result!.completions[0]?.error).toBeTruthy();
   });
 
   it('renews the staging lease while a bounded remote operation is still running', async () => {
