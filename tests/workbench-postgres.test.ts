@@ -2598,6 +2598,113 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
         expect(recovered).toHaveLength(1); expect(recovered[0]?.result).toMatchObject({projectId:p1.id,origin:originalRuns[0]!.origin});
     });
 
+    it('lets project admins issue only project scoped invitations and keeps workspace invites owner only', async () => {
+        const suffix = randomUUID();
+        const email = (name: string) => `${name}-${suffix}@test.example`;
+        const ownerEmail = email('workspace-owner');
+        await app.close();
+        app = await createWorkbenchApp({ sql, bootstrapEmail: ownerEmail, bootstrapPassword: 'invite-owner-password-123' });
+        const ownerLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: ownerEmail, password: 'invite-owner-password-123' } });
+        expect(ownerLogin.statusCode).toBe(200);
+        const ownerSession = String(ownerLogin.headers['set-cookie']).split(';')[0]!;
+        const ownerPost = (path: string, payload: unknown) => app.inject({ method: 'POST', url: `/api/workbench${path}`, headers: { cookie: ownerSession }, payload });
+        const checkedJson = (response: { statusCode: number; body: string; json(): any }, status = 200) => {
+            expect(response.statusCode, response.statusCode === status ? undefined : 'Unexpected PostgreSQL fixture response').toBe(status);
+            return response.json();
+        };
+        const adminEmail = email('project-admin');
+        const memberInviteEmail = email('invited-member');
+        const scopedAdminEmail = email('invited-admin');
+        const ordinaryEmail = email('ordinary-member');
+        const workspaceEmail = email('workspace-admin');
+        const project = checkedJson(await ownerPost('/projects', { name: `Invite scope ${suffix}` })) as Project;
+        const otherProject = checkedJson(await ownerPost('/projects', { name: `Invite other ${suffix}` })) as Project;
+        const cleanupEmails = [ownerEmail, adminEmail, memberInviteEmail, scopedAdminEmail, ordinaryEmail, workspaceEmail];
+        const inviteAndAccept = async (inviteEmail: string, projectId: string | undefined, role: 'admin' | 'member') => {
+            const payload = { email: inviteEmail, ...(projectId ? { projectId } : {}), role };
+            const invite = checkedJson(await ownerPost('/invites', payload));
+            const accepted = await app.inject({
+                method: 'POST', url: '/api/workbench/invites/accept',
+                payload: { token: invite.token, name: 'Invite fixture', password: 'invite-fixture-password-123' }
+            });
+            expect(accepted.statusCode).toBe(200);
+            const login = await app.inject({
+                method: 'POST', url: '/api/workbench/session',
+                payload: { email: inviteEmail, password: 'invite-fixture-password-123' }
+            });
+            expect(login.statusCode).toBe(200);
+            return { invite, session: String(login.headers['set-cookie']).split(';')[0]! };
+        };
+        const sessionPost = (session: string, payload: unknown) => app.inject({
+            method: 'POST', url: '/api/workbench/invites', headers: { cookie: session }, payload
+        });
+        const account = async (accountEmail: string, projectId: string, scopedRole: string) => {
+            const rows = await sql`SELECT u.role AS global_role,m.role AS project_role FROM wb_users u LEFT JOIN wb_memberships m ON m.user_id=u.id AND m.project_id=${projectId} WHERE u.email=${accountEmail}`;
+            expect(rows).toHaveLength(1);
+            expect(rows[0]).toMatchObject({ global_role: 'member', project_role: scopedRole });
+            const memberships = await sql`SELECT project_id FROM wb_memberships WHERE user_id=(SELECT id FROM wb_users WHERE email=${accountEmail})`;
+            expect(memberships).toHaveLength(1);
+            expect(memberships[0]!.project_id).toBe(projectId);
+        };
+        try {
+            const projectAdmin = await inviteAndAccept(adminEmail, project.id, 'admin');
+            await account(adminEmail, project.id, 'admin');
+            const actor = await sql`SELECT u.role AS global_role,m.role AS project_role FROM wb_users u JOIN wb_memberships m ON m.user_id=u.id AND m.project_id=${project.id} WHERE u.email=${adminEmail}`;
+            expect(actor).toMatchObject([{ global_role: 'member', project_role: 'admin' }]);
+            expect(await sql`SELECT role FROM wb_memberships WHERE user_id=(SELECT id FROM wb_users WHERE email=${adminEmail}) AND project_id=${otherProject.id}`).toHaveLength(0);
+
+            const memberInvite = checkedJson(await sessionPost(projectAdmin.session, { email: memberInviteEmail, projectId: project.id, role: 'member' }));
+            const memberAcceptance = await app.inject({ method: 'POST', url: '/api/workbench/invites/accept', payload: { token: memberInvite.token, name: 'Invited member', password: 'invite-fixture-password-123' } });
+            expect(memberAcceptance.statusCode).toBe(200);
+            await account(memberInviteEmail, project.id, 'member');
+            const memberLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: memberInviteEmail, password: 'invite-fixture-password-123' } });
+            expect(memberLogin.statusCode).toBe(200);
+
+            const scopedAdminInvite = checkedJson(await sessionPost(projectAdmin.session, { email: scopedAdminEmail, projectId: project.id, role: 'admin' }));
+            const scopedAdminAcceptance = await app.inject({ method: 'POST', url: '/api/workbench/invites/accept', payload: { token: scopedAdminInvite.token, name: 'Invited admin', password: 'invite-fixture-password-123' } });
+            expect(scopedAdminAcceptance.statusCode).toBe(200);
+            await account(scopedAdminEmail, project.id, 'admin');
+            const scopedAdminLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: scopedAdminEmail, password: 'invite-fixture-password-123' } });
+            expect(scopedAdminLogin.statusCode).toBe(200);
+            await account(adminEmail, project.id, 'admin');
+
+            const outsiderInvite = checkedJson(await ownerPost('/invites', { email: ordinaryEmail, projectId: project.id, role: 'member' }));
+            const outsiderAcceptance = await app.inject({ method: 'POST', url: '/api/workbench/invites/accept', payload: { token: outsiderInvite.token, name: 'Ordinary member', password: 'invite-fixture-password-123' } });
+            expect(outsiderAcceptance.statusCode).toBe(200);
+            const ordinaryLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: ordinaryEmail, password: 'invite-fixture-password-123' } });
+            expect(ordinaryLogin.statusCode).toBe(200);
+            const ordinarySession = String(ordinaryLogin.headers['set-cookie']).split(';')[0]!;
+            expect((await sql`SELECT role FROM wb_memberships WHERE user_id=(SELECT id FROM wb_users WHERE email=${ordinaryEmail}) AND project_id=${project.id}`).map(row => row.role)).toEqual(['member']);
+
+            const denied = async (response: { statusCode: number }) => expect(response.statusCode).toBe(403);
+            const inviteCount = async (inviteEmail: string) => Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${inviteEmail}`)[0]!.count);
+            const beforeUnscoped = await inviteCount(email('denied-unscoped'));
+            await denied(await sessionPost(projectAdmin.session, { email: email('denied-unscoped'), role: 'member' }));
+            await denied(await sessionPost(projectAdmin.session, { email: email('denied-unscoped'), role: 'admin' }));
+            expect(await inviteCount(email('denied-unscoped'))).toBe(beforeUnscoped);
+            await denied(await sessionPost(projectAdmin.session, { email: email('denied-other-project'), projectId: otherProject.id, role: 'admin' }));
+            expect(await inviteCount(email('denied-other-project'))).toBe(0);
+            await denied(await sessionPost(ordinarySession, { email: email('denied-ordinary-member'), projectId: project.id, role: 'admin' }));
+            expect(await inviteCount(email('denied-ordinary-member'))).toBe(0);
+
+            const deniedWorkspaceEmail = email('denied-workspace');
+            await denied(await sessionPost(projectAdmin.session, { email: deniedWorkspaceEmail, role: 'member' }));
+            expect(await inviteCount(deniedWorkspaceEmail)).toBe(0);
+            await denied(await sessionPost(projectAdmin.session, { email: deniedWorkspaceEmail, role: 'admin' }));
+            expect(await inviteCount(deniedWorkspaceEmail)).toBe(0);
+
+            await inviteAndAccept(workspaceEmail, undefined, 'admin');
+            const workspaceUser = await sql`SELECT role FROM wb_users WHERE email=${workspaceEmail}`;
+            expect(workspaceUser).toMatchObject([{ role: 'admin' }]);
+            expect(await sql`SELECT project_id FROM wb_memberships WHERE user_id=(SELECT id FROM wb_users WHERE email=${workspaceEmail})`).toHaveLength(0);
+        } finally {
+            await sql`DELETE FROM wb_invites WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`}`;
+            await sql`DELETE FROM wb_sessions WHERE user_id IN (SELECT id FROM wb_users WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`})`;
+            await sql`DELETE FROM wb_memberships WHERE user_id IN (SELECT id FROM wb_users WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`})`;
+            await sql`DELETE FROM wb_users WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`}`;
+            await sql`DELETE FROM wb_records WHERE id=ANY(${[project.id, otherProject.id]}) AND kind='project'`;
+        }
+    });
 });
 
 describe.skipIf(!url)('Slack durable reply PostgreSQL',()=>{
