@@ -21,6 +21,60 @@ function claim():ClaimedRun {
 }
 const execFile=promisify(execFileCallback);
 describe('Integrated connector lifecycle',()=>{
+  it('keeps two worker slots plus one local Master slot live in the polling loop',async()=>{
+    vi.stubEnv('MENOTEAM_GITHUB_TOKEN','');
+    const dataDir=await mkdtemp(path.join(os.tmpdir(),'menoteam-runner-capacity-'));
+    const kinds:Array<ClaimedRun['run']['kind']> = ['implementation','master','review','implementation','master','review'];
+    const claims=kinds.map((kind,index)=>{const value=claim();value.run.id=`capacity-${index}`;value.run.kind=kind;return value;});
+    const requested:Array<ClaimedRun['run']['kind'][]|undefined>=[];
+    const releases=new Map<string,()=>void>(),started=new Set<string>(),active=new Map<string,ClaimedRun['run']['kind']>();
+    const client={claim:async(runKinds?:ClaimedRun['run']['kind'][]):Promise<ClaimedRun|undefined>=>{
+      requested.push(runKinds);
+      if(runKinds?.length===0)return undefined;
+      const index=claims.findIndex(value=>!runKinds||runKinds.includes(value.run.kind));
+      return index<0?undefined:claims.splice(index,1)[0];
+    }} as unknown as WorkbenchConnectorClient;
+    const native={start:async()=>['gpt-6.1-sol'],stop:async()=>{}} as unknown as CodexAppServer;
+    const runner=new ConnectorRunner({serverUrl:'http://127.0.0.1:3200',token:'fixture',connectorId:'one',dataDir,projects:{},pollIntervalMs:50},{native:()=>native,client:()=>client});
+    vi.spyOn(runner,'execute').mockImplementation(value=>{
+      started.add(value.run.id);active.set(value.run.id,value.run.kind);
+      expect([...active.values()].filter(kind=>kind!=='master').length).toBeLessThanOrEqual(2);
+      expect([...active.values()].filter(kind=>kind==='master').length).toBeLessThanOrEqual(1);
+      return new Promise<void>(resolve=>releases.set(value.run.id,()=>{active.delete(value.run.id);resolve();}));
+    });
+    const waitFor=async(predicate:()=>boolean)=>{await vi.waitFor(()=>expect(predicate()).toBe(true),{timeout:2_000,interval:5});};
+    const running=runner.run();
+    try{
+      await waitFor(()=>started.has('capacity-0')&&started.has('capacity-1')&&started.has('capacity-2'));
+      expect([...started]).toEqual(['capacity-0','capacity-1','capacity-2']);
+      expect(requested.slice(0,3)).toEqual([undefined,undefined,['implementation','review']]);
+      expect(active.size).toBe(3);
+      await waitFor(()=>requested.filter(value=>Array.isArray(value)&&value.length===0).length>=2);
+      const heartbeatCount=requested.filter(value=>Array.isArray(value)&&value.length===0).length;
+      await new Promise(resolve=>setTimeout(resolve,130));
+      expect(requested.filter(value=>Array.isArray(value)&&value.length===0).length-heartbeatCount).toBeLessThanOrEqual(3);
+      const afterWorkerRelease=requested.length;
+      releases.get('capacity-0')!();
+      vi.stubEnv('MENOTEAM_GITHUB_TOKEN','fixture-token');
+      await waitFor(()=>started.has('capacity-3'));
+      expect(requested.slice(afterWorkerRelease).some(value=>JSON.stringify(value)===JSON.stringify(['implementation','review','delivery']))).toBe(true);
+      const afterMasterRelease=requested.length;
+      releases.get('capacity-1')!();
+      await waitFor(()=>started.has('capacity-4'));
+      expect(requested.slice(afterMasterRelease).some(value=>JSON.stringify(value)===JSON.stringify(['master']))).toBe(true);
+      expect(active.size).toBe(3);
+      expect(started.has('capacity-5')).toBe(false);
+      const fullCount=requested.filter(value=>Array.isArray(value)&&value.length===0).length;
+      await waitFor(()=>requested.filter(value=>Array.isArray(value)&&value.length===0).length>=fullCount+2);
+      expect(started.size).toBe(5);
+    }finally{
+      await runner.stop();
+      for(const release of releases.values())release();
+      await running;
+      vi.unstubAllEnvs();
+      await rm(dataDir,{recursive:true,force:true});
+    }
+  });
   it.each([
     {stage:'read-run',error:new ConnectorHttpError(429,'private-token https://private.invalid/path',[], 'GET','connector.runs.read'),category:'http-failure',status:429},
     {stage:'renew',error:new ConnectorHttpError(403,'private-token https://private.invalid/path',[], 'POST','connector.runs.renew'),category:'http-failure',status:403},
