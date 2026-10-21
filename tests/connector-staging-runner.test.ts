@@ -128,6 +128,24 @@ async function execute(claim: ClaimedRun, authorize: (effect: 'discovery' | 'pro
 }
 
 describe('staging delivery Connector integration', () => {
+  it.each([true,false])('records offline stop proof only after confirmed transport cleanup (confirmed=%s)',async confirmed=>{
+    const claim=stagingClaim(),events:string[]=[];
+    const result=await execute(claim,async()=>({authorized:true,action:'deploy'}),async(request,tracking)=>{
+      if(confirmed){await tracking!.starting!();await tracking!.started(identity);await tracking!.stopped();}
+      return {operationId:request.operationId,targetId:request.targetId,phase:'target_offline',commitSha:request.commitSha,imageDigest:request.imageDigest,checkedAt:new Date().toISOString()};
+    },{awaitCompletion:true,receiptAck:async receipt=>{events.push('receipt');Object.assign(claim.run.operation!,{phase:'target_offline',effectIntentGeneration:1,stagingReceipt:receipt});},completeAck:async()=>{events.push('complete');claim.run.status='failed';},stopAck:async()=>{events.push('stopped');}});
+    expect(result.stoppedAcks).toEqual(confirmed?[1]:[]);
+    expect(events).toEqual(confirmed?['receipt','complete','stopped']:['receipt','complete']);
+  });
+  it('keeps confirmed offline cleanup in the outbox when its stopped ACK is lost',async()=>{
+    const claim=stagingClaim();
+    const result=await execute(claim,async()=>({authorized:true,action:'deploy'}),async(request,tracking)=>{
+      await tracking!.starting!();await tracking!.started(identity);await tracking!.stopped();
+      return {operationId:request.operationId,targetId:request.targetId,phase:'target_offline',commitSha:request.commitSha,imageDigest:request.imageDigest,checkedAt:new Date().toISOString()};
+    },{awaitCompletion:true,receiptAck:async receipt=>{Object.assign(claim.run.operation!,{phase:'target_offline',effectIntentGeneration:1,stagingReceipt:receipt});},completeAck:async()=>{claim.run.status='failed';},stopAck:async()=>{throw Error('stopped ACK lost');}});
+    expect(result.stoppedAcks).toEqual([1]);expect(result.spools).toHaveLength(1);
+    expect(result.spools[0]).toMatchObject({generation:1,stagingOfflineReceipt:true,stagingTransportStopped:true,completion:{error:expect.any(String)}});
+  });
   it.each(['deploy', 'rollback'] as const)('converges a completed %s by status and retries a lost terminal receipt ACK without mutating', async action => {
     const claim = stagingClaim('deploy_intent');
     claim.run.operation!.expectedCurrentDeploymentId = 'deploy_current';

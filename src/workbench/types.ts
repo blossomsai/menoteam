@@ -93,6 +93,8 @@ export interface Run {
         targetPolicyVersion?: string;
         imageDigest?: string;
         sourceMergeRunId?: string;
+        recoveryFromRunId?: string;
+        recoveryFromGeneration?: number;
         buildStatus?: 'discovering' | 'unavailable' | 'running' | 'failed' | 'receipt_missing' | 'receipt_expired' | 'provenance_failed' | 'verified';
         buildMessage?: string;
         stagingRetired?: { at: string; by: string; generation: number };
@@ -233,4 +235,16 @@ export function isPreEffectStagingRun(run: Run): boolean {
     const op = run.operation;
     return run.kind === 'delivery' && op?.action === 'deploy_staging' && op.phase === 'build_discovery'
         && op.effectIntentGeneration === undefined && op.stagingEffectStage === undefined && op.stagingReceipt === undefined;
+}
+
+/** Local stop alone is insufficient: recovery also needs an exact terminal offline receipt. */
+export function isOfflineStagingRun(run: Pick<Run, 'id' | 'kind' | 'operation'>): boolean {
+    const op=run.operation, receipt=op?.stagingReceipt;
+    return run.kind==='delivery'&&op?.action==='deploy_staging'&&op.phase==='target_offline'&&op.effectIntentGeneration!==undefined&&
+        receipt?.phase==='target_offline'&&receipt.operationId===run.id&&receipt.targetId===op.targetId&&
+        receipt.commitSha===op.commitSha&&receipt.imageDigest===op.imageDigest&&
+        !receipt.deploymentId&&!receipt.activeCommitSha&&!receipt.activeImageDigest;
+}
+export function canRecoverStagingRun(run: Pick<Run, 'id' | 'kind' | 'operation' | 'status' | 'stoppedAt'>): boolean {
+    return isOfflineStagingRun(run)&&['failed','completed','cancelled'].includes(run.status)&&Boolean(run.stoppedAt);
 }

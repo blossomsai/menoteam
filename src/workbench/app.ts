@@ -15,7 +15,7 @@ import { registerSourceRoutes } from "./sources.js";
 import { WorkbenchStore } from "./store.js";
 import { requiresLocalWorktree } from "./execution-capabilities.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
-import { isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type SnapshotRun, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
+import { canRecoverStagingRun, isOfflineStagingRun, isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type SnapshotRun, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
 
 export function snapshotRun({ prompt: _prompt, execution, ...run }: Run): SnapshotRun {
@@ -774,6 +774,60 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${reservationScope},'reservation',${tx.json({runId:run.id,action:'deploy_staging',targetId:b.targetId} as never)}),(${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;
         return saved;
     }
+    async function recoverySource(run:Run,tx:Sql,requireReservation=false){
+        const op=run.operation!,source=await store.get<Run>('run',op.sourceMergeRunId??'',tx),s=source?.operation;
+        if(op.recoveryFromRunId&&requireReservation){
+            const old=await store.get<Run>('run',op.recoveryFromRunId,tx);
+            const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${stagingReservationScope(run.projectId,op.targetId??'')} AND request_id='reservation' FOR UPDATE`;
+            if(!old||old.projectId!==run.projectId||old.workId!==run.workId||old.generation!==op.recoveryFromGeneration||!canRecoverStagingRun(old)||old.operation?.sourceMergeRunId!==op.sourceMergeRunId||old.operation?.targetId!==op.targetId||!isDeepStrictEqual(old.operation?.buildReceipt,op.buildReceipt)||op.expectedCurrentDeploymentId!==null||(reservation[0]?.result as {runId?:string})?.runId!==run.id)fail(409,'Recovery reservation or frozen offline identity changed');
+        }
+        if(!source||source.projectId!==run.projectId||source.workId!==run.workId||source.kind!=='delivery'||source.status!=='completed'||s?.action!=='merge_pr'||s.phase!=='merged'||s.external?.mergeSha!==op.commitSha||source.connectorId!==source.targetConnectorId)fail(409,'Recovery merged source receipt is unavailable');
+        const keys=['candidateRunId','candidateRevision','artifactRevision','candidateFingerprint','repositoryUrl','baseRevision','baseBranch','remoteBranch','workTitle','changeSummary','qaStatus','reviewRunId','qaPolicySnapshot'] as const;
+        if(keys.some(key=>!isDeepStrictEqual(op[key],s![key]))||run.targetRunId!==source.targetRunId||run.targetRevision!==source.targetRevision||op.buildStatus!=='verified'||!op.buildReceipt||op.buildReceipt.sourceSha!==op.commitSha||op.buildReceipt.imageDigest!==op.imageDigest)fail(409,'Recovery frozen provenance changed');
+        const buildArtifact=await store.get<Artifact>('artifact',`artifact:${run.id}:staging-build:${op.buildReceipt!.verifiedGeneration}`,tx);
+        if(buildArtifact?.projectId!==run.projectId||buildArtifact.runId!==run.id||buildArtifact.kind!=='delivery'||!isDeepStrictEqual((buildArtifact.data as {receipt?:unknown})?.receipt,op.buildReceipt))fail(409,'Recovery frozen build artifact is unavailable');
+        if(!source.requestedBy||!await actorAuthorized(source,tx))fail(403,'Recovery merge actor authorization was revoked');
+        await mergePrPolicy(source,tx);
+        return source;
+    }
+    async function requestStagingRecovery(user:Member,workId:string,raw:unknown,tx:Sql){
+        const b=z.object({oldRunId:text,generation:z.number().int().nonnegative(),targetId:z.string().regex(/^[a-z0-9][a-z0-9-]{0,63}$/u),requestId:z.string().min(1).max(200)}).strict().parse(raw);
+        const work=await store.get<Work>('work',workId,tx);if(!work)fail(404,'Work missing');
+        await grant(user,work.projectId,true,tx);
+        const users=await tx`SELECT role FROM wb_users WHERE id=${user.id}`;
+        if(!users[0]||!['owner','admin'].includes(String(users[0].role)))fail(403,'Recovery requires a project administrator');
+        const old=await store.get<Run>('run',b.oldRunId,tx);
+        if(!old||old.projectId!==work.projectId||old.workId!==workId||old.generation!==b.generation||old.operation?.targetId!==b.targetId||!canRecoverStagingRun(old))fail(409,'Recovery requires the exact stopped terminal offline Run');
+        const op=old.operation!;
+        if(op.actorId!==old.requestedBy||!await actorAuthorized(old,tx))fail(403,'Offline Run actor authorization was revoked');
+        const receiptArtifact=await store.get<Artifact>('artifact',`artifact:${old.id}:staging:${old.generation}:target_offline`,tx);
+        if(receiptArtifact?.projectId!==old.projectId||receiptArtifact.runId!==old.id||receiptArtifact.workId!==old.workId||receiptArtifact.kind!=='delivery'||receiptArtifact.revision!==op.candidateRevision||!isDeepStrictEqual((receiptArtifact.data as {receipt?:unknown})?.receipt,op.stagingReceipt))fail(409,'Durable offline receipt is unavailable');
+        const source=await recoverySource(old,tx);
+        const {policy}=await stagingTargetPolicy(work.projectId,b.targetId,tx,op.targetPolicyVersion);
+        const connectorId=await stagingConnector(work.projectId,b.targetId,'deploy_staging',tx);
+        const requestScope=`staging-recovery-request:${work.projectId}:${user.id}:${b.targetId}`;
+        const canonicalScope=`staging-recovery:${old.id}:${b.generation}`;
+        // Revalidate current authority and provenance above even when returning a lost ACK.
+        const prior=await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
+        const canonical=await tx`SELECT result FROM wb_requests WHERE scope=${canonicalScope} AND request_id='canonical'`;
+        if(prior[0]){
+            const saved=prior[0].result as {run:Run;operationId:string};
+            if(saved.run.workId!==workId||saved.run.operation?.recoveryFromRunId!==old.id||saved.run.operation.recoveryFromGeneration!==b.generation||saved.run.operation.actorId!==user.id||!canonical[0]||(canonical[0].result as {operationId:string}).operationId!==saved.operationId)fail(409,'Recovery request identity changed');
+            const current=await store.get<Run>('run',saved.operationId,tx);if(!current)fail(409,'Recovery operation unavailable');
+            return {run:current,operationId:current.id};
+        }
+        if(canonical[0])fail(409,'Offline Run reservation was already transferred');
+        const reservationScope=stagingReservationScope(work.projectId,b.targetId);
+        const reservation=await tx`SELECT result FROM wb_requests WHERE scope=${reservationScope} AND request_id='reservation' FOR UPDATE`;
+        if(!reservation[0]||(reservation[0].result as {runId?:string}).runId!==old.id)fail(409,'Offline Run no longer owns the target reservation');
+        const run:Run={id:id('run'),projectId:work.projectId,workId,prompt:'Recover the verified offline target using the frozen merged source and build provenance. Do not run a model.',requestedBy:user.id,kind:'delivery',model:'internal',reasoning:'none',status:'queued',generation:0,createdAt:now(),updatedAt:now(),targetRunId:source.targetRunId,targetRevision:source.targetRevision,targetConnectorId:connectorId,operation:{...source.operation!,action:'deploy_staging',actorId:user.id,commitSha:op.commitSha,phase:'build_discovery',effectIntentGeneration:undefined,external:undefined,sourceMergeRunId:source.id,targetId:b.targetId,targetPolicyVersion:policy.updatedAt,expectedCurrentDeploymentId:null,buildStatus:'verified',buildReceipt:op.buildReceipt,imageDigest:op.imageDigest,recoveryFromRunId:old.id,recoveryFromGeneration:b.generation}};
+        await store.put('run',run,tx);const saved={run,operationId:run.id};
+        const buildArtifact:Artifact={id:`artifact:${run.id}:staging-build:${op.buildReceipt!.verifiedGeneration}`,projectId:run.projectId,workId:run.workId,runId:run.id,kind:'delivery',revision:op.candidateRevision,data:{phase:'build_verified',sourceMergeRunId:source.id,commitSha:op.commitSha,targetId:b.targetId,receipt:op.buildReceipt,recoveryFromRunId:old.id},createdAt:now()};
+        await store.put('artifact',buildArtifact,tx);
+        await tx`UPDATE wb_requests SET result=${tx.json({runId:run.id,action:'deploy_staging',targetId:b.targetId} as never)} WHERE scope=${reservationScope} AND request_id='reservation' AND result->>'runId'=${old.id}`;
+        await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json(saved as never)}),(${canonicalScope},'canonical',${tx.json(saved as never)})`;
+        return saved;
+    }
     async function retireStagingDeploy(user:Member,runId:string,raw:unknown,tx:Sql,projectBoundary?:string){
         const body=z.object({generation:z.number().int().nonnegative()}).strict().parse(raw);
         const run=await store.get<Run>('run',runId,tx);
@@ -871,6 +925,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
     });
     app.post('/api/workbench/works/:id/merge',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`delivery:${workId}`,tx=>requestMergePr(user,workId,req.body,tx));});
     app.post('/api/workbench/works/:id/staging',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,tx=>requestStagingDeploy(user,workId,req.body,tx));});
+    app.post('/api/workbench/works/:id/staging/recover',async req=>{const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,async tx=>requestStagingRecovery(await member(req,tx),workId,req.body,tx));});
     app.post('/api/workbench/runs/:id/staging/retire',async req=>{const runId=(req.params as {id:string}).id;return store.transaction(`run:${runId}`,async tx=>retireStagingDeploy(await member(req,tx),runId,req.body,tx));});
     app.post('/api/workbench/works/:id/staging/rollback',async req=>{const user=await member(req);const workId=(req.params as {id:string}).id;return store.transaction(`staging:${workId}`,tx=>requestStagingRollback(user,workId,req.body,tx));});
     app.get("/api/workbench/works/:id", async (req) => {
@@ -1383,6 +1438,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             if(!current||!receipt||receipt.operationId!==current.id||receipt.targetId!==targetId||receipt.phase!==current.operation!.phase||!(Date.parse(previous!.operation!.stagingReceipt!.checkedAt)<=Date.parse(receipt.checkedAt)))fail(409,'Current verified staging deployment changed');
             if(previousSource.id!==source.id||op.previousDeploymentId!==previous!.operation!.stagingReceipt!.deploymentId||op.imageDigest!==previous!.operation!.imageDigest||op.commitSha!==previous!.operation!.commitSha||op.rollbackToImageDigest!==op.imageDigest||Object.entries(identity).some(([key,value])=>!isDeepStrictEqual(op[key as keyof NonNullable<Run['operation']>],value))||run.targetRunId!==previousSource.targetRunId||run.targetRevision!==previousSource.targetRevision||!current||!receipt||current.workId!==run.workId||receipt.deploymentId!==op.expectedCurrentDeploymentId||receipt.previousDeploymentId!==op.previousDeploymentId||receipt.previousImageDigest!==op.imageDigest||!(Date.parse(previous!.createdAt)<=Date.parse(current.createdAt)))fail(409,'Rollback deployment chain changed');
         }
+        if(op.recoveryFromRunId)await recoverySource(run,tx,true);
         if(op.action==='deploy_staging'&&op.phase==='build_discovery'&&body.effect==='discovery'){
             if(op.buildStatus==='verified'&&!op.buildReceipt||op.effectIntentGeneration)fail(409,'Staging build discovery has already completed');
             return {authorized:true as const,action:'discover' as const};
@@ -1407,6 +1463,11 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const run=await leased(req,tx,false,readOnly);if(run.kind!=='delivery'||!run.operation||!['deploy_staging','rollback_staging'].includes(run.operation.action))fail(403,'Staging delivery operation required');
         if(!run.operation.effectIntentGeneration)fail(409,'A saved staging intent is required for receipt reconciliation');
         const op=run.operation,receipt=body.receipt;if(receipt.operationId!==run.id||receipt.targetId!==op.targetId||receipt.commitSha!==op.commitSha||receipt.imageDigest!==op.imageDigest)fail(409,'Staging receipt does not match the immutable operation');
+        if(op.phase==='target_offline'){
+            const artifact=await store.get<Artifact>('artifact',`artifact:${run.id}:staging:${run.generation}:target_offline`,tx);
+            if(!isDeepStrictEqual(op.stagingReceipt,receipt)||artifact&&!isDeepStrictEqual((artifact.data as {receipt?:unknown})?.receipt,receipt))fail(409,'Terminal offline receipt is immutable');
+            if(artifact)return {run,artifact};
+        }
         const validDeploy=op.action==='deploy_staging'&&receipt.phase==='health_passed'&&receipt.deploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
         const validRollback=op.action==='rollback_staging'&&receipt.phase==='rolled_back'&&receipt.deploymentId===op.previousDeploymentId&&Boolean(op.previousDeploymentId)&&receipt.previousDeploymentId===op.expectedCurrentDeploymentId&&receipt.activeCommitSha===op.commitSha&&receipt.activeImageDigest===op.imageDigest;
         let validFallback=false;
@@ -2137,8 +2198,9 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 r!.status='interrupted';
                 r!.error='Connector confirmed unexpected process stop; reconciliation required';
                 r!.updatedAt=now();
-            } else if (!["paused", "cancelled", "interrupted"].includes(r!.status) && !(r!.status === 'failed' && isPreEffectStagingRun(r!) && !r!.operation?.stagingRetired))
+            } else if (!["paused", "cancelled", "interrupted"].includes(r!.status) && !(r!.status === 'failed' && (isPreEffectStagingRun(r!)||isOfflineStagingRun(r!)) && !r!.operation?.stagingRetired))
                 fail(409, "Stop acknowledgement not expected");
+            if(r!.stoppedAt&&isOfflineStagingRun(r!))return r;
             r!.stoppedAt = now();
             r!.threadId = body.threadId ?? r!.threadId;
             await store.put("run", r!, tx);

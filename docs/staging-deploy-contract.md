@@ -129,3 +129,29 @@ The fixed read-only discovery subprocesses wait for child `close`, including
 abort/error paths, before the Connector records discovery cleanup as stopped.
 That proof and the subsequent stopped acknowledgement remain in the outbox
 until acknowledged by the server.
+
+An offline target has a separate explicit recovery entry:
+`POST /api/workbench/works/:id/staging/recover` accepts only `oldRunId`,
+`generation`, `targetId`, and a stable `requestId`. The authorized owner/admin
+must identify a terminal deploy Run with a durable exact `target_offline`
+receipt (no active deployment) and a same-generation Connector stopped ACK.
+Pending, unknown, unstopped, foreign, stale-generation and already transferred
+operations cannot authorize recovery. The fixed Connector records the stopped
+ACK only after its tracked SSH process has finished; failed status alone is
+not cleanup proof. Existing offline Runs without that proof remain unavailable.
+
+Recovery rechecks current project/target policy, Connector capability, merged
+source, frozen build provenance, and the existing merge QA/review gates,
+including on request retries and before new effects. In one database
+transaction it locks the old target reservation, creates a fresh deploy Run
+with `recoveryFromRunId`/`recoveryFromGeneration`, preserves its frozen build
+receipt in a new Run-bound artifact, and transfers ownership to the fresh Run.
+Only that terminal offline receipt justifies `expectedCurrentDeploymentId=null`;
+a historical healthy deployment is not current state. Separate recovery
+request/canonical scopes deduplicate a lost ACK and reject competing new
+requests. The old Run, artifacts, intent and canonical source entry remain
+unchanged. Old status remains read-only and terminal offline progress can
+acknowledge only the saved receipt; it cannot release the new reservation.
+The UI exposes **Recover deployment** as an explicit action. The new Run still
+uses normal frozen build verification and staging authorization; this API
+neither changes the helper protocol nor proves a runtime recovery succeeded.
