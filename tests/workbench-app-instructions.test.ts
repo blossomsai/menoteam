@@ -166,6 +166,38 @@ it('rebinds delivery settings when switching projects', async () => {
   expect(host.textContent).not.toContain('unsaved-a');
 });
 
+function offlineStagingRun(): Snapshot['runs'][number] {
+  const run=healthyStagingRun();run.status='failed';run.stoppedAt=run.updatedAt;
+  Object.assign(run.operation!,{phase:'target_offline',effectIntentGeneration:1,sourceMergeRunId:'merge-current'});
+  run.operation!.stagingReceipt={operationId:run.id,targetId:'stage-safe',phase:'target_offline',commitSha:run.operation!.commitSha,imageDigest:run.operation!.imageDigest!,checkedAt:run.updatedAt};
+  return run;
+}
+it('recovers only on an explicit click, retaining request identity after ACK loss',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot(),old=offlineStagingRun();value.runs.push(old);responses=[Promise.resolve(value)];
+  const recover=vi.spyOn(workbenchApi,'recoverStagingDeployment').mockRejectedValue(new Error('ACK lost'));
+  const deploy=vi.spyOn(workbenchApi,'requestStagingDeployment');
+  await mount();expect(recover).not.toHaveBeenCalled();
+  await click('Recover deployment');await click('Recover deployment');
+  expect(recover).toHaveBeenCalledTimes(2);expect(recover.mock.calls[1]).toEqual(recover.mock.calls[0]);
+  expect(recover.mock.calls[0]).toEqual(['work',{oldRunId:old.id,generation:old.generation,targetId:'stage-safe',requestId:expect.any(String)}]);
+  expect(deploy).not.toHaveBeenCalled();
+});
+it.each(['unknown','pending','unstopped','foreign receipt','member','policy revoked','capability revoked','transferred'])('hides recovery for %s',async state=>{
+  window.history.replaceState(null,'','/workbench/?view=work-detail&project=project&work=work');
+  const value=stagingSnapshot(),old=offlineStagingRun();value.runs.push(old);
+  if(state==='unknown')old.operation!.stagingReceipt!.phase='unknown';
+  if(state==='pending')old.status='running';
+  if(state==='unstopped')old.stoppedAt=undefined;
+  if(state==='foreign receipt')old.operation!.stagingReceipt!.operationId='other';
+  if(state==='member'){value.member={...member,role:'member'};value.projectRoles={project:'member'};}
+  if(state==='policy revoked')value.settings[0]!.data.enabled=false;
+  if(state==='capability revoked')value.runtimeProviders[0]!.deliveryActions=[];
+  if(state==='transferred'){const next=structuredClone(old);next.id='fresh';next.createdAt='2026-10-08T00:00:00.000Z';next.status='queued';next.operation!.phase='build_discovery';next.operation!.stagingReceipt=undefined;next.operation!.recoveryFromRunId=old.id;value.runs.push(next);}
+  responses=[Promise.resolve(value)];const recover=vi.spyOn(workbenchApi,'recoverStagingDeployment');
+  await mount();expect(host.textContent).not.toContain('Recover deployment');expect(recover).not.toHaveBeenCalled();
+});
+
 it('shows the merged source for this Work, not a newer merge from another Work', async () => {
   window.history.replaceState(null, '', '/workbench/?view=work-detail&project=project&work=work');
   const value = snapshot('A'); value.projects[0]!.repositoryUrl = 'https://github.com/org/repo';

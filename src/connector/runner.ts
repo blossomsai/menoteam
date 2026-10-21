@@ -9,7 +9,7 @@ import { WorkbenchConnectorClient, ConnectorHttpError } from './client.js';
 import { ensureWorktree, checkpoint, createDiff, diffRevision, fingerprint, persistWorktreeMap, readWorktreeMap, spoolDiffFile, waitForGit, GitCommandError, type GitOptions, type DiffFileChunkIndex } from './git.js';
 import { prepareDataDir, readJson, stateKey, writeSecureJson } from './state.js';
 import { assertExecutionSelection } from './selection.js';
-import { isPreEffectStagingRun } from '../workbench/types.js';
+import { isOfflineStagingRun, isPreEffectStagingRun } from '../workbench/types.js';
 import { requiresLocalWorktree } from '../workbench/execution-capabilities.js';
 import { createDraftPullRequest } from './github-draft-pr.js';
 import { captureRequiredLocalQa } from './local-qa.js';
@@ -30,6 +30,7 @@ interface Spool {
   deliveryProgress?: {phase:'published'|'pr_created'|'ready_intent'|'merge_intent'|'merged';remoteHeadSha?:string;pullRequestNumber?:number;pullRequestUrl?:string;headSha?:string;baseSha?:string;mergeSha?:string;pullRequestNodeId?:string};
   stagingIntent?: Omit<StagingRequest,'action'|'operationId'>;
   stagingReceipt?: StagingReceipt;
+  stagingOfflineReceipt?:boolean;
   stagingDiscoveryStopped?:boolean;
   stagingTransportStarted?:boolean;
   stagingTransportStopped?:boolean;
@@ -137,9 +138,10 @@ export class ConnectorRunner {
       try {
         await this.recover();
         if(Date.now()<this.pollBlockedUntil)continue;
-        if (this.tasks.size >= 2) { await Promise.race(this.tasks); continue; }
         const kinds=[...this.activeKinds.values()];
-        const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
+        const workers=kinds.filter(kind=>kind!=='master').length;
+        const hasMaster=kinds.includes('master');
+        const runKinds:ClaimedRun['run']['kind'][]|undefined=workers>=2?(hasMaster?[]:['master']):hasMaster?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
         const claim = await this.client.claim(runKinds);
         if (claim) {
           this.activeRuns.add(claim.run.id);
@@ -194,6 +196,7 @@ export class ConnectorRunner {
     if(spool.stagingReceipt){
       const receipt=spool.stagingReceipt;
       if(!spool.completion)spool.completion=['health_passed','rolled_back'].includes(receipt.phase)?{}:{error:'Staging target did not confirm the requested deployment; its reservation remains held for status reconciliation'};
+      if(receipt.phase==='target_offline')spool.stagingOfflineReceipt=true;
       await this.save(spool);
       await client.stagingProgress(spool.runId,spool.generation,receipt);
       spool.stagingReceipt=undefined;spool.deliveryExecutor&&(spool.deliveryExecutor.stage='completion');await this.save(spool);
@@ -232,6 +235,10 @@ export class ConnectorRunner {
     if(spool.completion&&spool.stagingDiscoveryStopped&&!spool.stagingTransportStarted){
       const remote=await client.readRun(spool.runId);
       if(remote.generation===spool.generation&&isPreEffectStagingRun(remote)&&!remote.operation?.stagingRetired)await client.stopped(spool.runId,spool.generation);
+    }
+    if(spool.completion&&spool.stagingOfflineReceipt&&spool.stagingTransportStopped&&!spool.stagingProcessIdentity){
+      const remote=await client.readRun(spool.runId);
+      if(remote.generation===spool.generation&&remote.status==='failed'&&isOfflineStagingRun(remote))await client.stopped(spool.runId,spool.generation);
     }
     if (spool.stopped || spool.completion) await unlink(this.spoolPath(spool.runId,spool.generation));
   }
