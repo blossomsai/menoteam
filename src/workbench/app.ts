@@ -215,7 +215,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         });
     });
     app.post("/api/workbench/invites", async (req) => {
-        const user = await admin(req);
+        const user = await member(req);
         const b = z.object({
             email: z.string().email(),
             projectId: z.string().min(1).optional(),
