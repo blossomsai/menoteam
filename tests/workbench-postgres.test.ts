@@ -136,6 +136,87 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         expect(discovered.statusCode).toBe(204);
         checkedJson(await user('PATCH',`/settings/${fixtureConnections.get(connectorId)!}`,{data:{default:true}}));
     }
+    it('treats only an explicit empty runKinds array as a mutation-free heartbeat',async()=>{
+        const connectorId=`empty-claim-${randomUUID()}`;
+        const priorConnectorToken=connectorToken;
+        const priorDefaultProviders=await sql`SELECT id,data,updated_at FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'kind'='provider' AND data->'data'->>'default'='true'`;
+        let projectIdForCase:string|undefined;
+        let providerSettingId:string|undefined;
+        const recordIds=new Set<string>();
+        const requestIds:string[]=[];
+        try{
+            const project=checkedJson(await user('POST','/projects',{name:`Empty claim heartbeat ${randomUUID()}`}));
+            projectIdForCase=project.id;
+            recordIds.add(project.id);
+            connectorToken=(await enrollProvider(connectorId,[project.id])).token;
+            providerSettingId=fixtureConnections.get(connectorId);
+            if(providerSettingId)recordIds.add(providerSettingId);
+            const makeQueued=async(title:string)=>{
+                const work=checkedJson(await user('POST',`/projects/${project.id}/works`,{title}));
+                recordIds.add(work.id);
+                const requestId=randomUUID();
+                requestIds.push(requestId);
+                const result=checkedJson(await user('POST',`/projects/${project.id}/messages`,{workId:work.id,text:title,requestId}));
+                recordIds.add(result.message.id);
+                recordIds.add(result.run.id);
+                return result.run as Run;
+            };
+            const expired=await makeQueued('Expired running record');
+            const invalidSelection=await makeQueued('Invalid selected connection');
+            const unauthorized=await makeQueued('Unauthorized queued record');
+            const eligible=await makeQueued('Normal queued record');
+            expect([expired.kind,invalidSelection.kind,unauthorized.kind,eligible.kind]).toEqual(['implementation','implementation','implementation','implementation']);
+            const seeds:Run[]=[
+                {...expired,status:'running',leaseUntil:'2000-01-01T00:00:00.000Z'},
+                {...invalidSelection,execution:{...invalidSelection.execution!,connectionId:'missing-connection'}},
+                {...unauthorized,requestedBy:randomUUID()},
+                eligible
+            ];
+            for(const run of seeds)await sql`UPDATE wb_records SET data=${sql.json(run as never)} WHERE kind='run' AND id=${run.id}`;
+            const ids=seeds.map(run=>run.id);
+            const readRuns=async()=>Promise.all(ids.map(async id=>(await sql`SELECT data::text AS data FROM wb_records WHERE kind='run' AND id=${id}`)[0]?.data));
+            const before=await readRuns();
+            await sql`UPDATE wb_connectors SET last_seen='2000-01-01T00:00:00Z',capabilities=${sql.json({previous:'capability'})} WHERE id=${connectorId}`;
+            const empty=await conn('POST','/claim',{capabilities:{...fixtureCapabilities,runKinds:[],heartbeatRevision:'empty'}});
+            expect(empty.statusCode).toBe(204);
+            expect(await readRuns()).toEqual(before);
+            const heartbeat=(await sql`SELECT last_seen,capabilities FROM wb_connectors WHERE id=${connectorId}`)[0];
+            expect(new Date(String(heartbeat?.last_seen)).getTime()).toBeGreaterThan(Date.parse('2000-01-01T00:00:00Z'));
+            expect(heartbeat?.capabilities).toEqual({...fixtureCapabilities,runKinds:[],heartbeatRevision:'empty'});
+
+            const filtered=await conn('POST','/claim',{capabilities:{...fixtureCapabilities,runKinds:['review'],heartbeatRevision:'nonempty'}});
+            expect(filtered.statusCode).toBe(204);
+            const afterFiltered=await readRuns();
+            expect(JSON.parse(String(afterFiltered[0])).status).toBe('interrupted');
+            expect(JSON.parse(String(afterFiltered[1])).status).toBe('failed');
+            expect(JSON.parse(String(afterFiltered[2])).status).toBe('cancelled');
+            expect(afterFiltered[3]).toBe(before[3]);
+
+            for(let index=0;index<seeds.length;index++){const run=seeds[index]!,id=ids[index]!;await sql`UPDATE wb_records SET data=${sql.json(run as never)} WHERE kind='run' AND id=${id}`;}
+            const unfiltered=await conn('POST','/claim',{capabilities:{...fixtureCapabilities,heartbeatRevision:'missing-filter'}});
+            expect(unfiltered.statusCode).toBe(200);
+            expect(checkedJson(unfiltered).run.id).toBe(eligible.id);
+            const afterUnfiltered=await readRuns();
+            expect(JSON.parse(String(afterUnfiltered[0])).status).toBe('interrupted');
+            expect(JSON.parse(String(afterUnfiltered[1])).status).toBe('failed');
+            expect(JSON.parse(String(afterUnfiltered[2])).status).toBe('cancelled');
+            expect(JSON.parse(String(afterUnfiltered[3])).status).toBe('running');
+        }finally{
+            connectorToken=priorConnectorToken;
+            fixtureConnections.delete(connectorId);
+            if(recordIds.size){
+                const ids=[...recordIds];
+                const runIds=ids.filter(id=>id.startsWith('run_'));
+                await sql`DELETE FROM wb_bridge_tokens WHERE run_id=ANY(${runIds})`;
+                if(projectIdForCase)await sql`DELETE FROM wb_requests WHERE scope=${`message:${projectIdForCase}`} AND request_id=ANY(${requestIds})`;
+                if(projectIdForCase)await sql`DELETE FROM wb_memberships WHERE project_id=${projectIdForCase}`;
+                await sql`DELETE FROM wb_records WHERE id=ANY(${ids})`;
+            }
+            if(providerSettingId)await sql`DELETE FROM wb_records WHERE id=${providerSettingId} AND kind='setting'`;
+            await sql`DELETE FROM wb_connectors WHERE id=${connectorId}`;
+            for(const setting of priorDefaultProviders)await sql`UPDATE wb_records SET data=${sql.json(setting.data as never)},updated_at=${setting.updated_at} WHERE id=${setting.id} AND kind='setting'`;
+        }
+    });
     it("persists project and conversation, idempotent submission and scoped login", async () => {
         expect((await app.inject("/api/workbench/snapshot")).statusCode).toBe(401);
         const p = await user("POST", "/projects", {

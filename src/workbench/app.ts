@@ -1441,6 +1441,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             capabilities: z.record(z.string(), z.unknown()).optional()
         }).parse(req.body ?? {});
         await sql `UPDATE wb_connectors SET last_seen=now(),capabilities=${sql.json((body.capabilities ?? {}) as never)} WHERE id=${c.id}`;
+        if(Array.isArray(body.capabilities?.runKinds)&&body.capabilities.runKinds.length===0)return reply.code(204).send();
         const claimed = await store.transaction("workbench:claim", async (tx) => {
             const runs = await store.list<Run>("run", undefined, tx);
             const isStagingStatusOnly=(run:Run)=>!!run.operation&&['deploy_staging','rollback_staging'].includes(run.operation.action)&&Boolean(run.operation.effectIntentGeneration)&&['deploy_intent','rollback_intent','deploy_unknown','health_passed','rolled_back','target_offline'].includes(run.operation.phase);

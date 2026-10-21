@@ -137,9 +137,10 @@ export class ConnectorRunner {
       try {
         await this.recover();
         if(Date.now()<this.pollBlockedUntil)continue;
-        if (this.tasks.size >= 2) { await Promise.race(this.tasks); continue; }
         const kinds=[...this.activeKinds.values()];
-        const runKinds:ClaimedRun['run']['kind'][]|undefined=kinds.includes('master')?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
+        const workers=kinds.filter(kind=>kind!=='master').length;
+        const hasMaster=kinds.includes('master');
+        const runKinds:ClaimedRun['run']['kind'][]|undefined=workers>=2?(hasMaster?[]:['master']):hasMaster?['implementation','review',...(process.env.MENOTEAM_GITHUB_TOKEN?['delivery' as const]:[])]:undefined;
         const claim = await this.client.claim(runKinds);
         if (claim) {
           this.activeRuns.add(claim.run.id);
