@@ -4,6 +4,7 @@ import { createWorkbenchApp } from "./app.js";
 import { registerWorkbenchAssets } from './assets.js';
 import { processSlackReplies } from './slack-replies.js';
 import { WorkbenchStore } from './store.js';
+import { createInviteMailer, inviteMailConfig } from './invite-mail.js';
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl)
     throw new Error("DATABASE_URL required");
@@ -11,12 +12,15 @@ await migrate(databaseUrl);
 const sql = postgres(databaseUrl, {
     max: 5
 });
+const inviteMail = inviteMailConfig();
 const app = await createWorkbenchApp({
     sql,
     bootstrapEmail: process.env.WORKBENCH_BOOTSTRAP_EMAIL,
     bootstrapPassword: process.env.WORKBENCH_BOOTSTRAP_PASSWORD,
     secureCookies: process.env.WORKBENCH_SECURE_COOKIES === "true" || process.env.WORKBENCH_ORIGIN?.startsWith("https://"),
-    allowedOrigin: process.env.WORKBENCH_ORIGIN,
+    allowedOrigin: inviteMail?.origin ?? process.env.WORKBENCH_ORIGIN,
+    inviteMailer: createInviteMailer(inviteMail),
+    inviteOrigin: inviteMail?.origin,
     registerAssets: async (app) => registerWorkbenchAssets(app, "dist/workbench/web")
 });
 const slackToken=process.env.WORKBENCH_SLACK_BOT_TOKEN;

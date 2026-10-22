@@ -17,6 +17,7 @@ import { requiresLocalWorktree } from "./execution-capabilities.js";
 import { token, digest, hashPassword, checkPassword } from "./auth.js";
 import { canRecoverStagingRun, isOfflineStagingRun, isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type SnapshotRun, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
+import type { InviteMail, InviteMailResult } from './invite-mail.js';
 
 export function snapshotRun({ prompt: _prompt, execution, ...run }: Run): SnapshotRun {
     if (!execution) return run;
@@ -93,6 +94,8 @@ export interface WorkbenchOptions {
     allowedOrigin?: string;
     sourceFetcher?: typeof fetch;
     registerAssets?: (app: FastifyInstance) => Promise<void>;
+    inviteMailer?: (mail: InviteMail) => Promise<InviteMailResult>;
+    inviteOrigin?: string;
 }
 export async function createWorkbenchApp(options: WorkbenchOptions) {
     const store = new WorkbenchStore(options.sql);
@@ -214,23 +217,56 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
             authenticated: false
         });
     });
+    app.get('/api/workbench/invites/config', async (req) => {
+        const user = await member(req);
+        const projectId = z.string().min(1).parse((req.query as { projectId?: string }).projectId);
+        await grant(user, projectId, true);
+        return { emailAvailable: Boolean(options.inviteMailer) };
+    });
     app.post("/api/workbench/invites", async (req) => {
         const user = await member(req);
         const b = z.object({
             email: z.string().email(),
-            projectId: z.string().min(1).optional(),
-            role: z.enum(["admin", "member"]).default("member")
+            projectId: z.string().min(1),
+            role: z.enum(["admin", "member"]).default("member"),
+            requestId: z.string().min(1).max(200),
+            sendEmail: z.boolean()
         }).parse(req.body);
-        if (b.projectId)
-            await grant(user, b.projectId, true);
-        if (user.role !== "owner" && !b.projectId)
-            fail(403, "Owner required");
+        await grant(user, b.projectId, true);
+        const email = b.email.toLowerCase();
+        const requestScope = `project-invite:${b.projectId}:${user.id}`;
+        const payloadHash = createHash('sha256').update(JSON.stringify([user.id,b.projectId,email,b.role,b.sendEmail])).digest('hex');
         const raw = token();
-        await sql `INSERT INTO wb_invites(digest,email,project_id,role,expires_at) VALUES (${digest(raw)},${b.email.toLowerCase()},${b.projectId ?? null},${b.role},now()+interval '2 days')`;
-        return {
-            token: raw,
-            expiresAt: new Date(Date.now() + 172800000).toISOString()
-        };
+        const reservation = await store.transaction(`invite-request:${requestScope}:${b.requestId}`, async tx => {
+            await grant(user,b.projectId,true,tx);
+            const prior = await tx`SELECT result FROM wb_requests WHERE scope=${requestScope} AND request_id=${b.requestId}`;
+            if (prior[0]) {
+                const result=prior[0].result as {payloadHash?:string;delivery?:string;expiresAt?:string};
+                if(result.payloadHash!==payloadHash)fail(409,'Request ID was already used with a different invitation');
+                return { replay:true, delivery:result.delivery==='sending'?'unknown':result.delivery??'unknown', expiresAt:result.expiresAt };
+            }
+            const project=await store.get<Project>('project',b.projectId,tx);
+            if(!project)fail(404,'Project missing');
+            const expiresAt=new Date(Date.now()+172800000).toISOString();
+            await tx`INSERT INTO wb_invites(digest,email,project_id,role,expires_at) VALUES (${digest(raw)},${email},${b.projectId},${b.role},now()+interval '2 days')`;
+            const delivery=b.sendEmail?(options.inviteMailer?'sending':'unavailable'):'not_requested';
+            await tx`INSERT INTO wb_requests(scope,request_id,result) VALUES (${requestScope},${b.requestId},${tx.json({payloadHash,delivery,expiresAt} as never)})`;
+            return { replay:false, delivery, expiresAt, projectName:project.name };
+        });
+        if(reservation.replay)return {delivery:reservation.delivery,token:null,expiresAt:reservation.expiresAt??null,replay:true};
+        if(reservation.delivery==='sending'&&options.inviteMailer){
+            const mailer=options.inviteMailer;
+            let mailResult:InviteMailResult='unknown';
+            try { mailResult=await mailer({to:email,projectName:reservation.projectName!,role:b.role,url:`${options.inviteOrigin}/workbench/?invite=${encodeURIComponent(raw)}`}); } catch { /* A thrown transport result may follow SMTP acceptance. */ }
+            try {
+                const saved=await sql`UPDATE wb_requests SET result=jsonb_set(result,'{delivery}',to_jsonb(${mailResult}::text)) WHERE scope=${requestScope} AND request_id=${b.requestId} AND result->>'payloadHash'=${payloadHash} RETURNING request_id`;
+                if(!saved[0])return {delivery:'unknown',token:raw,expiresAt:reservation.expiresAt,replay:false};
+            } catch {
+                return {delivery:'unknown',token:raw,expiresAt:reservation.expiresAt,replay:false};
+            }
+            return {delivery:mailResult,token:raw,expiresAt:reservation.expiresAt,replay:false};
+        }
+        return {delivery:reservation.delivery,token:raw,expiresAt:reservation.expiresAt,replay:false};
     });
     app.post("/api/workbench/invites/accept", async (req) => {
         const b = z.object({
