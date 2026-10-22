@@ -635,6 +635,18 @@ it('offers link-only fallback when SMTP is unavailable and clears the old link o
   expect(host.textContent).not.toContain('Invitation link');
 });
 
+it('retries an ambiguous request with the same requestId',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const invite=vi.spyOn(workbenchApi,'invite').mockRejectedValueOnce(new Error('connection lost')).mockResolvedValueOnce({token:'retry-token',expiresAt:null,delivery:'accepted',replay:false});
+  await mount();await flush();await type('retry@example.test','#invite-email');
+  await click('Invite');const firstRequestId=invite.mock.calls[0]![0].requestId;
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite).toHaveBeenCalledTimes(2);expect(invite.mock.calls[1]![0].requestId).toBe(firstRequestId);
+});
+
 describe('mounted invitation acceptance', () => {
   it('joins an invitation as the signed-in account without creating an account or signing in again', async () => {
     window.history.replaceState(null, '', '/workbench/?invite=project-invite');

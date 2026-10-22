@@ -221,7 +221,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         const user = await member(req);
         const projectId = z.string().min(1).parse((req.query as { projectId?: string }).projectId);
         await grant(user, projectId, true);
-        return { emailAvailable: Boolean(options.inviteMailer) };
+        return { emailAvailable: Boolean(options.inviteMailer&&options.inviteOrigin) };
     });
     app.post("/api/workbench/invites", async (req) => {
         const user = await member(req);
@@ -238,7 +238,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
         if (!b.requestId && !b.sendEmail) {
             const raw=token();
             const expiresAt=new Date(Date.now()+172800000).toISOString();
-            await sql`INSERT INTO wb_invites(digest,email,project_id,role,expires_at) VALUES (${digest(raw)},${email},${null},${b.role},now()+interval '2 days')`;
+            await sql`INSERT INTO wb_invites(digest,email,project_id,role,expires_at) VALUES (${digest(raw)},${email},${b.projectId??null},${b.role},now()+interval '2 days')`;
             return {token:raw,expiresAt,delivery:'not_requested',replay:false};
         }
         if (!b.requestId) fail(400,'requestId is required for email invitations');

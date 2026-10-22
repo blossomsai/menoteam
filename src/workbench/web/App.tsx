@@ -1084,6 +1084,7 @@ function Members({ project, snapshot, refresh, setError }: { project: Project; s
   const identityFor=(payload:string)=>{if(requestRef.current?.payload!==payload)requestRef.current={payload,id:crypto.randomUUID()};return requestRef.current.id;};
   const clearInvite=()=>{setInviteUrl('');setDelivery('');requestRef.current=null;};
   useEffect(()=>{clearInvite();},[project.id]);
+  useEffect(()=>{clearInvite();},[emailAvailable]);
   const submitInvite=async(sendEmail:boolean)=>{
     if(busyRef.current)return;busyRef.current=true;setBusy(true);setError('');setDelivery('');
     const normalizedEmail=email.trim().toLowerCase(),payload=JSON.stringify([normalizedEmail,project.id,role,sendEmail]);
