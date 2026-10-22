@@ -619,22 +619,23 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const connectorId=`claim-blockers-${randomUUID()}`;
         const previousToken=connectorToken;
         const priorDefaults=await sql`SELECT id,data,updated_at FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'kind'='provider' AND data->'data'->>'default'='true'`;
-        const ids=new Set<string>();const requestIds:string[]=[];let pId='';let otherProjectId='';let providerId='';
+        const ids=new Set<string>();const requests:{projectId:string;requestId:string}[]=[];let pId='';let otherProjectId='';let providerId='';
         try{
             const p=checkedJson(await user('POST','/projects',{name:`Claim blockers ${randomUUID()}`}));pId=p.id;ids.add(p.id);
             const other=checkedJson(await user('POST','/projects',{name:`Claim blocker other project ${randomUUID()}`}));otherProjectId=other.id;ids.add(other.id);
-            connectorToken=(await enrollProvider(connectorId,[p.id])).token;providerId=fixtureConnections.get(connectorId)!;ids.add(providerId);
+            connectorToken=(await enrollProvider(connectorId,[p.id,other.id])).token;providerId=fixtureConnections.get(connectorId)!;ids.add(providerId);
             const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Claim blocker work',connectionId:providerId}));ids.add(work.id);
-            const enqueue=async(text:string)=>{
-                const requestId=randomUUID();requestIds.push(requestId);
-                const result=checkedJson(await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text,requestId}));
+            const otherWork=checkedJson(await user('POST',`/projects/${other.id}/works`,{title:'Other project blocker work',connectionId:providerId}));ids.add(otherWork.id);
+            const enqueue=async(text:string,targetProjectId=p.id,targetWorkId=work.id)=>{
+                const requestId=randomUUID();requests.push({projectId:targetProjectId,requestId});
+                const result=checkedJson(await user('POST',`/projects/${targetProjectId}/messages`,{workId:targetWorkId,text,requestId}));
                 ids.add(result.message.id);ids.add(result.run.id);return result.run as Run;
             };
             const claim=()=>conn('POST','/claim',{});
             const first=await enqueue('Unacknowledged interrupted run');
             const firstClaim=checkedJson(await claim()).run as Run;
             expect(firstClaim.id).toBe(first.id);
-            await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"')-'stoppedAt' WHERE id=${first.id} AND kind='run'`;
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"')-'stoppedAt' WHERE id=${firstClaim.id} AND kind='run' AND project_id=${p.id}`;
             const second=await enqueue('Wait for stop ACK');
             expect((await claim()).statusCode).toBe(204);
             const ended=checkedJson(await user('POST',`/runs/${first.id}/cancel`,{}));
@@ -644,23 +645,44 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             const ack=checkedJson(await conn('POST',`/runs/${firstClaim.id}/stopped`,{generation:firstClaim.generation}));
             expect(ack).toMatchObject({id:firstClaim.id,generation:firstClaim.generation,status:'cancelled'});
             expect(ack.stoppedAt).toBeTruthy();
-            expect(checkedJson(await claim()).run.id).toBe(second.id);
+            const secondClaim=checkedJson(await claim()).run as Run;
+            expect(secondClaim.id).toBe(second.id);
 
-            const stoppedAt='2026-10-22T10:00:00.000Z';
-            await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(data,'{status}','"interrupted"'),'{stoppedAt}',${sql.json(stoppedAt)}) WHERE id=${second.id} AND kind='run'`;
+            const secondStop=checkedJson(await conn('POST',`/runs/${secondClaim.id}/stopped`,{generation:secondClaim.generation}));
+            expect(secondStop).toMatchObject({id:secondClaim.id,generation:secondClaim.generation,status:'interrupted'});
+            expect(secondStop.stoppedAt).toBeTruthy();
             const third=await enqueue('Stopped interrupted blocks');
             expect((await claim()).statusCode).toBe(204);
-            checkedJson(await user('POST',`/runs/${second.id}/cancel`,{}));
-            expect(checkedJson(await claim()).run.id).toBe(third.id);
+            const secondEnd=checkedJson(await user('POST',`/runs/${second.id}/cancel`,{}));
+            expect(secondEnd).toMatchObject({id:secondClaim.id,status:'cancelled',stoppedAt:secondStop.stoppedAt});
+            const thirdClaim=checkedJson(await claim()).run as Run;
+            expect(thirdClaim.id).toBe(third.id);
+
+            const thirdEnd=checkedJson(await user('POST',`/runs/${thirdClaim.id}/cancel`,{}));
+            expect(thirdEnd).toMatchObject({id:thirdClaim.id,generation:thirdClaim.generation,status:'cancelled'});
+            expect(thirdEnd.stoppedAt).toBeUndefined();
+            const thirdStop=checkedJson(await conn('POST',`/runs/${thirdClaim.id}/stopped`,{generation:thirdClaim.generation}));
+            expect(thirdStop).toMatchObject({id:thirdClaim.id,generation:thirdClaim.generation,status:'cancelled'});
+            expect(thirdStop.stoppedAt).toBeTruthy();
+
+            const otherRun=await enqueue('Independent other project blocker',other.id,otherWork.id);
+            const otherClaim=checkedJson(await claim()).run as Run;
+            expect(otherClaim).toMatchObject({id:otherRun.id,projectId:other.id,workId:otherWork.id});
+            expect(otherClaim.workId).not.toBe(work.id);
+            const otherStop=checkedJson(await conn('POST',`/runs/${otherClaim.id}/stopped`,{generation:otherClaim.generation}));
+            expect(otherStop).toMatchObject({id:otherClaim.id,generation:otherClaim.generation,projectId:other.id,workId:otherWork.id,status:'interrupted'});
+            expect(otherStop.stoppedAt).toBeTruthy();
 
             const fourth=await enqueue('Other project blocker must not fence');
-            await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(jsonb_set(data,'{status}','"interrupted"'),'{stoppedAt}',${sql.json(stoppedAt)}),'{projectId}',${sql.json(otherProjectId)}) WHERE id=${third.id} AND kind='run'`;
             expect(checkedJson(await claim()).run.id).toBe(fourth.id);
+            const otherRecord=(await sql`SELECT project_id,data FROM wb_records WHERE id=${otherClaim.id} AND kind='run'`)[0];
+            expect(otherRecord?.project_id).toBe(other.id);
+            expect(otherRecord?.data).toMatchObject({id:otherClaim.id,projectId:other.id,workId:otherWork.id,status:'interrupted',stoppedAt:otherStop.stoppedAt});
         }finally{
             connectorToken=previousToken;fixtureConnections.delete(connectorId);
             const runIds=[...ids].filter(id=>id.startsWith('run_'));
             if(runIds.length)await sql`DELETE FROM wb_bridge_tokens WHERE run_id=ANY(${runIds})`;
-            if(pId)await sql`DELETE FROM wb_requests WHERE scope=${`message:${pId}`} AND request_id=ANY(${requestIds})`;
+            for(const request of requests)await sql`DELETE FROM wb_requests WHERE scope=${`message:${request.projectId}`} AND request_id=${request.requestId}`;
             if(pId)await sql`DELETE FROM wb_memberships WHERE project_id=${pId}`;
             if(otherProjectId)await sql`DELETE FROM wb_memberships WHERE project_id=${otherProjectId}`;
             if(ids.size)await sql`DELETE FROM wb_records WHERE id=ANY(${[...ids]})`;
