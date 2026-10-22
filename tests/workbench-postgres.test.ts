@@ -2385,9 +2385,15 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect([a.statusCode,b.statusCode]).toEqual([200,200]);expect(sends).toBe(1);
             expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
             expect([a.json().delivery,b.json().delivery]).toContain('accepted');expect([a.json().delivery,b.json().delivery]).toContain('unknown');
+            const initial=[a.json(),b.json()].find(value=>value.token)!;
+            expect(initial.inviteId).toBe(digest(initial.token));expect(a.json().inviteId).toBe(b.json().inviteId);
+            const replay=checkedJson(await user('POST','/invites',payload));
+            expect(replay).toMatchObject({inviteId:initial.inviteId,token:null,replay:true});expect(sends).toBe(1);
             expect((await user('POST','/invites',{...payload,role:'admin'})).statusCode).toBe(409);expect(sends).toBe(1);
             const request=await sql`SELECT result::text AS value FROM wb_requests WHERE request_id=${requestId}`;
             expect(JSON.stringify(request)).not.toContain(email);expect(JSON.stringify(request)).not.toContain('https://');
+            expect(JSON.stringify(request)).not.toContain(initial.token);
+            expect(Object.keys(JSON.parse(request[0]!.value)).sort()).toEqual(['delivery','expiresAt','inviteId','payloadHash']);
         }finally{release();await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
     });
 
@@ -2399,6 +2405,12 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             expect(unavailable.statusCode).toBe(503);expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(0);
             const link=await user('POST','/invites',{email,projectId:project.id,role:'member',requestId:requestIds[1],sendEmail:false});
             expect(link.statusCode).toBe(200);expect(link.json()).toMatchObject({delivery:'not_requested',replay:false});expect(link.json().token).toBeTruthy();
+            expect(link.json().inviteId).toBe(digest(link.json().token));
+            const replayPayload={email,projectId:project.id,role:'member',requestId:requestIds[1],sendEmail:false};
+            expect(checkedJson(await user('POST','/invites',replayPayload))).toMatchObject({inviteId:link.json().inviteId,token:null,replay:true});
+            // Existing request receipts predate inviteId; replay must not invent a row identity.
+            await sql`UPDATE wb_requests SET result=result-'inviteId' WHERE request_id=${requestIds[1]}`;
+            expect(checkedJson(await user('POST','/invites',replayPayload))).toMatchObject({inviteId:null,token:null,replay:true});
             expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
         }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=ANY(${requestIds})`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
     });
@@ -2415,6 +2427,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         try{
             const first=await user('POST','/invites',payload);expect(first.statusCode).toBe(200);expect(first.json().delivery).toBe(throws?'unknown':result);expect(sends).toBe(1);
             const replay=await user('POST','/invites',payload);expect(replay.statusCode).toBe(200);expect(replay.json()).toMatchObject({delivery:throws?'unknown':result,token:null,replay:true});expect(sends).toBe(1);
+            expect(first.json().inviteId).toBe(digest(first.json().token));expect(replay.json().inviteId).toBe(first.json().inviteId);
             expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
         }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
     });
@@ -2429,6 +2442,7 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         try{
             const first=await user('POST','/invites',payload);expect(first.statusCode).toBe(200);expect(first.json().delivery).toBe('unknown');expect(sends).toBe(1);
             const replay=await user('POST','/invites',payload);expect(replay.statusCode).toBe(200);expect(replay.json()).toMatchObject({delivery:'unknown',token:null,replay:true});expect(sends).toBe(1);
+            expect(first.json().inviteId).toBe(digest(first.json().token));expect(replay.json().inviteId).toBe(first.json().inviteId);
             expect(await sql`SELECT request_id FROM wb_requests WHERE request_id=${requestId}`).toHaveLength(1);
         }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
     });
@@ -2768,6 +2782,7 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
         const inviteAndAccept = async (inviteEmail: string, projectId: string | undefined, role: 'admin' | 'member') => {
             const payload = { email: inviteEmail, ...(projectId ? { projectId } : {}), role };
             const invite = checkedJson(await ownerPost('/invites', payload));
+            expect(invite.inviteId).toBe(digest(invite.token));
             const accepted = await app.inject({
                 method: 'POST', url: '/api/workbench/invites/accept',
                 payload: { token: invite.token, name: 'Invite fixture', password: 'invite-fixture-password-123' }

@@ -695,7 +695,7 @@ it('clears a revoked link and uses a new requestId for an intentional reinvite w
   const invite=vi.spyOn(workbenchApi,'invite').mockImplementation(async(input)=>{
     const id=`invite-${++created}`,token=`token-${created}`;
     pendingInvites.push({id,email:input.email,role:input.role as 'member'|'admin',expiresAt:'2026-10-24T00:00:00.000Z'});
-    return {token,expiresAt:'2026-10-24T00:00:00.000Z',delivery:'accepted',replay:false};
+    return {inviteId:id,token,expiresAt:'2026-10-24T00:00:00.000Z',delivery:'accepted',replay:false};
   });
   await mount();await flush();await type('same@example.test','#invite-email');
   responses.push(Promise.resolve(snapshot('A')));await click('Invite');
@@ -730,7 +730,7 @@ it('keeps a newer invitation pending when an older deferred revoke completes',as
   const revoke=deferred<{revoked:true}>();
   vi.spyOn(workbenchApi,'revokeInvite').mockReturnValue(revoke.promise);
   const pendingB=deferred<Awaited<ReturnType<typeof workbenchApi.invite>>>();
-  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValueOnce({token:'token-a',expiresAt:null,delivery:'accepted',replay:false}).mockReturnValueOnce(pendingB.promise);
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValueOnce({inviteId:'invite-a',token:'token-a',expiresAt:null,delivery:'accepted',replay:false}).mockReturnValueOnce(pendingB.promise);
   await mount();await flush();await type('a@example.test','#invite-email');
   responses.push(Promise.resolve(snapshot('A')));await click('Invite');
   expect(host.textContent).toContain('token-a');
@@ -781,13 +781,48 @@ it('restores an uncertain attempt after a failed revoke and safely replays its r
   vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
   vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[{id:'uncertain-invite',email:'uncertain@example.test',role:'member',expiresAt:'2026-10-24T00:00:00.000Z'}]});
   vi.spyOn(workbenchApi,'revokeInvite').mockRejectedValueOnce(new Error('revoke failed'));
-  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValueOnce({token:'uncertain-token',expiresAt:null,delivery:'unknown',replay:false}).mockResolvedValueOnce({token:null,expiresAt:null,delivery:'unknown',replay:true});
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValueOnce({inviteId:'uncertain-invite',token:'uncertain-token',expiresAt:null,delivery:'unknown',replay:false}).mockResolvedValueOnce({token:null,expiresAt:null,delivery:'unknown',replay:true});
   await mount();await flush();await type('uncertain@example.test','#invite-email');
   responses.push(Promise.resolve(snapshot('A')));await click('Create link');
   const submitted=invite.mock.calls[0]![0];
   await click('Revoke');expect(invite).toHaveBeenCalledOnce();expect(host.textContent).toContain('uncertain-token');
   responses.push(Promise.resolve(snapshot('A')));await click('Create link');
   expect(invite.mock.calls[1]![0]).toEqual(submitted);expect(host.textContent).toContain('outcome is unknown');
+});
+
+it.each(['response','lost ACK'] as const)('keeps the exact second invite when revoking an older same-payload row (%s)',async(outcome)=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  const ids=['1'.repeat(64),'2'.repeat(64),'3'.repeat(64)];
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  let rows:Array<{id:string;email:string;role:'member';expiresAt:string}>=[];
+  vi.spyOn(workbenchApi,'projectInvites').mockImplementation(async()=>({invites:[...rows]}));
+  const oldRevoke=deferred<{revoked:true}>();
+  const revoke=vi.spyOn(workbenchApi,'revokeInvite').mockImplementation(async(id)=>{if(id===ids[0])await oldRevoke.promise;rows=rows.filter(row=>row.id!==id);return {revoked:true};});
+  let calls=0;
+  const invite=vi.spyOn(workbenchApi,'invite').mockImplementation(async(input)=>{
+    calls++;
+    if(calls===3)return {inviteId:ids[1],token:null,expiresAt:null,delivery:'unknown',replay:true};
+    const index=calls===4?2:calls-1;
+    rows.push({id:ids[index]!,email:input.email,role:'member',expiresAt:'2026-10-24T00:00:00.000Z'});
+    if(calls===2&&outcome==='lost ACK')throw new Error('ACK lost');
+    return {inviteId:ids[index],token:`exact-token-${index+1}`,expiresAt:null,delivery:calls===2?'unknown':'accepted',replay:false};
+  });
+  await mount();await flush();await type('same@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  const firstId=invite.mock.calls[0]![0].requestId;
+  if(outcome==='response')responses.push(Promise.resolve(snapshot('A')));
+  await click('Invite');const secondRequest=invite.mock.calls[1]![0];expect(secondRequest.requestId).not.toBe(firstId);
+  const revokeRow=async(index:number)=>{await flush(()=>host.querySelectorAll('ul')[host.querySelectorAll('ul').length-1]!.querySelectorAll('li')[index]!.querySelector<HTMLButtonElement>('button')!.click());};
+  await revokeRow(0);await flush(()=>oldRevoke.resolve({revoked:true}));await flush();
+  expect(revoke).toHaveBeenLastCalledWith(ids[0]);expect(host.textContent).toContain('outcome is unknown');
+  if(outcome==='response')expect(host.textContent).toContain('exact-token-2');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite.mock.calls[2]![0]).toEqual(secondRequest);expect(host.textContent).toContain('outcome is unknown');
+  await revokeRow(0);expect(revoke).toHaveBeenLastCalledWith(ids[1]);
+  expect(host.textContent).not.toContain('outcome is unknown');expect(host.textContent).not.toContain('exact-token-2');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite.mock.calls[3]![0].requestId).not.toBe(secondRequest.requestId);expect(host.textContent).toContain('exact-token-3');
 });
 
 describe('mounted invitation acceptance', () => {

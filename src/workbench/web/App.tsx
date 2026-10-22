@@ -1075,7 +1075,7 @@ function Instructions({ project, member, refresh, setError }: { project: Project
 
 function Members({ project, snapshot, refresh, setError }: { project: Project; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {
   type InviteRequest = Readonly<{ email: string; projectId: string; role: Member['role']; sendEmail: boolean; requestId: string }>;
-  type InviteAttempt = Readonly<{ request: InviteRequest; phase: 'pending' | 'unknown' | 'complete' | 'revoking'; delivery: string; url: string }>;
+  type InviteAttempt = Readonly<{ request: InviteRequest; phase: 'pending' | 'unknown' | 'complete' | 'revoking'; delivery: string; url: string; inviteId: string | null }>;
   const [email, setEmail] = useState(''); const [role, setRole] = useState<Member['role']>('member');
   const [emailAvailability, setEmailAvailability] = useState<'loading' | 'available' | 'unavailable' | 'error'>('loading');
   const [attempt, setAttempt] = useState<InviteAttempt | null>(null);
@@ -1094,7 +1094,7 @@ function Members({ project, snapshot, refresh, setError }: { project: Project; s
     if(previous?.phase==='pending'||previous?.phase==='revoking')return;
     const payload={email:email.trim().toLowerCase(),projectId:project.id,role,sendEmail};
     const retry=previous?.phase==='unknown'&&previous.request.email===payload.email&&previous.request.projectId===payload.projectId&&previous.request.role===payload.role&&previous.request.sendEmail===payload.sendEmail;
-    const pending:InviteAttempt={request:retry?previous.request:{...payload,requestId:crypto.randomUUID()},phase:'pending',delivery:retry?previous.delivery:'',url:retry?previous.url:''};
+    const pending:InviteAttempt={request:retry?previous.request:{...payload,requestId:crypto.randomUUID()},phase:'pending',delivery:retry?previous.delivery:'',url:retry?previous.url:'',inviteId:retry?previous.inviteId:null};
     // The ref is also the synchronous double-submit gate. Each snapshot fences its own completion.
     updateAttempt(pending);setError('');
     try {
@@ -1102,7 +1102,7 @@ function Members({ project, snapshot, refresh, setError }: { project: Project; s
       if(attemptRef.current!==pending)return;
       const outcome=result.delivery??'not_requested';let url=pending.url;
       if(result.token){const link=new URL('/workbench/',window.location.origin);link.searchParams.set('invite',result.token);url=link.toString();}
-      const completed:InviteAttempt={...pending,phase:outcome==='unknown'?'unknown':'complete',delivery:outcome,url};
+      const completed:InviteAttempt={...pending,phase:outcome==='unknown'?'unknown':'complete',delivery:outcome,url,inviteId:result.inviteId??pending.inviteId};
       updateAttempt(completed);
       try { await load(); await refresh(); } catch(cause) { if(attemptRef.current===completed)setError(errorMessage(cause)); }
     } catch(cause) {
@@ -1117,7 +1117,7 @@ function Members({ project, snapshot, refresh, setError }: { project: Project; s
   const revokeInvite=async(invite:typeof invites[number])=>{
     const started=attemptRef.current;
     if(started?.phase==='pending'||started?.phase==='revoking')return;
-    const related=started&&started.request.projectId===project.id&&started.request.email===invite.email.toLowerCase()&&started.request.role===invite.role;
+    const related=started?.inviteId!=null&&started.inviteId===invite.id;
     const revoking:InviteAttempt|null=related?{...started,phase:'revoking'}:null;
     if(revoking)updateAttempt(revoking);
     try {
