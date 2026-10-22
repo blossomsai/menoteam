@@ -748,10 +748,25 @@ describe('mounted provider connection settings', () => {
     expect(summaries[1]?.querySelectorAll('a[href^="#run-"]')).toHaveLength(4);
     expect(summaries[0]?.querySelector('a[href="#run-delivery-middle"]')).toBeTruthy();
     expect(summaries[1]?.querySelector('a[href="#run-delivery-middle"]')).toBeNull();
+    await type('input[aria-label="Message Master"]', 'Draft survives blocker navigation');
+    const composer = host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')!;
+    const route = window.location.href;
+    const pushState = vi.spyOn(window.history, 'pushState');
     for (const link of [...host.querySelectorAll('section[aria-label^="Runs blocking Master"] a[href^="#run-"]')]) {
       const target = host.querySelector(link.getAttribute('href')!);
       expect(target?.querySelector('strong')?.textContent).toBe(link.textContent);
+      // Observe after the real router's document listener; suppress only the DOM
+      // emulator's native activation, which cannot verify browser scrolling.
+      let intercepted = true;
+      window.addEventListener('click', event => { intercepted = event.defaultPrevented; event.preventDefault(); }, { once: true });
+      await flush(() => link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 })));
+      expect(intercepted).toBe(false);
     }
+    expect(pushState).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(route);
+    expect(host.querySelector('input[aria-label="Message Master"]')).toBe(composer);
+    expect(composer.value).toBe('Draft survives blocker navigation');
+    expect(snapshotRequest).not.toHaveBeenCalled();
     expect(host.querySelector('#run-blocked-interrupted button')?.textContent).toBe('End');
     expect(host.querySelector('#run-blocked-interrupted')?.textContent).toContain('End or wait for stop confirmation');
     expect([...host.querySelectorAll('#run-blocked-interrupted button')].some(item => item.textContent === 'Resume')).toBe(false);
