@@ -598,6 +598,43 @@ beforeEach(() => {
 });
 afterEach(async () => { await flush(() => root.unmount()); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
+it('uses one email request while busy and keeps Copy link available after acceptance', async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const pending=deferred<{token:string|null;expiresAt:string|null;delivery:'accepted';replay:false}>();
+  const invite=vi.spyOn(workbenchApi,'invite').mockReturnValue(pending.promise);
+  await mount(); await flush();
+  await type('invitee@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));
+  const form=host.querySelector<HTMLInputElement>('#invite-email')!.closest('form')!;
+  await flush(()=>{form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});
+  expect(invite).toHaveBeenCalledTimes(1);
+  expect(invite.mock.calls[0]![0]).toMatchObject({email:'invitee@example.test',projectId:'project',sendEmail:true});
+  expect(invite.mock.calls[0]![0].requestId).toBeTruthy();
+  await flush(()=>pending.resolve({token:'fresh-token',expiresAt:null,delivery:'accepted',replay:false})); await flush();
+  expect(host.textContent).toContain('inbox delivery is not confirmed');
+  expect(host.textContent).toContain('Copy link');
+});
+
+it('offers link-only fallback when SMTP is unavailable and clears the old link on recipient change',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:false});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValue({token:'link-token',expiresAt:null,delivery:'not_requested',replay:false});
+  await mount();await flush();
+  expect(host.textContent).toContain('Email sending is unavailable');
+  await type('first@example.test','#invite-email');responses.push(Promise.resolve(snapshot('A')));
+  await click('Create link');
+  expect(invite).toHaveBeenCalledWith(expect.objectContaining({sendEmail:false,email:'first@example.test',requestId:expect.any(String)}));
+  expect(host.textContent).toContain('Copy link');
+  await type('second@example.test','#invite-email');
+  expect(host.textContent).not.toContain('link-token');
+  expect(host.textContent).not.toContain('Invitation link');
+});
+
 describe('mounted invitation acceptance', () => {
   it('joins an invitation as the signed-in account without creating an account or signing in again', async () => {
     window.history.replaceState(null, '', '/workbench/?invite=project-invite');

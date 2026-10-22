@@ -119,7 +119,7 @@ export const workbenchApi = {
   saveSetting: (input: { kind: Setting['kind']; projectId?: string; name: string; data: Record<string, unknown> }) => request<Setting>('/settings', { method: 'POST', body: JSON.stringify(input) }),
   updateSetting: (id: string, input: { name?: string; data?: Record<string, unknown>; expectedUpdatedAt?: string }) => request<Setting>(`/settings/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(input) }),
   copyProjectSkill: (id: string) => request<Setting>(`/settings/${encodeURIComponent(id)}/copy-to-workspace`, { method: 'POST', body: '{}' }),
-  invite: (input: { email: string; projectId: string; role: Member['role']; requestId: string; sendEmail: boolean }) => request<{ token: string | null; expiresAt: string | null; delivery: 'accepted' | 'failed' | 'unknown' | 'unavailable' | 'not_requested'; replay: boolean }>('/invites', { method: 'POST', body: JSON.stringify(input) }),
+  invite: (input: { email: string; projectId?: string; role: Member['role']; requestId?: string; sendEmail?: boolean }) => request<{ token: string | null; expiresAt: string | null; delivery?: 'accepted' | 'failed' | 'unknown' | 'unavailable' | 'not_requested'; replay?: boolean }>('/invites', { method: 'POST', body: JSON.stringify(input) }),
   acceptInvite: (input: { token: string; name: string; password: string }) => request<{ accepted: true; email: string }>('/invites/accept', { method: 'POST', body: JSON.stringify(input) }),
   joinInvite: (token: string) => request<{ accepted: true }>('/invites/join', { method: 'POST', body: JSON.stringify({ token }) }),
 };

@@ -2371,6 +2371,38 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await sql`UPDATE wb_records SET data=data #- '{data,files,0,fileSha256}' WHERE id=${parent.id}`;expect((await memberRead()).json()).toMatchObject({complete:false,incomplete:true});
     },20000);
 
+    it('sends one invitation for concurrent idempotent email submits and rejects changed payloads',async()=>{
+        const project=checkedJson(await user('POST','/projects',{name:`Invite mail ${randomUUID()}`})) as Project;
+        let sends=0;let release!:()=>void;const waiting=new Promise<void>(resolve=>{release=resolve;});
+        await app.close();
+        app=await createWorkbenchApp({sql,inviteOrigin:'https://workbench.example.test',inviteMailer:async()=>{sends++;await waiting;return 'accepted';}});
+        const email=`invite-mail-${randomUUID()}@test.example`,requestId=randomUUID();
+        const payload={email,projectId:project.id,role:'member',requestId,sendEmail:true};
+        try{
+            const first=user('POST','/invites',payload),second=user('POST','/invites',payload);
+            await new Promise(resolve=>setTimeout(resolve,30));release();
+            const [a,b]=await Promise.all([first,second]);
+            expect([a.statusCode,b.statusCode]).toEqual([200,200]);expect(sends).toBe(1);
+            expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
+            expect([a.json().delivery,b.json().delivery]).toContain('accepted');expect([a.json().delivery,b.json().delivery]).toContain('unknown');
+            expect((await user('POST','/invites',{...payload,role:'admin'})).statusCode).toBe(409);expect(sends).toBe(1);
+            const request=await sql`SELECT result::text AS value FROM wb_requests WHERE request_id=${requestId}`;
+            expect(JSON.stringify(request)).not.toContain(email);expect(JSON.stringify(request)).not.toContain('https://');
+        }finally{release();await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
+    });
+
+    it('rejects email without SMTP before insert and preserves explicit link fallback',async()=>{
+        const project=checkedJson(await user('POST','/projects',{name:`Invite fallback ${randomUUID()}`})) as Project;
+        const email=`invite-fallback-${randomUUID()}@test.example`,requestIds=[randomUUID(),randomUUID()];
+        try{
+            const unavailable=await user('POST','/invites',{email,projectId:project.id,role:'member',requestId:requestIds[0],sendEmail:true});
+            expect(unavailable.statusCode).toBe(503);expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(0);
+            const link=await user('POST','/invites',{email,projectId:project.id,role:'member',requestId:requestIds[1],sendEmail:false});
+            expect(link.statusCode).toBe(200);expect(link.json()).toMatchObject({delivery:'not_requested',replay:false});expect(link.json().token).toBeTruthy();
+            expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
+        }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=ANY(${requestIds})`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
+    });
+
 });
 
 describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
@@ -2683,8 +2715,9 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
         const suffix = randomUUID();
         const email = (name: string) => `${name}-${suffix}@test.example`;
         const ownerEmail = email('workspace-owner');
+        let unauthorizedSends=0;
         await app.close();
-        app = await createWorkbenchApp({ sql, bootstrapEmail: ownerEmail, bootstrapPassword: 'invite-owner-password-123' });
+        app = await createWorkbenchApp({ sql, bootstrapEmail: ownerEmail, bootstrapPassword: 'invite-owner-password-123', inviteOrigin:'https://workbench.example.test', inviteMailer:async()=>{unauthorizedSends++;return 'accepted';} });
         const ownerLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: ownerEmail, password: 'invite-owner-password-123' } });
         expect(ownerLogin.statusCode).toBe(200);
         const ownerSession = String(ownerLogin.headers['set-cookie']).split(';')[0]!;
@@ -2765,8 +2798,11 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             expect(await inviteCount(email('denied-unscoped'))).toBe(beforeUnscoped);
             await denied(await sessionPost(projectAdmin.session, { email: email('denied-other-project'), projectId: otherProject.id, role: 'admin' }));
             expect(await inviteCount(email('denied-other-project'))).toBe(0);
+            await denied(await sessionPost(projectAdmin.session,{email:email('denied-crossscope-send'),projectId:otherProject.id,role:'member',requestId:randomUUID(),sendEmail:true}));
             await denied(await sessionPost(ordinarySession, { email: email('denied-ordinary-member'), projectId: project.id, role: 'admin' }));
             expect(await inviteCount(email('denied-ordinary-member'))).toBe(0);
+            await denied(await sessionPost(ordinarySession,{email:email('denied-member-send'),projectId:project.id,role:'member',requestId:randomUUID(),sendEmail:true}));
+            expect(unauthorizedSends).toBe(0);
 
             const deniedWorkspaceEmail = email('denied-workspace');
             await denied(await sessionPost(projectAdmin.session, { email: deniedWorkspaceEmail, role: 'member' }));
@@ -2786,6 +2822,7 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             await sql`DELETE FROM wb_records WHERE id=ANY(${[project.id, otherProject.id]}) AND kind='project'`;
         }
     });
+
 });
 
 describe.skipIf(!url)('Slack durable reply PostgreSQL',()=>{
