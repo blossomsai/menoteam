@@ -722,6 +722,51 @@ describe('mounted provider connection settings', () => {
     }
   });
 
+  it('shows every visible run blocking queued Master and keeps actions exact and manual', async () => {
+    const queued = { id: 'queued-master', projectId: project.id, kind: 'master' as const, prompt: '', model: 'gpt-6-luna', reasoning: 'medium', status: 'queued' as const, generation: 0, createdAt: '2026-10-22T10:00:00.000Z', updatedAt: '2026-10-22T10:00:00.000Z' };
+    const unconfirmed = { id: 'blocked-interrupted', projectId: project.id, workId: undefined, kind: 'implementation' as const, prompt: '', model: 'gpt-6.1-sol', reasoning: 'medium', status: 'interrupted' as const, generation: 1, createdAt: '2026-10-22T09:00:00.000Z', updatedAt: '2026-10-22T09:00:00.000Z' };
+    const unconfirmedPaused = { id: 'blocked-paused', projectId: project.id, workId: undefined, kind: 'review' as const, prompt: '', model: 'gpt-6.1-sol', reasoning: 'medium', status: 'paused' as const, generation: 1, createdAt: '2026-10-22T09:30:00.000Z', updatedAt: '2026-10-22T09:30:00.000Z' };
+    const stopped = { ...unconfirmedPaused, id: 'resumable-paused', stoppedAt: '2026-10-22T09:45:00.000Z' };
+    const current = snapshot(); current.runs = [queued, unconfirmed, unconfirmedPaused, stopped];
+    window.history.replaceState(null, '', `/workbench/?view=master&project=${project.id}`);
+    const afterEnd = snapshot(); afterEnd.runs = [queued, { ...unconfirmed, status: 'cancelled', stoppedAt: '2026-10-22T10:05:00.000Z' }, unconfirmedPaused, stopped];
+    const end = vi.spyOn(workbenchApi, 'cancelRun').mockResolvedValue({ ...unconfirmed, status: 'cancelled' } as Snapshot['runs'][number]);
+    const resume = vi.spyOn(workbenchApi, 'resumeRun').mockResolvedValue(stopped as Snapshot['runs'][number]);
+    await mount(current);
+    const snapshotRequest = vi.spyOn(workbenchApi, 'snapshot').mockResolvedValueOnce(afterEnd);
+
+    const summary = host.querySelector('[aria-label="Visible runs blocking queued Master"]');
+    expect(summary?.textContent).toContain('Other queue constraints may also apply');
+    expect(summary?.querySelectorAll('a[href^="#run-"]')).toHaveLength(2);
+    expect(summary?.textContent).toContain('implementation run · interrupted');
+    expect(summary?.textContent).toContain('review run · paused');
+    expect(summary?.textContent).toContain(new Date(unconfirmed.createdAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' }));
+    expect(summary?.textContent).toContain(`#${unconfirmed.id.slice(-8)}`);
+    expect(host.querySelector('#run-blocked-interrupted button')?.textContent).toBe('End');
+    expect([...host.querySelectorAll('#run-blocked-interrupted button')].some(item => item.textContent === 'Resume')).toBe(false);
+    expect(host.querySelector('#run-blocked-paused button')?.textContent).toBe('End');
+    expect([...host.querySelectorAll('#run-blocked-paused button')].some(item => item.textContent === 'Resume')).toBe(false);
+    expect([...host.querySelectorAll('#run-resumable-paused button')].some(item => item.textContent === 'Resume')).toBe(true);
+    expect(end).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled();
+
+    await flush(() => [...host.querySelectorAll('#run-blocked-interrupted button')].find(item => item.textContent === 'End')!.click());
+    expect(end).toHaveBeenCalledWith(unconfirmed.id);
+    expect(snapshotRequest).toHaveBeenCalledTimes(1);
+    expect(host.querySelector('[aria-label="Visible runs blocking queued Master"] a[href="#run-blocked-interrupted"]')).toBeNull();
+    expect(host.querySelector('[aria-label="Visible runs blocking queued Master"] a[href^="#run-"]')).toBeTruthy();
+    expect(host.textContent).toContain('review run · paused');
+    await flush(() => [...host.querySelectorAll('#run-resumable-paused button')].find(item => item.textContent === 'Resume')!.click());
+    expect(resume).toHaveBeenCalledWith(stopped.id);
+  });
+
+  it('keeps ordinary Queued when no visible run matches the blocking rule', async () => {
+    const current = snapshot(); current.runs = [{ id: 'queued-master-only', projectId: project.id, kind: 'master', prompt: '', model: 'gpt-6-luna', reasoning: 'medium', status: 'queued', generation: 0, createdAt: '2026-10-22T10:00:00.000Z', updatedAt: '2026-10-22T10:00:00.000Z' } as Snapshot['runs'][number]];
+    window.history.replaceState(null, '', `/workbench/?view=master&project=${project.id}`);
+    await mount(current);
+    expect(host.querySelector('[aria-label="Visible runs blocking queued Master"]')).toBeNull();
+    expect(host.querySelector('#run-queued-master-only')?.textContent).toContain('queued');
+  });
+
   it('does not offer cancel or end for an effectful interrupted delivery', async () => {
     const work = { id: 'delivery-cancel-work', projectId: project.id, title: 'Published delivery', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
     const delivery = { id: 'effectful-interrupted-delivery', projectId: project.id, workId: work.id, targetRunId: 'candidate', kind: 'delivery' as const, prompt: '', model: 'internal', reasoning: 'none', status: 'interrupted' as const, generation: 2, createdAt: '', updatedAt: '', operation: { action: 'create_draft_pr', actorId: owner.id, candidateRunId: 'candidate', candidateRevision: 'candidate-revision', artifactRevision: 'candidate-revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/blossomsai/menoteam', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/candidate', workTitle: work.title, changeSummary: 'published', qaStatus: 'current', phase: 'pr_created', effectIntentGeneration: 2, external: { pullRequestNumber: 42, pullRequestUrl: 'https://github.com/blossomsai/menoteam/pull/42' } } } as Snapshot['runs'][number];

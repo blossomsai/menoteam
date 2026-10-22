@@ -615,6 +615,56 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         const pausedProven=((await user('GET','/snapshot')).json().runs as SnapshotRun[]).find(run=>run.id===fourthClaim.id)!;
         expect(pausedProven.status).toBe('cancelled');expect(pausedProven.stoppedAt).toBe(pausedStoppedAt);
     });
+    it('keeps claim fenced through unacknowledged End and stopped interrupted runs, while ignoring other projects',async()=>{
+        const connectorId=`claim-blockers-${randomUUID()}`;
+        const previousToken=connectorToken;
+        const priorDefaults=await sql`SELECT id,data,updated_at FROM wb_records WHERE kind='setting' AND project_id IS NULL AND data->>'kind'='provider' AND data->'data'->>'default'='true'`;
+        const ids=new Set<string>();const requestIds:string[]=[];let pId='';let otherProjectId='';let providerId='';
+        try{
+            const p=checkedJson(await user('POST','/projects',{name:`Claim blockers ${randomUUID()}`}));pId=p.id;ids.add(p.id);
+            const other=checkedJson(await user('POST','/projects',{name:`Claim blocker other project ${randomUUID()}`}));otherProjectId=other.id;ids.add(other.id);
+            const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Claim blocker work'}));ids.add(work.id);
+            connectorToken=(await enrollProvider(connectorId,[p.id])).token;providerId=fixtureConnections.get(connectorId)??'';if(providerId)ids.add(providerId);
+            const enqueue=async(text:string)=>{
+                const requestId=randomUUID();requestIds.push(requestId);
+                const result=checkedJson(await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text,requestId}));
+                ids.add(result.message.id);ids.add(result.run.id);return result.run as Run;
+            };
+            const claim=()=>conn('POST','/claim',{});
+            const first=await enqueue('Unacknowledged interrupted run');
+            expect(checkedJson(await claim()).run.id).toBe(first.id);
+            await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"')-'stoppedAt' WHERE id=${first.id} AND kind='run'`;
+            const second=await enqueue('Wait for stop ACK');
+            expect((await claim()).statusCode).toBe(204);
+            checkedJson(await user('POST',`/runs/${first.id}/cancel`,{}));
+            expect((await claim()).statusCode).toBe(204);
+            const ack=checkedJson(await conn(`/runs/${first.id}/stopped`,{generation:first.generation}));
+            expect(ack.stoppedAt).toBeTruthy();
+            expect(checkedJson(await claim()).run.id).toBe(second.id);
+
+            const stoppedAt='2026-10-22T10:00:00.000Z';
+            await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(data,'{status}','"interrupted"'),'{stoppedAt}',${sql.json(stoppedAt)}) WHERE id=${second.id} AND kind='run'`;
+            const third=await enqueue('Stopped interrupted blocks');
+            expect((await claim()).statusCode).toBe(204);
+            checkedJson(await user('POST',`/runs/${second.id}/cancel`,{}));
+            expect(checkedJson(await claim()).run.id).toBe(third.id);
+
+            const fourth=await enqueue('Other project blocker must not fence');
+            await sql`UPDATE wb_records SET data=jsonb_set(jsonb_set(jsonb_set(data,'{status}','"interrupted"'),'{stoppedAt}',${sql.json(stoppedAt)}),'{projectId}',${sql.json(otherProjectId)}) WHERE id=${third.id} AND kind='run'`;
+            expect(checkedJson(await claim()).run.id).toBe(fourth.id);
+        }finally{
+            connectorToken=previousToken;fixtureConnections.delete(connectorId);
+            const runIds=[...ids].filter(id=>id.startsWith('run_'));
+            if(runIds.length)await sql`DELETE FROM wb_bridge_tokens WHERE run_id=ANY(${runIds})`;
+            if(pId)await sql`DELETE FROM wb_requests WHERE scope=${`message:${pId}`} AND request_id=ANY(${requestIds})`;
+            if(pId)await sql`DELETE FROM wb_memberships WHERE project_id=${pId}`;
+            if(otherProjectId)await sql`DELETE FROM wb_memberships WHERE project_id=${otherProjectId}`;
+            if(ids.size)await sql`DELETE FROM wb_records WHERE id=ANY(${[...ids]})`;
+            if(providerId)await sql`DELETE FROM wb_records WHERE id=${providerId} AND kind='setting'`;
+            await sql`DELETE FROM wb_connectors WHERE id=${connectorId}`;
+            for(const setting of priorDefaults)await sql`UPDATE wb_records SET data=${sql.json(setting.data as never)},updated_at=${setting.updated_at} WHERE id=${setting.id} AND kind='setting'`;
+        }
+    });
     it("signed inbound sources are scoped, deduplicated and never directly execute", async () => {
         const p = (await user("POST", "/projects", {
             name: "Sources",
