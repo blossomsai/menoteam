@@ -632,13 +632,17 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
             };
             const claim=()=>conn('POST','/claim',{});
             const first=await enqueue('Unacknowledged interrupted run');
-            expect(checkedJson(await claim()).run.id).toBe(first.id);
+            const firstClaim=checkedJson(await claim()).run as Run;
+            expect(firstClaim.id).toBe(first.id);
             await sql`UPDATE wb_records SET data=jsonb_set(data,'{status}','"interrupted"')-'stoppedAt' WHERE id=${first.id} AND kind='run'`;
             const second=await enqueue('Wait for stop ACK');
             expect((await claim()).statusCode).toBe(204);
-            checkedJson(await user('POST',`/runs/${first.id}/cancel`,{}));
+            const ended=checkedJson(await user('POST',`/runs/${first.id}/cancel`,{}));
+            expect(ended).toMatchObject({id:firstClaim.id,generation:firstClaim.generation,status:'cancelled'});
+            expect(ended.stoppedAt).toBeUndefined();
             expect((await claim()).statusCode).toBe(204);
-            const ack=checkedJson(await conn(`/runs/${first.id}/stopped`,{generation:first.generation}));
+            const ack=checkedJson(await conn('POST',`/runs/${firstClaim.id}/stopped`,{generation:firstClaim.generation}));
+            expect(ack).toMatchObject({id:firstClaim.id,generation:firstClaim.generation,status:'cancelled'});
             expect(ack.stoppedAt).toBeTruthy();
             expect(checkedJson(await claim()).run.id).toBe(second.id);
 

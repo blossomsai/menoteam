@@ -753,10 +753,12 @@ describe('mounted provider connection settings', () => {
       expect(target?.querySelector('strong')?.textContent).toBe(link.textContent);
     }
     expect(host.querySelector('#run-blocked-interrupted button')?.textContent).toBe('End');
+    expect(host.querySelector('#run-blocked-interrupted')?.textContent).toContain('End or wait for stop confirmation');
     expect([...host.querySelectorAll('#run-blocked-interrupted button')].some(item => item.textContent === 'Resume')).toBe(false);
     expect(host.querySelector('#run-blocked-paused button')?.textContent).toBe('End');
     expect([...host.querySelectorAll('#run-blocked-paused button')].some(item => item.textContent === 'Resume')).toBe(false);
     expect([...host.querySelectorAll('#run-resumable-interrupted button')].some(item => item.textContent === 'Resume')).toBe(true);
+    expect(host.querySelector('#run-resumable-interrupted')?.textContent).toContain('Resume or End');
     expect([...host.querySelectorAll('#run-resumable-paused button')].some(item => item.textContent === 'Resume')).toBe(true);
     expect(end).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled(); expect(reconcile).not.toHaveBeenCalled();
 
@@ -779,18 +781,24 @@ describe('mounted provider connection settings', () => {
     expect(host.querySelector('#run-queued-master-only')?.textContent).toContain('Master · Queued');
   });
 
-  it('does not offer cancel or end for an effectful interrupted delivery', async () => {
+  it.each([false, true])('does not advertise unsupported actions for an effectful interrupted delivery (stopped=%s)', async stopped => {
     const work = { id: 'delivery-cancel-work', projectId: project.id, title: 'Published delivery', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
     const delivery = { id: 'effectful-interrupted-delivery', projectId: project.id, workId: work.id, targetRunId: 'candidate', kind: 'delivery' as const, prompt: '', model: 'internal', reasoning: 'none', status: 'interrupted' as const, generation: 2, createdAt: '', updatedAt: '', operation: { action: 'create_draft_pr', actorId: owner.id, candidateRunId: 'candidate', candidateRevision: 'candidate-revision', artifactRevision: 'candidate-revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/blossomsai/menoteam', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/candidate', workTitle: work.title, changeSummary: 'published', qaStatus: 'current', phase: 'pr_created', effectIntentGeneration: 2, external: { pullRequestNumber: 42, pullRequestUrl: 'https://github.com/blossomsai/menoteam/pull/42' } } } as Snapshot['runs'][number];
+    if (stopped) delivery.stoppedAt = '2026-10-23T00:00:00.000Z';
     const current = snapshot(); current.works = [work]; current.runs = [delivery];
     window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
     const cancel = vi.spyOn(workbenchApi, 'cancelRun');
+    const reconcile = vi.spyOn(workbenchApi, 'reconcileRun');
     await mount(current);
     expect(host.textContent).toContain('Interrupted');
     expect(delivery.operation?.phase).toBe('pr_created');
     expect([...host.querySelectorAll('button')].map(item => item.textContent?.trim())).not.toContain('End');
     expect([...host.querySelectorAll('button')].map(item => item.textContent?.trim())).not.toContain('Cancel');
+    const notice = host.querySelector('#run-effectful-interrupted-delivery');
+    expect(notice?.querySelector('span')?.textContent).not.toMatch(/End|Resume/);
+    expect([...notice!.querySelectorAll('button')].some(item => item.textContent === 'Resume')).toBe(stopped);
     expect(cancel).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
   });
 
   it.each(['empty stored draft','existing draft'])('New work opens Master preset without automatic creation or sending: %s',async scenario=>{
