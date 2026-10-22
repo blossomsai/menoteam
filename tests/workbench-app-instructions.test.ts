@@ -598,6 +598,233 @@ beforeEach(() => {
 });
 afterEach(async () => { await flush(() => root.unmount()); host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers(); });
 
+it('uses one email request while busy and keeps Copy link available after acceptance', async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const pending=deferred<{token:string|null;expiresAt:string|null;delivery:'accepted';replay:false}>();
+  const invite=vi.spyOn(workbenchApi,'invite').mockReturnValue(pending.promise);
+  await mount(); await flush();
+  await type('invitee@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));
+  const form=host.querySelector<HTMLInputElement>('#invite-email')!.closest('form')!;
+  await flush(()=>{form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});
+  expect(invite).toHaveBeenCalledTimes(1);
+  expect(invite.mock.calls[0]![0]).toMatchObject({email:'invitee@example.test',projectId:'project',sendEmail:true});
+  expect(invite.mock.calls[0]![0].requestId).toBeTruthy();
+  await flush(()=>pending.resolve({token:'fresh-token',expiresAt:null,delivery:'accepted',replay:false})); await flush();
+  expect(host.textContent).toContain('inbox delivery is not confirmed');
+  expect(host.textContent).toContain('Copy link');
+});
+
+it('offers link-only fallback when SMTP is unavailable and clears the old link on recipient change',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:false});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValue({token:'link-token',expiresAt:null,delivery:'not_requested',replay:false});
+  await mount();await flush();
+  expect(host.textContent).toContain('Email sending is unavailable');
+  await type('first@example.test','#invite-email');responses.push(Promise.resolve(snapshot('A')));
+  await click('Create link');
+  expect(invite).toHaveBeenCalledWith(expect.objectContaining({sendEmail:false,email:'first@example.test',requestId:expect.any(String)}));
+  expect(host.textContent).toContain('Copy link');
+  await type('second@example.test','#invite-email');
+  expect(host.textContent).not.toContain('link-token');
+  expect(host.textContent).not.toContain('Invitation link');
+});
+
+it('retries an ambiguous request with the same requestId',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const invite=vi.spyOn(workbenchApi,'invite').mockRejectedValueOnce(new Error('connection lost')).mockResolvedValueOnce({token:'retry-token',expiresAt:null,delivery:'accepted',replay:false});
+  await mount();await flush();await type('retry@example.test','#invite-email');
+  await click('Invite');const firstRequestId=invite.mock.calls[0]![0].requestId;
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite).toHaveBeenCalledTimes(2);expect(invite.mock.calls[1]![0].requestId).toBe(firstRequestId);
+});
+
+it('ignores a deferred invite completion after recipient and role change while preserving the new submission busy state',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const first=deferred<{token:string|null;expiresAt:string|null;delivery:'accepted';replay:false}>();
+  const second=deferred<{token:string|null;expiresAt:string|null;delivery:'accepted';replay:false}>();
+  const invite=vi.spyOn(workbenchApi,'invite').mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+  await mount();await flush();await type('first@example.test','#invite-email');await click('Invite');
+  const firstRequestId=invite.mock.calls[0]![0].requestId;
+  await type('second@example.test','#invite-email');
+  await flush(()=>{const select=host.querySelector<HTMLSelectElement>('#invite-role')!;Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value')!.set!.call(select,'admin');select.dispatchEvent(new Event('change',{bubbles:true}));});
+  await click('Invite');
+  expect(invite).toHaveBeenCalledTimes(2);expect(invite.mock.calls[1]![0]).toMatchObject({email:'second@example.test',role:'admin'});expect(invite.mock.calls[1]![0].requestId).not.toBe(firstRequestId);
+  await flush(()=>first.resolve({token:'stale-recipient-token',expiresAt:null,delivery:'accepted',replay:false}));
+  expect(host.textContent).not.toContain('stale-recipient-token');expect(host.textContent).toContain('Sending…');
+  responses.push(Promise.resolve(snapshot('A')));
+  await flush(()=>second.resolve({token:'current-recipient-token',expiresAt:null,delivery:'accepted',replay:false}));await flush();
+  expect(host.textContent).not.toContain('stale-recipient-token');expect(host.textContent).toContain('current-recipient-token');
+});
+
+it('ignores a deferred invitation response after switching projects',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  const value=snapshot('A');value.projects.push({id:'project-b',name:'Project B',instructions:'',repositoryUrl:'',deliveryAuthorization:'',createdAt:'2026-10-06'});
+  responses=[Promise.resolve(value)];evidenceSnapshot=value;
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const pending=deferred<{token:string|null;expiresAt:string|null;delivery:'accepted';replay:false}>();
+  const invite=vi.spyOn(workbenchApi,'invite').mockReturnValue(pending.promise);
+  await mount();await flush();await type('first@example.test','#invite-email');await click('Invite');
+  await flush(()=>{window.history.replaceState(null,'','/workbench/?view=members&project=project-b');window.dispatchEvent(new PopStateEvent('popstate'));});
+  expect(host.textContent).toContain('Project B');expect(host.textContent).not.toContain('Sending…');
+  await flush(()=>pending.resolve({token:'stale-project-token',expiresAt:null,delivery:'accepted',replay:false}));
+  expect(host.textContent).not.toContain('stale-project-token');expect(invite).toHaveBeenCalledOnce();
+});
+
+it('clears a revoked link and uses a new requestId for an intentional reinvite with the same payload',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  const pendingInvites:Array<{id:string;email:string;role:'member'|'admin';expiresAt:string}> = [];
+  vi.spyOn(workbenchApi,'projectInvites').mockImplementation(async()=>({invites:[...pendingInvites]}));
+  vi.spyOn(workbenchApi,'revokeInvite').mockImplementation(async(inviteId)=>{const index=pendingInvites.findIndex(item=>item.id===inviteId);if(index>=0)pendingInvites.splice(index,1);return {revoked:true};});
+  let created=0;
+  const invite=vi.spyOn(workbenchApi,'invite').mockImplementation(async(input)=>{
+    const id=`invite-${++created}`,token=`token-${created}`;
+    pendingInvites.push({id,email:input.email,role:input.role as 'member'|'admin',expiresAt:'2026-10-24T00:00:00.000Z'});
+    return {inviteId:id,token,expiresAt:'2026-10-24T00:00:00.000Z',delivery:'accepted',replay:false};
+  });
+  await mount();await flush();await type('same@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  const firstRequestId=invite.mock.calls[0]![0].requestId;
+  expect(host.textContent).toContain('token-1');
+  await click('Revoke');expect(host.textContent).not.toContain('token-1');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite).toHaveBeenCalledTimes(2);expect(invite.mock.calls[1]![0].requestId).not.toBe(firstRequestId);
+  expect(host.textContent).toContain('token-2');
+});
+
+it('offers link fallback and a retry after availability lookup fails',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  const config=vi.spyOn(workbenchApi,'inviteEmailConfig').mockRejectedValueOnce(new Error('temporary config failure')).mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValue({token:'fallback-token',expiresAt:null,delivery:'not_requested',replay:false});
+  await mount();await flush();
+  expect(host.textContent).toContain('Could not check email sending availability');
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('Could not check email sending availability');
+  await type('fallback@example.test','#invite-email');responses.push(Promise.resolve(snapshot('A')));await click('Create link');
+  expect(invite).toHaveBeenCalledWith(expect.objectContaining({sendEmail:false,email:'fallback@example.test'}));expect(host.textContent).toContain('fallback-token');
+  await click('Retry availability check');await flush();
+  expect(config).toHaveBeenCalledTimes(2);expect(button('Invite').disabled).toBe(false);expect(host.textContent).toContain('Invite sends an email');
+});
+
+it('keeps a newer invitation pending when an older deferred revoke completes',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  const invitations=vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[{id:'invite-a',email:'a@example.test',role:'member',expiresAt:'2026-10-24T00:00:00.000Z'}]});
+  const revoke=deferred<{revoked:true}>();
+  vi.spyOn(workbenchApi,'revokeInvite').mockReturnValue(revoke.promise);
+  const pendingB=deferred<Awaited<ReturnType<typeof workbenchApi.invite>>>();
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValueOnce({inviteId:'invite-a',token:'token-a',expiresAt:null,delivery:'accepted',replay:false}).mockReturnValueOnce(pendingB.promise);
+  await mount();await flush();await type('a@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(host.textContent).toContain('token-a');
+  await click('Revoke');
+  expect(button('Revoking…').disabled).toBe(true);
+  const form=host.querySelector<HTMLInputElement>('#invite-email')!.closest('form')!;
+  await flush(()=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  expect(invite).toHaveBeenCalledOnce();
+  await type('b@example.test','#invite-email');await click('Invite');
+  const submittedB=invite.mock.calls[1]![0];
+  expect(submittedB).toMatchObject({email:'b@example.test',sendEmail:true,requestId:expect.any(String)});
+  invitations.mockResolvedValue({invites:[]});
+  await flush(()=>revoke.resolve({revoked:true}));await flush();
+  expect(button('Sending…').disabled).toBe(true);
+  await flush(()=>{form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));});
+  expect(invite).toHaveBeenCalledTimes(2);expect(invite.mock.calls[1]![0]).toEqual(submittedB);
+  responses.push(Promise.resolve(snapshot('A')));
+  await flush(()=>pendingB.resolve({token:'token-b',expiresAt:null,delivery:'accepted',replay:false}));await flush();
+  expect(host.textContent).toContain('token-b');expect(host.textContent).not.toContain('token-a');expect(button('Invite').disabled).toBe(false);
+});
+
+it.each(['error','unavailable','available'] as const)('preserves a committed link attempt after ACK loss and an availability retry returning %s',async(outcome)=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  const metadata=deferred<{emailAvailable:boolean}>();
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockRejectedValueOnce(new Error('config unavailable')).mockReturnValueOnce(metadata.promise);
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[]});
+  const committedRequests=new Set<string>();
+  let submissions=0;
+  const invite=vi.spyOn(workbenchApi,'invite').mockImplementation(async(input)=>{
+    committedRequests.add(input.requestId!);
+    if(++submissions===1)throw new Error('response ACK lost after commit');
+    return {token:null,expiresAt:null,delivery:'not_requested',replay:true};
+  });
+  await mount();await flush();await type('link@example.test','#invite-email');await click('Create link');
+  const submitted=invite.mock.calls[0]![0];
+  expect(submitted.sendEmail).toBe(false);expect(host.textContent).toContain('outcome is unknown');
+  await click('Retry availability check');
+  expect(host.textContent).toContain('Checking email sending availability');expect(host.textContent).toContain('outcome is unknown');expect(invite).toHaveBeenCalledOnce();
+  await flush(()=>{if(outcome==='error')metadata.reject(new Error('config still unavailable'));else metadata.resolve({emailAvailable:outcome==='available'});});
+  responses.push(Promise.resolve(snapshot('A')));await click('Create link');
+  expect(invite).toHaveBeenCalledTimes(2);expect(invite.mock.calls[1]![0]).toEqual(submitted);expect(committedRequests.size).toBe(1);
+});
+
+it('restores an uncertain attempt after a failed revoke and safely replays its request',async()=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:false});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  vi.spyOn(workbenchApi,'projectInvites').mockResolvedValue({invites:[{id:'uncertain-invite',email:'uncertain@example.test',role:'member',expiresAt:'2026-10-24T00:00:00.000Z'}]});
+  vi.spyOn(workbenchApi,'revokeInvite').mockRejectedValueOnce(new Error('revoke failed'));
+  const invite=vi.spyOn(workbenchApi,'invite').mockResolvedValueOnce({inviteId:'uncertain-invite',token:'uncertain-token',expiresAt:null,delivery:'unknown',replay:false}).mockResolvedValueOnce({token:null,expiresAt:null,delivery:'unknown',replay:true});
+  await mount();await flush();await type('uncertain@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));await click('Create link');
+  const submitted=invite.mock.calls[0]![0];
+  await click('Revoke');expect(invite).toHaveBeenCalledOnce();expect(host.textContent).toContain('uncertain-token');
+  responses.push(Promise.resolve(snapshot('A')));await click('Create link');
+  expect(invite.mock.calls[1]![0]).toEqual(submitted);expect(host.textContent).toContain('outcome is unknown');
+});
+
+it.each(['response','lost ACK'] as const)('keeps the exact second invite when revoking an older same-payload row (%s)',async(outcome)=>{
+  window.history.replaceState(null,'','/workbench/?view=members&project=project');
+  const ids=['1'.repeat(64),'2'.repeat(64),'3'.repeat(64)];
+  vi.spyOn(workbenchApi,'inviteEmailConfig').mockResolvedValue({emailAvailable:true});
+  vi.spyOn(workbenchApi,'projectMembers').mockResolvedValue({members:[member]});
+  let rows:Array<{id:string;email:string;role:'member';expiresAt:string}>=[];
+  vi.spyOn(workbenchApi,'projectInvites').mockImplementation(async()=>({invites:[...rows]}));
+  const oldRevoke=deferred<{revoked:true}>();
+  const revoke=vi.spyOn(workbenchApi,'revokeInvite').mockImplementation(async(id)=>{if(id===ids[0])await oldRevoke.promise;rows=rows.filter(row=>row.id!==id);return {revoked:true};});
+  let calls=0;
+  const invite=vi.spyOn(workbenchApi,'invite').mockImplementation(async(input)=>{
+    calls++;
+    if(calls===3)return {inviteId:ids[1],token:null,expiresAt:null,delivery:'unknown',replay:true};
+    const index=calls===4?2:calls-1;
+    rows.push({id:ids[index]!,email:input.email,role:'member',expiresAt:'2026-10-24T00:00:00.000Z'});
+    if(calls===2&&outcome==='lost ACK')throw new Error('ACK lost');
+    return {inviteId:ids[index],token:`exact-token-${index+1}`,expiresAt:null,delivery:calls===2?'unknown':'accepted',replay:false};
+  });
+  await mount();await flush();await type('same@example.test','#invite-email');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  const firstId=invite.mock.calls[0]![0].requestId;
+  if(outcome==='response')responses.push(Promise.resolve(snapshot('A')));
+  await click('Invite');const secondRequest=invite.mock.calls[1]![0];expect(secondRequest.requestId).not.toBe(firstId);
+  const revokeRow=async(index:number)=>{await flush(()=>host.querySelectorAll('ul')[host.querySelectorAll('ul').length-1]!.querySelectorAll('li')[index]!.querySelector<HTMLButtonElement>('button')!.click());};
+  await revokeRow(0);await flush(()=>oldRevoke.resolve({revoked:true}));await flush();
+  expect(revoke).toHaveBeenLastCalledWith(ids[0]);expect(host.textContent).toContain('outcome is unknown');
+  if(outcome==='response')expect(host.textContent).toContain('exact-token-2');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite.mock.calls[2]![0]).toEqual(secondRequest);expect(host.textContent).toContain('outcome is unknown');
+  await revokeRow(0);expect(revoke).toHaveBeenLastCalledWith(ids[1]);
+  expect(host.textContent).not.toContain('outcome is unknown');expect(host.textContent).not.toContain('exact-token-2');
+  responses.push(Promise.resolve(snapshot('A')));await click('Invite');
+  expect(invite.mock.calls[3]![0].requestId).not.toBe(secondRequest.requestId);expect(host.textContent).toContain('exact-token-3');
+});
+
 describe('mounted invitation acceptance', () => {
   it('joins an invitation as the signed-in account without creating an account or signing in again', async () => {
     window.history.replaceState(null, '', '/workbench/?invite=project-invite');

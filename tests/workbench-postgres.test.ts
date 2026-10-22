@@ -2371,6 +2371,82 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         await sql`UPDATE wb_records SET data=data #- '{data,files,0,fileSha256}' WHERE id=${parent.id}`;expect((await memberRead()).json()).toMatchObject({complete:false,incomplete:true});
     },20000);
 
+    it('sends one invitation for concurrent idempotent email submits and rejects changed payloads',async()=>{
+        const project=checkedJson(await user('POST','/projects',{name:`Invite mail ${randomUUID()}`})) as Project;
+        let sends=0;let release!:()=>void;const waiting=new Promise<void>(resolve=>{release=resolve;});
+        await app.close();
+        app=await createWorkbenchApp({sql,inviteOrigin:'https://workbench.example.test',inviteMailer:async()=>{sends++;await waiting;return 'accepted';}});
+        const email=`invite-mail-${randomUUID()}@test.example`,requestId=randomUUID();
+        const payload={email,projectId:project.id,role:'member',requestId,sendEmail:true};
+        try{
+            const first=user('POST','/invites',payload),second=user('POST','/invites',payload);
+            await new Promise(resolve=>setTimeout(resolve,30));release();
+            const [a,b]=await Promise.all([first,second]);
+            expect([a.statusCode,b.statusCode]).toEqual([200,200]);expect(sends).toBe(1);
+            expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
+            expect([a.json().delivery,b.json().delivery]).toContain('accepted');expect([a.json().delivery,b.json().delivery]).toContain('unknown');
+            const initial=[a.json(),b.json()].find(value=>value.token)!;
+            expect(initial.inviteId).toBe(digest(initial.token));expect(a.json().inviteId).toBe(b.json().inviteId);
+            const replay=checkedJson(await user('POST','/invites',payload));
+            expect(replay).toMatchObject({inviteId:initial.inviteId,token:null,replay:true});expect(sends).toBe(1);
+            expect((await user('POST','/invites',{...payload,role:'admin'})).statusCode).toBe(409);expect(sends).toBe(1);
+            const request=await sql`SELECT result::text AS value FROM wb_requests WHERE request_id=${requestId}`;
+            expect(JSON.stringify(request)).not.toContain(email);expect(JSON.stringify(request)).not.toContain('https://');
+            expect(JSON.stringify(request)).not.toContain(initial.token);
+            expect(Object.keys(JSON.parse(request[0]!.value)).sort()).toEqual(['delivery','expiresAt','inviteId','payloadHash']);
+        }finally{release();await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
+    });
+
+    it('rejects email without SMTP before insert and preserves explicit link fallback',async()=>{
+        const project=checkedJson(await user('POST','/projects',{name:`Invite fallback ${randomUUID()}`})) as Project;
+        const email=`invite-fallback-${randomUUID()}@test.example`,requestIds=[randomUUID(),randomUUID()];
+        try{
+            const unavailable=await user('POST','/invites',{email,projectId:project.id,role:'member',requestId:requestIds[0],sendEmail:true});
+            expect(unavailable.statusCode).toBe(503);expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(0);
+            const link=await user('POST','/invites',{email,projectId:project.id,role:'member',requestId:requestIds[1],sendEmail:false});
+            expect(link.statusCode).toBe(200);expect(link.json()).toMatchObject({delivery:'not_requested',replay:false});expect(link.json().token).toBeTruthy();
+            expect(link.json().inviteId).toBe(digest(link.json().token));
+            const replayPayload={email,projectId:project.id,role:'member',requestId:requestIds[1],sendEmail:false};
+            expect(checkedJson(await user('POST','/invites',replayPayload))).toMatchObject({inviteId:link.json().inviteId,token:null,replay:true});
+            // Existing request receipts predate inviteId; replay must not invent a row identity.
+            await sql`UPDATE wb_requests SET result=result-'inviteId' WHERE request_id=${requestIds[1]}`;
+            expect(checkedJson(await user('POST','/invites',replayPayload))).toMatchObject({inviteId:null,token:null,replay:true});
+            expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
+        }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=ANY(${requestIds})`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
+    });
+
+    it.each([
+        ['definite rejection','failed',false],
+        ['unknown transport result','unknown',false],
+        ['transport timeout',undefined,true],
+    ] as const)('persists %s without retrying transport',async(_label,result,throws)=>{
+        const project=checkedJson(await user('POST','/projects',{name:`Invite outcome ${randomUUID()}`})) as Project;
+        await app.close();let sends=0;
+        app=await createWorkbenchApp({sql,inviteOrigin:'https://workbench.example.test',inviteMailer:async()=>{sends++;if(throws)throw Object.assign(new Error('timeout'),{code:'ETIMEDOUT'});return result!;}});
+        const email=`invite-outcome-${randomUUID()}@test.example`,requestId=randomUUID(),payload={email,projectId:project.id,role:'member',requestId,sendEmail:true};
+        try{
+            const first=await user('POST','/invites',payload);expect(first.statusCode).toBe(200);expect(first.json().delivery).toBe(throws?'unknown':result);expect(sends).toBe(1);
+            const replay=await user('POST','/invites',payload);expect(replay.statusCode).toBe(200);expect(replay.json()).toMatchObject({delivery:throws?'unknown':result,token:null,replay:true});expect(sends).toBe(1);
+            expect(first.json().inviteId).toBe(digest(first.json().token));expect(replay.json().inviteId).toBe(first.json().inviteId);
+            expect(Number((await sql`SELECT count(*) AS count FROM wb_invites WHERE email=${email}`)[0]!.count)).toBe(1);
+        }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
+    });
+
+    it('returns unknown after result persistence fails and never resends on replay',async()=>{
+        const project=checkedJson(await user('POST','/projects',{name:`Invite result save ${randomUUID()}`})) as Project;
+        let failSave=true,sends=0;
+        await app.close();
+        const failingSql=new Proxy(sql,{apply(target,thisArg,args){const query=args[0] as TemplateStringsArray;if(failSave&&query[0]?.includes("UPDATE wb_requests SET result=jsonb_set")){failSave=false;throw new Error('fixture result persistence failure');}return Reflect.apply(target,thisArg,args);}});
+        app=await createWorkbenchApp({sql:failingSql,inviteOrigin:'https://workbench.example.test',inviteMailer:async()=>{sends++;return 'accepted';}});
+        const email=`invite-save-${randomUUID()}@test.example`,requestId=randomUUID(),payload={email,projectId:project.id,role:'member',requestId,sendEmail:true};
+        try{
+            const first=await user('POST','/invites',payload);expect(first.statusCode).toBe(200);expect(first.json().delivery).toBe('unknown');expect(sends).toBe(1);
+            const replay=await user('POST','/invites',payload);expect(replay.statusCode).toBe(200);expect(replay.json()).toMatchObject({delivery:'unknown',token:null,replay:true});expect(sends).toBe(1);
+            expect(first.json().inviteId).toBe(digest(first.json().token));expect(replay.json().inviteId).toBe(first.json().inviteId);
+            expect(await sql`SELECT request_id FROM wb_requests WHERE request_id=${requestId}`).toHaveLength(1);
+        }finally{await sql`DELETE FROM wb_invites WHERE email=${email}`;await sql`DELETE FROM wb_requests WHERE request_id=${requestId}`;await sql`DELETE FROM wb_records WHERE id=${project.id}`;}
+    });
+
 });
 
 describe.skipIf(!url)('Real PostgreSQL authenticated rate budgets',()=>{
@@ -2683,8 +2759,9 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
         const suffix = randomUUID();
         const email = (name: string) => `${name}-${suffix}@test.example`;
         const ownerEmail = email('workspace-owner');
+        let unauthorizedSends=0;
         await app.close();
-        app = await createWorkbenchApp({ sql, bootstrapEmail: ownerEmail, bootstrapPassword: 'invite-owner-password-123' });
+        app = await createWorkbenchApp({ sql, bootstrapEmail: ownerEmail, bootstrapPassword: 'invite-owner-password-123', inviteOrigin:'https://workbench.example.test', inviteMailer:async()=>{unauthorizedSends++;return 'accepted';} });
         const ownerLogin = await app.inject({ method: 'POST', url: '/api/workbench/session', payload: { email: ownerEmail, password: 'invite-owner-password-123' } });
         expect(ownerLogin.statusCode).toBe(200);
         const ownerSession = String(ownerLogin.headers['set-cookie']).split(';')[0]!;
@@ -2694,16 +2771,18 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             return response.json();
         };
         const adminEmail = email('project-admin');
+        const mailReplayEmail=email('mail-replay');const mailReplayRequestId=randomUUID();
         const memberInviteEmail = email('invited-member');
         const scopedAdminEmail = email('invited-admin');
         const ordinaryEmail = email('ordinary-member');
         const workspaceEmail = email('workspace-admin');
         const project = checkedJson(await ownerPost('/projects', { name: `Invite scope ${suffix}` })) as Project;
         const otherProject = checkedJson(await ownerPost('/projects', { name: `Invite other ${suffix}` })) as Project;
-        const cleanupEmails = [ownerEmail, adminEmail, memberInviteEmail, scopedAdminEmail, ordinaryEmail, workspaceEmail];
+        const cleanupEmails = [ownerEmail, adminEmail, memberInviteEmail, scopedAdminEmail, ordinaryEmail, workspaceEmail,mailReplayEmail];
         const inviteAndAccept = async (inviteEmail: string, projectId: string | undefined, role: 'admin' | 'member') => {
             const payload = { email: inviteEmail, ...(projectId ? { projectId } : {}), role };
             const invite = checkedJson(await ownerPost('/invites', payload));
+            expect(invite.inviteId).toBe(digest(invite.token));
             const accepted = await app.inject({
                 method: 'POST', url: '/api/workbench/invites/accept',
                 payload: { token: invite.token, name: 'Invite fixture', password: 'invite-fixture-password-123' }
@@ -2730,6 +2809,11 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
         try {
             const projectAdmin = await inviteAndAccept(adminEmail, project.id, 'admin');
             await account(adminEmail, project.id, 'admin');
+            const replayPayload={email:mailReplayEmail,projectId:project.id,role:'member',requestId:mailReplayRequestId,sendEmail:true};
+            const firstMail=await sessionPost(projectAdmin.session,replayPayload);expect(firstMail.statusCode).toBe(200);expect(firstMail.json().delivery).toBe('accepted');expect(unauthorizedSends).toBe(1);
+            await sql`DELETE FROM wb_memberships WHERE project_id=${project.id} AND user_id=(SELECT id FROM wb_users WHERE email=${adminEmail})`;
+            expect((await sessionPost(projectAdmin.session,replayPayload)).statusCode).toBe(403);expect(unauthorizedSends).toBe(1);
+            await sql`INSERT INTO wb_memberships(user_id,project_id,role) VALUES ((SELECT id FROM wb_users WHERE email=${adminEmail}),${project.id},'admin')`;
             const actor = await sql`SELECT u.role AS global_role,m.role AS project_role FROM wb_users u JOIN wb_memberships m ON m.user_id=u.id AND m.project_id=${project.id} WHERE u.email=${adminEmail}`;
             expect(actor).toMatchObject([{ global_role: 'member', project_role: 'admin' }]);
             expect(await sql`SELECT role FROM wb_memberships WHERE user_id=(SELECT id FROM wb_users WHERE email=${adminEmail}) AND project_id=${otherProject.id}`).toHaveLength(0);
@@ -2765,8 +2849,14 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             expect(await inviteCount(email('denied-unscoped'))).toBe(beforeUnscoped);
             await denied(await sessionPost(projectAdmin.session, { email: email('denied-other-project'), projectId: otherProject.id, role: 'admin' }));
             expect(await inviteCount(email('denied-other-project'))).toBe(0);
+            const sendsBeforeDenied = unauthorizedSends;
+            await denied(await sessionPost(projectAdmin.session,{email:email('denied-crossscope-send'),projectId:otherProject.id,role:'member',requestId:randomUUID(),sendEmail:true}));
+            expect(await inviteCount(email('denied-crossscope-send'))).toBe(0);
             await denied(await sessionPost(ordinarySession, { email: email('denied-ordinary-member'), projectId: project.id, role: 'admin' }));
             expect(await inviteCount(email('denied-ordinary-member'))).toBe(0);
+            await denied(await sessionPost(ordinarySession,{email:email('denied-member-send'),projectId:project.id,role:'member',requestId:randomUUID(),sendEmail:true}));
+            expect(await inviteCount(email('denied-member-send'))).toBe(0);
+            expect(unauthorizedSends).toBe(sendsBeforeDenied);
 
             const deniedWorkspaceEmail = email('denied-workspace');
             await denied(await sessionPost(projectAdmin.session, { email: deniedWorkspaceEmail, role: 'member' }));
@@ -2779,6 +2869,7 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             expect(workspaceUser).toMatchObject([{ role: 'admin' }]);
             expect(await sql`SELECT project_id FROM wb_memberships WHERE user_id=(SELECT id FROM wb_users WHERE email=${workspaceEmail})`).toHaveLength(0);
         } finally {
+            await sql`DELETE FROM wb_requests WHERE request_id=${mailReplayRequestId}`;
             await sql`DELETE FROM wb_invites WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`}`;
             await sql`DELETE FROM wb_sessions WHERE user_id IN (SELECT id FROM wb_users WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`})`;
             await sql`DELETE FROM wb_memberships WHERE user_id IN (SELECT id FROM wb_users WHERE email=ANY(${cleanupEmails}) OR email LIKE ${`%-${suffix}@test.example`})`;
@@ -2786,6 +2877,7 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             await sql`DELETE FROM wb_records WHERE id=ANY(${[project.id, otherProject.id]}) AND kind='project'`;
         }
     });
+
 });
 
 describe.skipIf(!url)('Slack durable reply PostgreSQL',()=>{

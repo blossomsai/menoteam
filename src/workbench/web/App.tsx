@@ -1074,14 +1074,64 @@ function Instructions({ project, member, refresh, setError }: { project: Project
 }
 
 function Members({ project, snapshot, refresh, setError }: { project: Project; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {
-  const [email, setEmail] = useState(''); const [role, setRole] = useState<Member['role']>('member'); const [busy, setBusy] = useState(false); const [inviteUrl, setInviteUrl] = useState('');
+  type InviteRequest = Readonly<{ email: string; projectId: string; role: Member['role']; sendEmail: boolean; requestId: string }>;
+  type InviteAttempt = Readonly<{ request: InviteRequest; phase: 'pending' | 'unknown' | 'complete' | 'revoking'; delivery: string; url: string; inviteId: string | null }>;
+  const [email, setEmail] = useState(''); const [role, setRole] = useState<Member['role']>('member');
+  const [emailAvailability, setEmailAvailability] = useState<'loading' | 'available' | 'unavailable' | 'error'>('loading');
+  const [attempt, setAttempt] = useState<InviteAttempt | null>(null);
+  const attemptRef = useRef<InviteAttempt | null>(null);
+  const updateAttempt = useCallback((next: InviteAttempt | null) => { attemptRef.current=next;setAttempt(next); },[]);
+  const busy=attempt?.phase==='pending'||attempt?.phase==='revoking',delivery=attempt?.delivery??'',inviteUrl=attempt?.url??'';
+  const mountedRef = useRef(true);
+  const [availabilityRetry, setAvailabilityRetry] = useState(0);
   const [members, setMembers] = useState<Member[]>([]); const [invites, setInvites] = useState<Array<{ id: string; email: string; role: Member['role']; expiresAt: string }>>([]);
   const canManage = useProjectAdmin(project.id, snapshot.member);
+  useEffect(() => { mountedRef.current=true; return()=>{mountedRef.current=false;attemptRef.current=null;}; },[]);
+  useEffect(() => { let active=true; setEmailAvailability('loading'); void workbenchApi.inviteEmailConfig(project.id).then(value=>{if(active)setEmailAvailability(value.emailAvailable?'available':'unavailable');}).catch(()=>{if(active)setEmailAvailability('error');}); return()=>{active=false;}; },[project.id,availabilityRetry]);
+  const clearInvite=()=>updateAttempt(null);
+  const submitInvite=async(sendEmail:boolean)=>{
+    const previous=attemptRef.current;
+    if(previous?.phase==='pending'||previous?.phase==='revoking')return;
+    const payload={email:email.trim().toLowerCase(),projectId:project.id,role,sendEmail};
+    const retry=previous?.phase==='unknown'&&previous.request.email===payload.email&&previous.request.projectId===payload.projectId&&previous.request.role===payload.role&&previous.request.sendEmail===payload.sendEmail;
+    const pending:InviteAttempt={request:retry?previous.request:{...payload,requestId:crypto.randomUUID()},phase:'pending',delivery:retry?previous.delivery:'',url:retry?previous.url:'',inviteId:retry?previous.inviteId:null};
+    // The ref is also the synchronous double-submit gate. Each snapshot fences its own completion.
+    updateAttempt(pending);setError('');
+    try {
+      const result=await workbenchApi.invite(pending.request);
+      if(attemptRef.current!==pending)return;
+      const outcome=result.delivery??'not_requested';let url=pending.url;
+      if(result.token){const link=new URL('/workbench/',window.location.origin);link.searchParams.set('invite',result.token);url=link.toString();}
+      const completed:InviteAttempt={...pending,phase:outcome==='unknown'?'unknown':'complete',delivery:outcome,url,inviteId:result.inviteId??pending.inviteId};
+      updateAttempt(completed);
+      try { await load(); await refresh(); } catch(cause) { if(attemptRef.current===completed)setError(errorMessage(cause)); }
+    } catch(cause) {
+      if(attemptRef.current!==pending)return;
+      const uncertain=!(cause instanceof ApiError)||cause.status>=500;
+      updateAttempt({...pending,phase:uncertain?'unknown':'complete',delivery:uncertain?'unknown':''});setError(errorMessage(cause));
+    }
+  };
+  const retryEmailAvailability=()=>{setEmailAvailability('loading');setAvailabilityRetry(value=>value+1);};
   const load = useCallback(async () => { const memberResult = await workbenchApi.projectMembers(project.id); setMembers(memberResult.members); if (canManage) { const inviteResult = await workbenchApi.projectInvites(project.id); setInvites(inviteResult.invites); } else setInvites([]); }, [canManage, project.id]);
   useEffect(() => { void load().catch(cause => setError(errorMessage(cause))); }, [load, setError]);
-  return <section className="w-full"><ProjectSettingsNav project={project} active="members"/><header className="mb-5"><h1 className="text-2xl font-semibold">Members</h1><p className="mt-1 text-sm text-muted-foreground">Invite people to this private project.</p></header>{canManage && <form className="mb-6 flex flex-wrap items-end gap-3 rounded-lg border border-border p-4" onSubmit={async event => { event.preventDefault(); setBusy(true); setError(''); try { const result = await workbenchApi.invite({ email, projectId: project.id, role }); const url = new URL('/workbench/', window.location.origin); url.searchParams.set('invite', result.token); setInviteUrl(url.toString()); setEmail(''); await load(); await refresh(); } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(false); } }}><div className="grid min-w-56 flex-1 gap-2"><Label htmlFor="invite-email">Email</Label><Input id="invite-email" type="email" required value={email} onChange={event => setEmail(event.target.value)} /></div><div className="grid gap-2"><Label htmlFor="invite-role">Role</Label><NativeSelect id="invite-role" className="h-9 rounded-md border bg-background px-3 text-sm" value={role} onChange={event => setRole(event.target.value as Member['role'])}><NativeSelectOption value="member">Member</NativeSelectOption><NativeSelectOption value="admin">Admin</NativeSelectOption></NativeSelect></div><Button disabled={busy}>{busy ? 'Inviting…' : 'Invite member'}</Button></form>}{inviteUrl && <div role="status" className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-muted/30 p-3 text-sm"><span className="min-w-0 flex-1 break-all">Invitation link · {inviteUrl}</span><Button variant="outline" size="sm" onClick={() => void navigator.clipboard.writeText(inviteUrl)}>Copy link</Button></div>}
+  const revokeInvite=async(invite:typeof invites[number])=>{
+    const started=attemptRef.current;
+    if(started?.phase==='pending'||started?.phase==='revoking')return;
+    const related=started?.inviteId!=null&&started.inviteId===invite.id;
+    const revoking:InviteAttempt|null=related?{...started,phase:'revoking'}:null;
+    if(revoking)updateAttempt(revoking);
+    try {
+      await workbenchApi.revokeInvite(invite.id);
+      if(!mountedRef.current)return;
+      if(revoking&&attemptRef.current===revoking)clearInvite();
+      await load();
+    } catch(cause) {
+      if(mountedRef.current&&attemptRef.current===(revoking??started)){if(revoking)updateAttempt(started?{...started}:null);setError(errorMessage(cause));}
+    }
+  };
+  return <section className="w-full"><ProjectSettingsNav project={project} active="members"/><header className="mb-5"><h1 className="text-2xl font-semibold">Members</h1><p className="mt-1 text-sm text-muted-foreground">Invite people to this private project.</p></header>{canManage && <><form className="mb-3 flex flex-wrap items-end gap-3 rounded-lg border border-border p-4" onSubmit={event=>{event.preventDefault();if(emailAvailability==='available')void submitInvite(true);}}><div className="grid min-w-56 flex-1 gap-2"><Label htmlFor="invite-email">Email</Label><Input id="invite-email" type="email" required value={email} onChange={event=>{if(attemptRef.current?.request.email!==event.target.value.trim().toLowerCase())clearInvite();setEmail(event.target.value);}} /></div><div className="grid gap-2"><Label htmlFor="invite-role">Role</Label><NativeSelect id="invite-role" className="h-9 rounded-md border bg-background px-3 text-sm" value={role} onChange={event=>{if(attemptRef.current?.request.role!==event.target.value)clearInvite();setRole(event.target.value as Member['role']);}}><NativeSelectOption value="member">Member</NativeSelectOption><NativeSelectOption value="admin">Admin</NativeSelectOption></NativeSelect></div><Button disabled={busy||emailAvailability!=='available'}>{attempt?.phase==='revoking'?'Revoking…':busy?'Sending…':'Invite'}</Button>{(emailAvailability==='unavailable'||emailAvailability==='error'||attempt?.phase==='unknown'&&!attempt.request.sendEmail)&&<Button type="button" variant="outline" disabled={busy} onClick={()=>void submitInvite(false)}>Create link</Button>}{emailAvailability==='error'&&<Button type="button" variant="outline" disabled={busy} onClick={retryEmailAvailability}>Retry availability check</Button>}</form><p role={emailAvailability==='error'?'alert':'status'} className="mb-5 text-sm text-muted-foreground">{emailAvailability==='unavailable'?'Email sending is unavailable. Create a link to invite this person.':emailAvailability==='error'?'Could not check email sending availability. You can create a link without email or retry the check.':emailAvailability==='available'?'Invite sends an email; Copy link remains available.':'Checking email sending availability…'}</p></>}{delivery && <p role="status" className="mb-3 text-sm">{delivery==='accepted'?'Email accepted by the SMTP server; inbox delivery is not confirmed.':delivery==='failed'?'Email was rejected before acceptance.':delivery==='unknown'?'Email outcome is unknown. Do not retry automatically; check the recipient before sending again.':delivery==='unavailable'?'Email sending is unavailable. The invitation link is ready.':'Invitation link created.'}</p>}{inviteUrl && <div className="mb-5 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-muted/30 p-3 text-sm"><span className="min-w-0 flex-1 break-all">Invitation link · {inviteUrl}</span><Button type="button" variant="outline" size="sm" onClick={() => void navigator.clipboard.writeText(inviteUrl)}>Copy link</Button></div>}
     <h2 className="mb-2 font-semibold">Project members</h2><ul className="mb-7 divide-y rounded-lg border border-border">{members.map(record => <li key={record.id} className="flex items-center justify-between gap-3 border-border p-3 text-sm"><span>{record.name} · {record.email}</span><span className="flex items-center gap-3 text-muted-foreground">{record.role}{canManage && record.id !== snapshot.member.id && record.role !== 'owner' && <Button variant="ghost" size="sm" onClick={async () => { try { await workbenchApi.removeProjectMember(project.id, record.id); await load(); } catch (cause) { setError(errorMessage(cause)); } }}>Remove</Button>}</span></li>)}</ul>
-    {canManage && <><h2 className="mb-2 font-semibold">Pending invitations</h2><ul className="divide-y rounded-lg border border-border">{invites.map(invite => <li key={invite.id} className="flex items-center justify-between gap-3 border-border p-3 text-sm"><span>{invite.email} · {invite.role}</span><span className="flex items-center gap-3 text-muted-foreground">Expires {new Date(invite.expiresAt).toLocaleDateString()}<Button variant="ghost" size="sm" onClick={async () => { try { await workbenchApi.revokeInvite(invite.id); await load(); } catch (cause) { setError(errorMessage(cause)); } }}>Revoke</Button></span></li>)}</ul></>}</section>;
+    {canManage && <><h2 className="mb-2 font-semibold">Pending invitations</h2><ul className="divide-y rounded-lg border border-border">{invites.map(invite => <li key={invite.id} className="flex items-center justify-between gap-3 border-border p-3 text-sm"><span>{invite.email} · {invite.role}</span><span className="flex items-center gap-3 text-muted-foreground">Expires {new Date(invite.expiresAt).toLocaleDateString()}<Button variant="ghost" size="sm" disabled={busy} onClick={()=>void revokeInvite(invite)}>Revoke</Button></span></li>)}</ul></>}</section>;
 }
 
 function SettingsPage({ view, project, member, snapshot, refresh, setError }: { view: View; project?: Project; member: Member; snapshot: Snapshot; refresh: () => Promise<void>; setError: (value: string) => void }) {
