@@ -623,8 +623,8 @@ describe.skipIf(!url)("Real workbench PostgreSQL", () => {
         try{
             const p=checkedJson(await user('POST','/projects',{name:`Claim blockers ${randomUUID()}`}));pId=p.id;ids.add(p.id);
             const other=checkedJson(await user('POST','/projects',{name:`Claim blocker other project ${randomUUID()}`}));otherProjectId=other.id;ids.add(other.id);
-            const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Claim blocker work'}));ids.add(work.id);
-            connectorToken=(await enrollProvider(connectorId,[p.id])).token;providerId=fixtureConnections.get(connectorId)??'';if(providerId)ids.add(providerId);
+            connectorToken=(await enrollProvider(connectorId,[p.id])).token;providerId=fixtureConnections.get(connectorId)!;ids.add(providerId);
+            const work=checkedJson(await user('POST',`/projects/${p.id}/works`,{title:'Claim blocker work',connectionId:providerId}));ids.add(work.id);
             const enqueue=async(text:string)=>{
                 const requestId=randomUUID();requestIds.push(requestId);
                 const result=checkedJson(await user('POST',`/projects/${p.id}/messages`,{workId:work.id,text,requestId}));
