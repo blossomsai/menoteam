@@ -18,6 +18,7 @@ import { token, digest, hashPassword, checkPassword } from "./auth.js";
 import { canRecoverStagingRun, isOfflineStagingRun, isPreEffectStagingRun, isCausalMasterWake, type Member, type Project, type Work, type Message, type Run, type SnapshotRun, type Artifact, type Setting, type ExecutionContext, type RunEvent } from "./types.js";
 import { fixedQaSnapshot, hasRequiredLocalQa, qaPolicyData, savedQaPolicy, sameQaPolicy } from "./local-qa.js";
 import type { InviteMail, InviteMailResult } from './invite-mail.js';
+import { blocksRunClaim } from './run-claim.js';
 
 export function snapshotRun({ prompt: _prompt, execution, ...run }: Run): SnapshotRun {
     if (!execution) return run;
@@ -1573,7 +1574,7 @@ export async function createWorkbenchApp(options: WorkbenchOptions) {
                 const selected=queued.execution?.connectorId??queued.targetConnectorId??queued.connectorId;
                 if(selected)try{await validateRunSelection(queued,tx);}catch(error){queued.status='failed';queued.error=error instanceof Error?error.message:'Selected connection unavailable';queued.updatedAt=now();await store.put('run',queued,tx);}
             }
-            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? canClaimDelivery(r) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (r.kind==='delivery'?(!r.targetConnectorId||r.targetConnectorId===c.id):(r.execution?.connectorId??r.targetConnectorId??r.connectorId)===c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => active.id!==r.id&&active.projectId === r.projectId && active.workId === r.workId && (["running", "interrupted"].includes(active.status) || (["paused", "cancelled"].includes(active.status) && !active.stoppedAt) || (active.kind==='delivery'&&active.status==='queued'&&(Date.parse(active.createdAt)<Date.parse(r.createdAt)||(Date.parse(active.createdAt)===Date.parse(r.createdAt)&&active.id<r.id))))));
+            const r = runs.find(r => r.status === "queued" && (!Array.isArray(body.capabilities?.runKinds) || body.capabilities.runKinds.includes(r.kind)) && (r.kind==='delivery' ? canClaimDelivery(r) : (!Array.isArray(body.capabilities?.models) || body.capabilities.models.includes(r.model))) && (r.kind==='delivery'?(!r.targetConnectorId||r.targetConnectorId===c.id):(r.execution?.connectorId??r.targetConnectorId??r.connectorId)===c.id) && c.projectIds.includes(r.projectId) && !runs.some(active => blocksRunClaim(r, active)));
             if (!r)
                 return undefined;
             if(r.kind!=='delivery'){

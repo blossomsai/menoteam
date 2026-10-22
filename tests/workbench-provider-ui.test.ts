@@ -218,7 +218,7 @@ it('shows the blocked Slack reply cause for a completed Master turn without expo
 
   const notice = [...host.querySelectorAll('[role="status"]')].find(element => element.textContent?.includes('Slack reply blocked'));
   expect(notice?.textContent).toContain(`Slack reply blocked · ${cause}`);
-  expect(notice?.querySelector('strong')?.textContent).toBe('completed');
+  expect(notice?.querySelector('strong')?.textContent).toContain('Completed');
   expect(notice?.querySelector('button')).toBeNull();
   expect(host.textContent).not.toContain('Private other project cause');
   expect(host.textContent).not.toContain('Private other work cause');
@@ -722,18 +722,98 @@ describe('mounted provider connection settings', () => {
     }
   });
 
-  it('does not offer cancel or end for an effectful interrupted delivery', async () => {
+  it('shows each queued Master its own visible blockers and keeps anchors and actions exact', async () => {
+    const queuedLater = { id: 'queued-master-later', projectId: project.id, kind: 'master' as const, workId: undefined, prompt: '', model: 'gpt-6-luna', reasoning: 'medium', status: 'queued' as const, generation: 0, createdAt: '2026-10-22T10:00:00.000Z', updatedAt: '2026-10-22T10:00:00.000Z' };
+    const queuedEarlier = { ...queuedLater, id: 'queued-master-earlier', createdAt: '2026-10-22T09:00:00.000Z' };
+    const earlyDelivery = { ...queuedLater, id: 'delivery-early', kind: 'delivery' as const, status: 'queued' as const, createdAt: '2026-10-22T08:00:00.000Z' };
+    const middleDelivery = { ...queuedLater, id: 'delivery-middle', kind: 'delivery' as const, status: 'queued' as const, createdAt: '2026-10-22T09:30:00.000Z' };
+    const unconfirmed = { ...queuedLater, id: 'blocked-interrupted', kind: 'implementation' as const, status: 'interrupted' as const, generation: 1, createdAt: '2026-10-22T07:00:00.000Z' };
+    const unconfirmedPaused = { ...queuedLater, id: 'blocked-paused', kind: 'review' as const, status: 'paused' as const, generation: 1, createdAt: '2026-10-22T07:30:00.000Z' };
+    const stoppedInterrupted = { ...unconfirmed, id: 'resumable-interrupted', stoppedAt: '2026-10-22T09:45:00.000Z' };
+    const stoppedPaused = { ...unconfirmedPaused, id: 'resumable-paused', stoppedAt: '2026-10-22T09:50:00.000Z' };
+    const current = snapshot(); current.runs = [queuedLater, queuedEarlier, earlyDelivery, middleDelivery, unconfirmed, unconfirmedPaused, stoppedInterrupted, stoppedPaused];
+    window.history.replaceState(null, '', `/workbench/?view=master&project=${project.id}`);
+    const afterEnd = snapshot(); afterEnd.runs = [queuedLater, queuedEarlier, earlyDelivery, middleDelivery, { ...unconfirmed, status: 'cancelled', stoppedAt: '2026-10-22T10:05:00.000Z' }, unconfirmedPaused, stoppedInterrupted, stoppedPaused];
+    const end = vi.spyOn(workbenchApi, 'cancelRun').mockResolvedValue({ ...unconfirmed, status: 'cancelled' } as Snapshot['runs'][number]);
+    const reconcile = vi.spyOn(workbenchApi, 'reconcileRun').mockResolvedValue(stoppedInterrupted as Snapshot['runs'][number]);
+    const resume = vi.spyOn(workbenchApi, 'resumeRun').mockResolvedValue(stoppedPaused as Snapshot['runs'][number]);
+    await mount(current);
+    const snapshotRequest = vi.spyOn(workbenchApi, 'snapshot').mockResolvedValueOnce(afterEnd);
+
+    const summaries = [...host.querySelectorAll('section[aria-label^="Runs blocking Master"]')];
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]?.textContent).toContain('Waiting for these runs');
+    expect(summaries[0]?.textContent).not.toContain('queue constraints');
+    expect(summaries[0]?.querySelectorAll('a[href^="#run-"]')).toHaveLength(5);
+    expect(summaries[1]?.querySelectorAll('a[href^="#run-"]')).toHaveLength(4);
+    expect(summaries[0]?.querySelector('a[href="#run-delivery-middle"]')).toBeTruthy();
+    expect(summaries[1]?.querySelector('a[href="#run-delivery-middle"]')).toBeNull();
+    await type('input[aria-label="Message Master"]', 'Draft survives blocker navigation');
+    const composer = host.querySelector<HTMLInputElement>('input[aria-label="Message Master"]')!;
+    const route = window.location.href;
+    const pushState = vi.spyOn(window.history, 'pushState');
+    for (const link of [...host.querySelectorAll('section[aria-label^="Runs blocking Master"] a[href^="#run-"]')]) {
+      const target = host.querySelector(link.getAttribute('href')!);
+      expect(target?.querySelector('strong')?.textContent).toBe(link.textContent);
+      // Observe after the real router's document listener; suppress only the DOM
+      // emulator's native activation, which cannot verify browser scrolling.
+      let intercepted = true;
+      window.addEventListener('click', event => { intercepted = event.defaultPrevented; event.preventDefault(); }, { once: true });
+      await flush(() => link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 })));
+      expect(intercepted).toBe(false);
+    }
+    expect(pushState).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(route);
+    expect(host.querySelector('input[aria-label="Message Master"]')).toBe(composer);
+    expect(composer.value).toBe('Draft survives blocker navigation');
+    expect(snapshotRequest).not.toHaveBeenCalled();
+    expect(host.querySelector('#run-blocked-interrupted button')?.textContent).toBe('End');
+    expect(host.querySelector('#run-blocked-interrupted')?.textContent).toContain('End or wait for stop confirmation');
+    expect([...host.querySelectorAll('#run-blocked-interrupted button')].some(item => item.textContent === 'Resume')).toBe(false);
+    expect(host.querySelector('#run-blocked-paused button')?.textContent).toBe('End');
+    expect([...host.querySelectorAll('#run-blocked-paused button')].some(item => item.textContent === 'Resume')).toBe(false);
+    expect([...host.querySelectorAll('#run-resumable-interrupted button')].some(item => item.textContent === 'Resume')).toBe(true);
+    expect(host.querySelector('#run-resumable-interrupted')?.textContent).toContain('Resume or End');
+    expect([...host.querySelectorAll('#run-resumable-paused button')].some(item => item.textContent === 'Resume')).toBe(true);
+    expect(end).not.toHaveBeenCalled(); expect(resume).not.toHaveBeenCalled(); expect(reconcile).not.toHaveBeenCalled();
+
+    await flush(() => [...host.querySelectorAll('#run-blocked-interrupted button')].find(item => item.textContent === 'End')!.click());
+    expect(end).toHaveBeenCalledWith(unconfirmed.id);
+    expect(snapshotRequest).toHaveBeenCalledTimes(1);
+    expect(host.querySelectorAll('section[aria-label^="Runs blocking Master"] a[href="#run-blocked-interrupted"]')).toHaveLength(0);
+    expect(host.querySelectorAll('section[aria-label^="Runs blocking Master"] a[href^="#run-"]')).toHaveLength(7);
+    await flush(() => [...host.querySelectorAll('#run-resumable-interrupted button')].find(item => item.textContent === 'Resume')!.click());
+    expect(reconcile).toHaveBeenCalledWith(stoppedInterrupted.id);
+    await flush(() => [...host.querySelectorAll('#run-resumable-paused button')].find(item => item.textContent === 'Resume')!.click());
+    expect(resume).toHaveBeenCalledWith(stoppedPaused.id);
+  });
+
+  it('keeps ordinary Queued when no visible run matches the blocking rule', async () => {
+    const current = snapshot(); current.runs = [{ id: 'queued-master-only', projectId: project.id, kind: 'master', prompt: '', model: 'gpt-6-luna', reasoning: 'medium', status: 'queued', generation: 0, createdAt: '2026-10-22T10:00:00.000Z', updatedAt: '2026-10-22T10:00:00.000Z' } as Snapshot['runs'][number]];
+    window.history.replaceState(null, '', `/workbench/?view=master&project=${project.id}`);
+    await mount(current);
+    expect(host.querySelector('[aria-label^="Runs blocking Master"]')).toBeNull();
+    expect(host.querySelector('#run-queued-master-only')?.textContent).toContain('Master · Queued');
+  });
+
+  it.each([false, true])('does not advertise unsupported actions for an effectful interrupted delivery (stopped=%s)', async stopped => {
     const work = { id: 'delivery-cancel-work', projectId: project.id, title: 'Published delivery', overview: '', status: 'in_progress' as const, revision: 1, profileId: '', sources: [], createdAt: '', updatedAt: '' };
     const delivery = { id: 'effectful-interrupted-delivery', projectId: project.id, workId: work.id, targetRunId: 'candidate', kind: 'delivery' as const, prompt: '', model: 'internal', reasoning: 'none', status: 'interrupted' as const, generation: 2, createdAt: '', updatedAt: '', operation: { action: 'create_draft_pr', actorId: owner.id, candidateRunId: 'candidate', candidateRevision: 'candidate-revision', artifactRevision: 'candidate-revision', commitSha: 'a'.repeat(40), candidateFingerprint: 'b'.repeat(64), repositoryUrl: 'https://github.com/blossomsai/menoteam', baseRevision: 'c'.repeat(40), baseBranch: 'main', remoteBranch: 'codex/candidate', workTitle: work.title, changeSummary: 'published', qaStatus: 'current', phase: 'pr_created', effectIntentGeneration: 2, external: { pullRequestNumber: 42, pullRequestUrl: 'https://github.com/blossomsai/menoteam/pull/42' } } } as Snapshot['runs'][number];
+    if (stopped) delivery.stoppedAt = '2026-10-23T00:00:00.000Z';
     const current = snapshot(); current.works = [work]; current.runs = [delivery];
     window.history.replaceState(null, '', `/workbench/?view=work-detail&project=${project.id}&work=${work.id}`);
     const cancel = vi.spyOn(workbenchApi, 'cancelRun');
+    const reconcile = vi.spyOn(workbenchApi, 'reconcileRun');
     await mount(current);
-    expect(host.textContent).toContain('interrupted');
+    expect(host.textContent).toContain('Interrupted');
     expect(delivery.operation?.phase).toBe('pr_created');
     expect([...host.querySelectorAll('button')].map(item => item.textContent?.trim())).not.toContain('End');
     expect([...host.querySelectorAll('button')].map(item => item.textContent?.trim())).not.toContain('Cancel');
+    const notice = host.querySelector('#run-effectful-interrupted-delivery');
+    expect(notice?.querySelector('span')?.textContent).not.toMatch(/End|Resume/);
+    expect([...notice!.querySelectorAll('button')].some(item => item.textContent === 'Resume')).toBe(stopped);
     expect(cancel).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
   });
 
   it.each(['empty stored draft','existing draft'])('New work opens Master preset without automatic creation or sending: %s',async scenario=>{

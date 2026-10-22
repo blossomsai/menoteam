@@ -20,6 +20,7 @@ import { navigate, useWorkbenchUrl } from './navigation';
 import { useConversationScroll } from './conversation-scroll';
 import { Markdown } from './Markdown';
 import { artifactKey, useArtifactReader, type ArtifactReader } from './artifact-reader';
+import { blocksRunClaim } from '../run-claim';
 
 function href(view: View, projectId = '', workId = '') {
   const url = new URL('/workbench/', window.location.origin);
@@ -27,6 +28,13 @@ function href(view: View, projectId = '', workId = '') {
   if (projectId) url.searchParams.set('project', projectId);
   if (workId) url.searchParams.set('work', workId);
   return `${url.pathname}${url.search}`;
+}
+
+function runNoticeLabel(run: SnapshotRun) {
+  const status = run.status === 'cancelled' && !run.stoppedAt ? 'Cancelling' : run.status === 'cancelled' ? 'Cancelled' : run.status.charAt(0).toUpperCase() + run.status.slice(1);
+  const createdAt = Date.parse(run.createdAt);
+  const createdLabel = Number.isFinite(createdAt) ? new Date(createdAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' }) : 'time not recorded';
+  return `${run.kind === 'master' ? 'Master' : `${run.kind} run`} · ${status} · ${createdLabel} · #${run.id.slice(-8)}`;
 }
 
 const messageOrder = (a: Message, b: Message) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id);
@@ -348,7 +356,7 @@ function ConversationPage({ title, messages, project, snapshot, work, refresh, s
     : undefined;
   return <div className={`${work ? 'flex min-h-0 flex-1 flex-col' : 'flex h-[calc(100dvh-7.5rem)] flex-col'}`}>
     {title && <div className="mb-5 flex items-start justify-between gap-4"><div><h1 className="text-2xl font-semibold tracking-tight">{title}</h1><p className="mt-1 text-sm text-muted-foreground">{work ? 'Conversation with the responsible Agent, Master, and subagents.' : `Project conversation · ${project.name}`}</p></div>{work && <Badge variant="outline">{work.status.replace('_', ' ')}</Badge>}</div>}
-    {workRuns.map(run => <RunNotice key={run.id} run={run} canManageProject={canManageProject} refresh={refresh} setError={setError} />)}
+    {workRuns.map(run => <RunNotice key={run.id} run={run} canManageProject={canManageProject} refresh={refresh} setError={setError} blockingRuns={!work && run.kind === 'master' && run.status === 'queued' ? snapshot.runs.filter(other => blocksRunClaim(run, other)) : undefined} />)}
     <MessageHistoryStatus history={history} onRetry={() => void history.retry()} />
     <div ref={scroll.ref} onScroll={scroll.onScroll} className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4" aria-live="polite">{history.olderError && <p className="text-sm text-destructive" role="alert">Could not load earlier messages: {history.olderError}</p>}{history.hasOlder && <Button variant="ghost" size="sm" disabled={history.loadingOlder} onClick={() => void scroll.loadOlder()}>{history.loadingOlder ? 'Loading…' : history.olderError ? 'Retry loading earlier messages' : 'Load earlier messages'}</Button>}{displayedMessages.length ? displayedMessages.map(message => <MessageRow key={message.id} message={message} multiParticipant={!!work} userName={snapshot.member.name} />) : history.initialState === 'loading' ? <p className="py-16 text-center text-sm text-muted-foreground" role="status">Loading messages…</p> : history.initialState === 'loaded' ? <p className="py-16 text-center text-sm text-muted-foreground">No messages yet. Send a message to begin.</p> : null}</div>
     <MessageComposer key={`composer-${project.id}-${work?.id ?? 'master'}`} memberId={snapshot.member.id} project={project} work={work} agentName={agentName} handoffSource={handoffSource} handoffConnection={handoffSource ? handoffConnection : undefined} refresh={refresh} setError={setError} initialDraft={initialDraft} bootstrapConnections={!work && canBootstrapMaster(snapshot, project.id, displayedMessages) ? masterBootstrapConnections(snapshot, project.id) : []} />
@@ -476,14 +484,14 @@ function MessageComposer({ memberId, project, work, agentName, handoffSource, ha
   </form>;
 }
 
-function RunNotice({ run, canManageProject, refresh, setError }: { run: SnapshotRun; canManageProject: boolean; refresh: () => Promise<void>; setError: (value: string) => void }) {
+function RunNotice({ run, canManageProject, refresh, setError, blockingRuns }: { run: SnapshotRun; canManageProject: boolean; refresh: () => Promise<void>; setError: (value: string) => void; blockingRuns?: SnapshotRun[] }) {
   const queuedOrRunning = run.status === 'queued' || run.status === 'running';
   const cancelablePaused = run.kind !== 'delivery' && (run.status === 'paused' || run.status === 'interrupted');
   const pausedWaitingForStop = run.status === 'paused' && !run.stoppedAt;
   const interruptedWaitingForStop = run.status === 'interrupted' && !run.stoppedAt;
   const cancellationPending = run.status === 'cancelled' && !run.stoppedAt;
-  const status = cancellationPending ? 'Cancelling' : run.status === 'cancelled' ? 'Cancelled' : run.status;
-  return <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm"><span><strong className="capitalize">{status}</strong>{cancellationPending ? ' · Waiting for the Connector to confirm it has stopped' : run.status === 'interrupted' ? interruptedWaitingForStop ? ' · Waiting for the Connector to verify the old process has stopped' : ' · The Connector confirmed the old process stopped' : run.error ? ` · ${run.error}` : pausedWaitingForStop ? ' · Waiting for the Connector to confirm it has stopped before resuming' : ` · ${run.kind} run`}{run.slackReply?.state === 'blocked' && <> · Slack reply blocked · {run.slackReply.cause}</>}</span>{(queuedOrRunning || cancelablePaused) && <div className="flex gap-2">{queuedOrRunning && <Button variant="outline" size="sm" onClick={async () => { try { await workbenchApi.pauseRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>Pause</Button>}<Button variant="ghost" size="sm" onClick={async () => { try { await workbenchApi.cancelRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>{cancelablePaused ? 'End' : 'Cancel'}</Button></div>}{run.status === 'paused' && run.stoppedAt && <Button variant="outline" size="sm" onClick={async () => { try { await workbenchApi.resumeRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>Resume</Button>}{run.status === 'interrupted' && run.stoppedAt && canManageProject && <Button variant="outline" size="sm" onClick={async () => { try { await workbenchApi.reconcileRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>Resume</Button>}</div>;
+  const interruptedNextStep = cancelablePaused ? interruptedWaitingForStop ? '; End or wait for stop confirmation' : canManageProject ? '; Resume or End' : '; End' : '';
+  return <><div id={`run-${encodeURIComponent(run.id)}`} role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm"><span><strong>{runNoticeLabel(run)}</strong>{cancellationPending ? ' · Waiting for the Connector to confirm it has stopped' : run.status === 'interrupted' ? interruptedWaitingForStop ? ` · Waiting for the Connector to verify the old process has stopped${interruptedNextStep}` : ` · The Connector confirmed the old process stopped${interruptedNextStep}` : run.error ? ` · ${run.error}` : pausedWaitingForStop ? ' · Waiting for the Connector to confirm it has stopped before resuming' : ` · ${run.kind} run`}{run.slackReply?.state === 'blocked' && <> · Slack reply blocked · {run.slackReply.cause}</>}</span>{(queuedOrRunning || cancelablePaused) && <div className="flex gap-2">{queuedOrRunning && <Button variant="outline" size="sm" onClick={async () => { try { await workbenchApi.pauseRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>Pause</Button>}<Button variant="ghost" size="sm" onClick={async () => { try { await workbenchApi.cancelRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>{cancelablePaused ? 'End' : 'Cancel'}</Button></div>}{run.status === 'paused' && run.stoppedAt && <Button variant="outline" size="sm" onClick={async () => { try { await workbenchApi.resumeRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>Resume</Button>}{run.status === 'interrupted' && run.stoppedAt && canManageProject && <Button variant="outline" size="sm" onClick={async () => { try { await workbenchApi.reconcileRun(run.id); await refresh(); } catch (cause) { setError(errorMessage(cause)); } }}>Resume</Button>}</div>{blockingRuns && blockingRuns.length > 0 && <section className="mb-3 rounded-lg border border-border bg-muted/40 px-3 py-3 text-sm" aria-label={`Runs blocking ${runNoticeLabel(run)}`}><p className="font-medium">Waiting for these runs</p><ul className="mt-2 list-disc space-y-1 pl-5">{blockingRuns.map(blocker => <li key={blocker.id}><a className="underline underline-offset-2" href={`#run-${encodeURIComponent(blocker.id)}`}>{runNoticeLabel(blocker)}</a></li>)}</ul></section>}</>;
 }
 
 function WorkList({ project, works, snapshot }: { project: Project; works: Work[]; snapshot: Snapshot }) {

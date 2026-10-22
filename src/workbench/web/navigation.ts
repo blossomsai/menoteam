@@ -13,6 +13,7 @@ function subscribe(notify: () => void) {
     if (!anchor || !anchor.hasAttribute('href') || anchor.hasAttribute('download') || anchor.target && anchor.target !== '_self') return;
     const url = new URL(anchor.href, window.location.href);
     if (url.origin !== window.location.origin || !/^\/workbench(?:\/|$)/u.test(url.pathname)) return;
+    if (url.pathname === window.location.pathname && url.search === window.location.search && url.href.includes('#')) return;
     event.preventDefault();
     navigate(`${url.pathname}${url.search}${url.hash}`);
   };

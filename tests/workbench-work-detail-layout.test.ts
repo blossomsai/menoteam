@@ -149,6 +149,7 @@ it('keeps search replace-only and renders URL filters on popstate, Back and Forw
 it.each([
   { ctrlKey: true }, { metaKey: true }, { shiftKey: true }, { altKey: true }, { button: 1 },
   { target: '_blank' }, { download: 'file' }, { href: 'https://example.com/workbench/' }, { href: '/elsewhere' },
+  { href: '#run-existing' }, { href: `/workbench/?view=work-detail&project=${project.id}&work=${work.id}#run-existing` },
 ])('leaves native anchor behavior intact: %j', async variant => {
   await act(async () => root.render(createElement(App)));
   const anchor = document.createElement('a');
@@ -163,6 +164,23 @@ it.each([
   window.addEventListener('click', observe, { once: true });
   await act(async () => anchor.dispatchEvent(event));
   expect(prevented).toBe(false);
+});
+
+it('keeps changed-query fragment links on the normal internal navigation path', async () => {
+  await act(async () => root.render(createElement(App)));
+  const composer = host.querySelector<HTMLInputElement>('[aria-label="Message Agent"]')!;
+  const anchor = document.createElement('a');
+  const target = `/workbench/?view=work-detail&project=${project.id}&work=${work.id}&tab=qa#evidence`;
+  anchor.href = target;
+  host.append(anchor);
+  const pushState = vi.spyOn(window.history, 'pushState');
+  const event = new MouseEvent('click', { bubbles: true, cancelable: true, button: 0 });
+  await act(async () => anchor.dispatchEvent(event));
+  expect(event.defaultPrevented).toBe(true);
+  expect(pushState).toHaveBeenCalledExactlyOnceWith(null, '', target);
+  expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(target);
+  expect(host.querySelector('[aria-label="Message Agent"]')).toBe(composer);
+  expect(composer.value).toBe('Draft survives layout');
 });
 
 it('shows latest implementation/handoff model separately from later review and frozen profile', async () => {
