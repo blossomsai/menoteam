@@ -33,6 +33,16 @@ describe('project invitation SMTP',()=>{
     expect(inviteMailConfig({})).toBeUndefined();
   });
 
+  it('leaves mail disabled for local HTTP origin when SMTP is absent or partial',()=>{
+    expect(inviteMailConfig({WORKBENCH_ORIGIN:'http://127.0.0.1:3200'})).toBeUndefined();
+    expect(createInviteMailer(undefined)).toBeUndefined();
+    expect(inviteMailConfig({WORKBENCH_SMTP_HOST:'smtp.example.test',WORKBENCH_ORIGIN:'http://127.0.0.1:3200'})).toBeUndefined();
+  });
+
+  it('still rejects HTTP origin when the complete SMTP configuration is enabled',()=>{
+    expect(()=>inviteMailConfig({...env,WORKBENCH_ORIGIN:'http://127.0.0.1:3200'})).toThrow('fixed HTTPS origin');
+  });
+
   it('uses implicit TLS on port 465 without disabling certificate checks',()=>{
     createInviteMailer(inviteMailConfig({...env,WORKBENCH_SMTP_PORT:'465'})!);
     const options=vi.mocked(nodemailer.createTransport).mock.calls[0]![0];

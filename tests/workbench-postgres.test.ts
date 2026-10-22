@@ -2834,11 +2834,14 @@ describe.skipIf(!url)('Slack signed intake through HTTP and PostgreSQL', () => {
             expect(await inviteCount(email('denied-unscoped'))).toBe(beforeUnscoped);
             await denied(await sessionPost(projectAdmin.session, { email: email('denied-other-project'), projectId: otherProject.id, role: 'admin' }));
             expect(await inviteCount(email('denied-other-project'))).toBe(0);
+            const sendsBeforeDenied = unauthorizedSends;
             await denied(await sessionPost(projectAdmin.session,{email:email('denied-crossscope-send'),projectId:otherProject.id,role:'member',requestId:randomUUID(),sendEmail:true}));
+            expect(await inviteCount(email('denied-crossscope-send'))).toBe(0);
             await denied(await sessionPost(ordinarySession, { email: email('denied-ordinary-member'), projectId: project.id, role: 'admin' }));
             expect(await inviteCount(email('denied-ordinary-member'))).toBe(0);
             await denied(await sessionPost(ordinarySession,{email:email('denied-member-send'),projectId:project.id,role:'member',requestId:randomUUID(),sendEmail:true}));
-            expect(unauthorizedSends).toBe(0);
+            expect(await inviteCount(email('denied-member-send'))).toBe(0);
+            expect(unauthorizedSends).toBe(sendsBeforeDenied);
 
             const deniedWorkspaceEmail = email('denied-workspace');
             await denied(await sessionPost(projectAdmin.session, { email: deniedWorkspaceEmail, role: 'member' }));
